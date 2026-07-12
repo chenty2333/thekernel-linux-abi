@@ -13,7 +13,7 @@ run_cargo() {
 }
 
 if [ "$#" -eq 0 ]; then
-    packages=(thekernel-linux-usercopy thekernel-linux-process)
+    packages=(thekernel-linux-usercopy thekernel-linux-process thekernel-linux-vfs)
 else
     packages=("$@")
 fi
@@ -31,6 +31,10 @@ for package in "${packages[@]}"; do
         thekernel-linux-process)
             version=0.1.0
             crate_path=crates/process
+            ;;
+        thekernel-linux-vfs)
+            version=0.1.0
+            crate_path=crates/vfs
             ;;
         *)
             printf 'unknown workspace package: %s\n' "$package" >&2
