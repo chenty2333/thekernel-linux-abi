@@ -45,6 +45,8 @@ This ledger records semantic changes relative to the immutable
 - Use checked bounded increments for process, group, session, and thread
   charges. Every release is non-wrapping, so a duplicate internal refund keeps
   zero at zero and fails closed instead of creating effective infinity.
+- Refund the already-reserved domain thread charge if the defensive per-group
+  checked increment rejects publication.
 - Replace the final public exit/thread invariant assertions with idempotent or
   typed outcomes; lifecycle input cannot reach a panic/expect path.
 - Enable `kspin/smp` in the workspace dependency so standalone/concurrent tests

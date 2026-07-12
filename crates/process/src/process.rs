@@ -1080,10 +1080,7 @@ impl<Z> Process<Z> {
             registry.release_thread_member();
             return Err(ProcessError::AlreadyExists);
         }
-        let Some(next_memberships) = tg
-            .memberships
-            .checked_add(1)
-            .filter(|next| *next <= limit)
+        let Some(next_memberships) = tg.memberships.checked_add(1).filter(|next| *next <= limit)
         else {
             drop(tg);
             registry.release_thread_member();

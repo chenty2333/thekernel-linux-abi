@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - release candidate
+## 0.1.0 - 2026-07-12
 
 - Replace the crate-owned process registry and init singleton with an explicit
   `ProcessDomain` and `ProcessRegistry`.
@@ -20,6 +20,8 @@
   intrusive-tree mutation.
 - Make all registry and lifecycle counters checked on admission and
   non-wrapping on release, including duplicate-refund fail-closed tests.
+- Refund domain-wide admission if the per-process checked thread count cannot
+  be advanced.
 - Remove public lifecycle reliance on invariant assertions when exit or thread
   state is stale or inconsistent.
 - Exercise admission, removal, reparenting, exit, and reap concurrently with
