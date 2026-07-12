@@ -25,5 +25,9 @@
   targets instead of running usercopy/allocation under an IRQ-off spin guard.
 - Move immutable thread-registry snapshots to the sleepable kernel mutex and
   release registration `Arc` ownership only after IRQ-safe guards are gone.
+- Add prepared/deferred process and exact-thread publication tokens so a
+  credential transaction can prepare bounded routing ownership before an
+  outer spin lock, perform an allocation-free lifecycle-checked commit, and
+  release unused queue/account/endpoint ownership only after that lock is gone.
 - Test real SMP publication, queue accounting, frame placement, and restore
   behavior on the pinned nightly toolchain.

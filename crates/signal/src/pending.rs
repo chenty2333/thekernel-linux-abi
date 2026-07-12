@@ -356,6 +356,10 @@ impl PublishOutcome {
         drop(self.unused);
         self.added
     }
+
+    pub(crate) fn into_parts(self) -> (bool, Option<PreparedSignal>) {
+        (self.added, self.unused)
+    }
 }
 
 /// Structure to record pending signals.

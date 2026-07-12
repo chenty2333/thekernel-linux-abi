@@ -190,6 +190,10 @@ impl RegisteredThread {
         }
         self.thread.upgrade().map(|thread| (self.tid, thread))
     }
+
+    fn is_active(&self) -> bool {
+        self.state.load(Ordering::Acquire) == REGISTRATION_ACTIVE
+    }
 }
 
 pub(crate) type ThreadRegistry = Vec<Arc<RegisteredThread>>;
@@ -201,8 +205,117 @@ pub(crate) type ThreadRegistry = Vec<Arc<RegisteredThread>>;
 /// by kernel integrations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessSignalSendOutcome {
+    /// Whether this send published a new pending record.
     pub published: bool,
+    /// One currently unblocked retained endpoint selected for wakeup.
     pub wake_tid: Option<u32>,
+}
+
+struct RetainedThreadEndpoint {
+    registration: Arc<RegisteredThread>,
+    tid: u32,
+    thread: Arc<ThreadSignalManager>,
+}
+
+impl RetainedThreadEndpoint {
+    fn is_active(&self) -> bool {
+        self.registration.is_active()
+    }
+}
+
+/// Fallibly prepared process-directed routing state for a non-blocking commit.
+///
+/// Construction snapshots and retains every currently active thread endpoint
+/// outside IRQ-disabled locks. [`Self::publish`] then performs only bounded
+/// atomic loads, short signal-state spin-lock mutations, and ownership moves.
+/// This lets a kernel commit signal publication while holding an unrelated
+/// credential or liveness spin lock without acquiring this crate's sleepable
+/// thread-registry mutex or allocating.
+///
+/// The snapshot is deliberately one-shot and remains owned by the returned
+/// [`DeferredProcessSignalSend`] so endpoint `Arc` destruction cannot occur in
+/// the commit call. A thread which cancels or re-registers after preparation
+/// is rejected by its exact registration identity rather than confused with a
+/// reused TID.
+#[must_use = "publishing or dropping the prepared send releases retained endpoints"]
+pub struct PreparedProcessSignalSend {
+    process: Arc<ProcessSignalManager>,
+    endpoints: Vec<RetainedThreadEndpoint>,
+}
+
+impl PreparedProcessSignalSend {
+    /// Publishes one already allocated and accounted signal record.
+    ///
+    /// This method does not allocate and returns every unused queue record and
+    /// retained endpoint in a deferred owner. The caller must carry that owner
+    /// out of all IRQ-disabled outer critical sections before calling
+    /// [`DeferredProcessSignalSend::finish`] or dropping it.
+    pub fn publish(self, prepared: PreparedSignal) -> DeferredProcessSignalSend {
+        let process = &self.process;
+        let signo = prepared.signo();
+        let blocked_by_any_thread = self.endpoints.iter().any(|endpoint| {
+            endpoint.is_active()
+                && (endpoint.thread.signal_blocked(signo)
+                    || endpoint.thread.signal_real_blocked(signo))
+        });
+
+        let (published, unused, accepted) = {
+            let actions = process.actions.lock();
+            if ProcessSignalManager::action_ignored(&actions, signo) && !blocked_by_any_thread {
+                (false, Some(prepared), false)
+            } else {
+                let outcome = process.pending.lock().publish(prepared);
+                let (published, unused) = outcome.into_parts();
+                (published, unused, true)
+            }
+        };
+
+        let wake_tid = if accepted {
+            process.possibly_has_signal.store(true, Ordering::Release);
+            self.endpoints.iter().find_map(|endpoint| {
+                (endpoint.is_active() && !endpoint.thread.signal_blocked(signo))
+                    .then_some(endpoint.tid)
+            })
+        } else {
+            None
+        };
+
+        DeferredProcessSignalSend {
+            _prepared: self,
+            outcome: ProcessSignalSendOutcome {
+                published,
+                wake_tid,
+            },
+            unused,
+        }
+    }
+}
+
+/// Ownership deferred out of a process-signal publication critical section.
+///
+/// Dropping this value can release queue-account, queue-node, process-manager,
+/// registry-entry, and thread-endpoint ownership. It must therefore be
+/// retained until every unrelated IRQ-disabled outer guard has been released.
+#[must_use = "finish or drop this value only after outer spin locks are released"]
+pub struct DeferredProcessSignalSend {
+    _prepared: PreparedProcessSignalSend,
+    outcome: ProcessSignalSendOutcome,
+    unused: Option<PreparedSignal>,
+}
+
+impl DeferredProcessSignalSend {
+    /// Returns the fixed publication and wakeup result without releasing
+    /// deferred ownership.
+    pub const fn outcome(&self) -> ProcessSignalSendOutcome {
+        self.outcome
+    }
+
+    /// Releases retained routing ownership in the caller's current context and
+    /// returns any queue record that publication did not consume.
+    pub fn finish(mut self) -> (ProcessSignalSendOutcome, Option<PreparedSignal>) {
+        let unused = self.unused.take();
+        (self.outcome, unused)
+    }
 }
 
 /// Why a process signal disposition could not be replaced atomically.
@@ -344,6 +457,39 @@ impl ProcessSignalManager {
         }
         drop(registry);
         Ok(snapshot)
+    }
+
+    /// Prepares a bounded endpoint snapshot for one non-blocking authorized
+    /// process-signal commit.
+    ///
+    /// Allocation, registry locking, weak upgrades, and all temporary `Arc`
+    /// destruction finish before this method returns. `usize::MAX` cannot be
+    /// selected as the registry limit, and the snapshot reserves no more than
+    /// the current finite registry length.
+    pub fn try_prepare_signal_send(
+        self: &Arc<Self>,
+    ) -> Result<PreparedProcessSignalSend, AllocError> {
+        let registry = self.children_registry_snapshot();
+        let len = registry.as_deref().map_or(0, Vec::len);
+        let mut endpoints = Vec::new();
+        endpoints.try_reserve_exact(len).map_err(|_| AllocError)?;
+
+        if let Some(registry) = registry.as_deref() {
+            for entry in registry {
+                if let Some((tid, thread)) = entry.upgrade() {
+                    endpoints.push(RetainedThreadEndpoint {
+                        registration: entry.clone(),
+                        tid,
+                        thread,
+                    });
+                }
+            }
+        }
+        drop(registry);
+        Ok(PreparedProcessSignalSend {
+            process: self.clone(),
+            endpoints,
+        })
     }
 
     /// Atomically replaces one disposition with respect to signal

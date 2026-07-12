@@ -374,6 +374,84 @@ fn ignore_transition_linearizes_with_prepared_realtime_publication() {
 }
 
 #[test]
+fn deferred_process_send_linearizes_with_ignored_transition() {
+    let (process, _signal) = new_test_env();
+    let route = process.try_prepare_signal_send().unwrap();
+    let user = SignalQueueAccount::try_new(1).unwrap();
+    let global = SignalQueueAccount::try_new(1).unwrap();
+    let prepared = PreparedSignal::try_accounted(
+        SignalInfo::new_user(Signo::SIGRTMIN, 1, 1),
+        &user,
+        1,
+        &global,
+    )
+    .unwrap();
+    let start = Arc::new(Barrier::new(2));
+
+    let sender = {
+        let start = start.clone();
+        thread::spawn(move || {
+            start.wait();
+            let deferred = route.publish(prepared);
+            let outcome = deferred.outcome();
+            let (_, unused) = deferred.finish();
+            drop(unused);
+            outcome
+        })
+    };
+    start.wait();
+    process
+        .try_replace_action(
+            Signo::SIGRTMIN,
+            SignalAction {
+                disposition: SignalDisposition::Ignore,
+                ..SignalAction::default()
+            },
+        )
+        .unwrap();
+
+    let _ = sender.join().unwrap();
+    assert!(!process.pending().has(Signo::SIGRTMIN));
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn deferred_thread_send_linearizes_with_endpoint_cancellation() {
+    let (_process, signal) = new_test_env();
+    let endpoint = signal.prepare_signal_send();
+    let user = SignalQueueAccount::try_new(1).unwrap();
+    let global = SignalQueueAccount::try_new(1).unwrap();
+    let prepared = PreparedSignal::try_accounted(
+        SignalInfo::new_user(Signo::SIGRTMIN, 1, 1),
+        &user,
+        1,
+        &global,
+    )
+    .unwrap();
+    let start = Arc::new(Barrier::new(2));
+
+    let sender = {
+        let start = start.clone();
+        thread::spawn(move || {
+            start.wait();
+            let deferred = endpoint.publish(prepared);
+            let outcome = deferred.outcome();
+            let (_, unused) = deferred.finish();
+            drop(unused);
+            outcome
+        })
+    };
+    start.wait();
+    assert!(signal.cancel_registration());
+
+    let _ = sender.join().unwrap();
+    assert!(!signal.pending().has(Signo::SIGRTMIN));
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
 fn action_update_does_not_fail_under_registration_churn() {
     let (process, _signal) = new_test_env();
     let running = Arc::new(AtomicBool::new(true));

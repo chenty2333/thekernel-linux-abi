@@ -3,8 +3,8 @@ use std::mem::MaybeUninit;
 use axcpu::uspace::UserContext;
 use linux_raw_sys::general::{SS_DISABLE, SS_ONSTACK};
 use thekernel_linux_signal::{
-    SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction, SignalSet,
-    SignalStack, SignalStackRestoreError, Signo,
+    PreparedSignal, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction,
+    SignalQueueAccount, SignalSet, SignalStack, SignalStackRestoreError, Signo,
     api::{ProcessSignalManager, SignalFrame},
     arch::SignalContextError,
 };
@@ -263,6 +263,69 @@ fn block_ignore_send_signal() {
     let empty = SignalSet::default();
     thr.set_blocked(empty);
     assert!(!thr.signal_blocked(signo));
+}
+
+#[test]
+fn thread_prepared_send_defers_ignored_record_release() {
+    let (proc, thread) = new_test_env();
+    replace_action(
+        &proc,
+        Signo::SIGRTMIN,
+        SignalAction {
+            disposition: SignalDisposition::Ignore,
+            ..SignalAction::default()
+        },
+    );
+    let endpoint = thread.prepare_signal_send();
+    let per_user = SignalQueueAccount::try_new(4).unwrap();
+    let global = SignalQueueAccount::try_new(4).unwrap();
+    let prepared = PreparedSignal::try_accounted(
+        SignalInfo::new_user(Signo::SIGRTMIN, -1, 100),
+        &per_user,
+        4,
+        &global,
+    )
+    .unwrap();
+
+    let deferred = endpoint.publish(prepared);
+    assert!(!deferred.outcome().published);
+    assert!(!deferred.outcome().wake);
+    assert_eq!(per_user.queued(), 1);
+    assert_eq!(global.queued(), 1);
+
+    let (_, unused) = deferred.finish();
+    assert!(unused.is_some());
+    assert_eq!(per_user.queued(), 1);
+    drop(unused);
+    assert_eq!(per_user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn thread_prepared_send_rechecks_endpoint_cancellation() {
+    let (_proc, thread) = new_test_env();
+    let endpoint = thread.prepare_signal_send();
+    assert!(thread.cancel_registration());
+
+    let per_user = SignalQueueAccount::try_new(4).unwrap();
+    let global = SignalQueueAccount::try_new(4).unwrap();
+    let prepared = PreparedSignal::try_accounted(
+        SignalInfo::new_user(Signo::SIGRTMIN, -1, 100),
+        &per_user,
+        4,
+        &global,
+    )
+    .unwrap();
+    let deferred = endpoint.publish(prepared);
+    assert!(!deferred.outcome().published);
+    assert!(!deferred.outcome().wake);
+    assert_eq!(per_user.queued(), 1);
+
+    let (_, unused) = deferred.finish();
+    assert!(unused.is_some());
+    drop(unused);
+    assert_eq!(per_user.queued(), 0);
+    assert_eq!(global.queued(), 0);
 }
 
 #[test]

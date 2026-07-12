@@ -25,8 +25,98 @@ use crate::{
 /// Result of publishing one thread-directed signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadSignalSendOutcome {
+    /// Whether this send published a new pending record.
     pub published: bool,
+    /// Whether the target endpoint should be interrupted for delivery.
     pub wake: bool,
+}
+
+/// Prepared exact thread endpoint for a non-blocking signal commit.
+///
+/// The strong endpoint owner is acquired before an embedding kernel enters an
+/// unrelated credential or liveness spin critical section. Publication then
+/// rechecks the endpoint lifecycle and returns the owner together with every
+/// unused queue record, so no arbitrary destructor runs in the commit call.
+#[must_use = "publishing or dropping the prepared send releases endpoint ownership"]
+pub struct PreparedThreadSignalSend {
+    thread: Arc<ThreadSignalManager>,
+}
+
+impl PreparedThreadSignalSend {
+    /// Publishes one already allocated and accounted signal record.
+    ///
+    /// The commit is serialized against endpoint cancellation and performs no
+    /// allocation. The returned deferred owner must leave every unrelated
+    /// IRQ-disabled outer critical section before it is finished or dropped.
+    pub fn publish(self, prepared: PreparedSignal) -> DeferredThreadSignalSend {
+        let thread = &self.thread;
+        let lifecycle = thread.lifecycle.lock();
+        if !thread.accepting_signals.load(Ordering::Acquire) {
+            drop(lifecycle);
+            return DeferredThreadSignalSend {
+                _prepared: self,
+                outcome: ThreadSignalSendOutcome {
+                    published: false,
+                    wake: false,
+                },
+                unused: Some(prepared),
+            };
+        }
+
+        let signo = prepared.signo();
+        let blocked = thread.signal_blocked(signo);
+        let (published, unused, accepted) = {
+            let actions = thread.proc.actions.lock();
+            let ignored = ProcessSignalManager::action_ignored(&actions, signo);
+            if ignored && !blocked && !thread.signal_real_blocked(signo) {
+                (false, Some(prepared), false)
+            } else {
+                let outcome = thread.pending.lock().publish(prepared);
+                let (published, unused) = outcome.into_parts();
+                (published, unused, true)
+            }
+        };
+        if accepted {
+            thread.possibly_has_signal.store(true, Ordering::Release);
+        }
+        drop(lifecycle);
+
+        DeferredThreadSignalSend {
+            _prepared: self,
+            outcome: ThreadSignalSendOutcome {
+                published,
+                wake: accepted && !blocked,
+            },
+            unused,
+        }
+    }
+}
+
+/// Ownership deferred out of a thread-signal publication critical section.
+///
+/// Dropping this value can release queue-account, queue-node, process-manager,
+/// registration, and exact endpoint ownership. Retain it until every
+/// unrelated IRQ-disabled outer guard has been released.
+#[must_use = "finish or drop this value only after outer spin locks are released"]
+pub struct DeferredThreadSignalSend {
+    _prepared: PreparedThreadSignalSend,
+    outcome: ThreadSignalSendOutcome,
+    unused: Option<PreparedSignal>,
+}
+
+impl DeferredThreadSignalSend {
+    /// Returns the fixed publication and wakeup result without releasing
+    /// deferred ownership.
+    pub const fn outcome(&self) -> ThreadSignalSendOutcome {
+        self.outcome
+    }
+
+    /// Releases retained endpoint ownership in the caller's current context
+    /// and returns any queue record that publication did not consume.
+    pub fn finish(mut self) -> (ThreadSignalSendOutcome, Option<PreparedSignal>) {
+        let unused = self.unused.take();
+        (self.outcome, unused)
+    }
 }
 
 /// Why a thread endpoint could not be registered with its process manager.
@@ -348,6 +438,14 @@ impl ThreadSignalManager {
     /// Returns whether this endpoint currently accepts directed signals.
     pub fn is_registered(&self) -> bool {
         self.accepting_signals.load(Ordering::Acquire)
+    }
+
+    /// Retains this exact endpoint before a non-blocking authorized signal
+    /// commit.
+    pub fn prepare_signal_send(self: &Arc<Self>) -> PreparedThreadSignalSend {
+        PreparedThreadSignalSend {
+            thread: self.clone(),
+        }
     }
 
     /// Dequeues a signal from the thread's pending signals.

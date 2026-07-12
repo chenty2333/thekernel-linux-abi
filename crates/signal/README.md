@@ -22,6 +22,17 @@ admission token; dropping that token rolls the admission back, while
 admission first. An embedding kernel must call `cancel_registration()` during
 thread teardown before releasing the endpoint.
 
+Credential- or liveness-checked signal sends also have an explicit two-phase
+path. `try_prepare_signal_send()` fallibly retains a bounded process routing
+cohort before the kernel enters an unrelated IRQ-disabled authorization
+transaction; `prepare_signal_send()` retains one exact thread endpoint. Their
+`publish()` methods only take short signal-state spin locks, recheck exact
+registration/lifecycle identity, and move preallocated queue ownership. The
+returned deferred result retains every unused queue record, account, registry
+entry, process manager, and endpoint until the kernel has left its outer
+critical section. Process-route preparation is intentionally allowed to
+allocate and take the sleepable registry mutex; publication is not.
+
 Every userspace action/frame copy receives an explicit
 `UserMemoryContext`; the crate never obtains the current task or address space.
 Its only TheKernel Linux ABI workspace dependency is
@@ -73,5 +84,9 @@ guard is gone. Process-directed routing is therefore a sleepable task-context
 operation in 0.1.0; an interrupt-context sender must defer routing through its
 kernel adapter rather than smuggling allocation or destruction into a spin
 critical section.
+
+The process publication cohort is a correctness-first 0.1 representation. It
+is finite and allocation failure is explicit; its `Vec` layout, snapshot
+algorithm, and future RCU/epoch optimization are not stable API guarantees.
 
 See `VENDOR.md` and `PATCHES.md` for source identity and semantic changes.

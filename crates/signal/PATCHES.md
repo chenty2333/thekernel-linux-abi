@@ -55,5 +55,11 @@ This ledger records changes relative to `starry-signal 0.3.0` identified in
   detach manager-held registration `Arc`s before dropping short IRQ-safe
   guards. No registry snapshot clone or final entry destruction runs with
   interrupts disabled.
+- Add one-shot prepared/deferred signal-send tokens. Process-directed sends
+  fallibly retain a bounded exact registration cohort before an embedding
+  security transaction; process and thread commits recheck identity and move
+  fixed queue state without allocation, sleepable registry locking, or
+  arbitrary destruction. Deferred ownership is released by the caller after
+  its outer IRQ-disabled guards.
 - Declare the package nightly-only: `Arc::try_new` preserves real OOM errors;
   allocator pre-reservation is not treated as a substitute.
