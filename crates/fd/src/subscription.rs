@@ -69,11 +69,14 @@ impl WatchCharge<'_> {
         self.amount
     }
 
-    fn reduce_to(&mut self, amount: usize) {
-        debug_assert!(amount <= self.amount);
+    fn reduce_to(&mut self, amount: usize) -> Result<(), CommitSubscriptionError> {
+        if amount > self.amount {
+            return Err(CommitSubscriptionError::InvalidState);
+        }
         let refund = self.amount - amount;
         self.amount = amount;
         self.account.used.fetch_sub(refund, Ordering::AcqRel);
+        Ok(())
     }
 }
 
@@ -130,6 +133,16 @@ pub enum ArmError<E> {
     },
     /// A specific source rejected registration.
     Source(AggregateError<E>),
+    /// The prepared owner no longer retains its unpublished storage.
+    InvalidState,
+}
+
+/// Failure while publishing a fully armed aggregate subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommitSubscriptionError {
+    /// The prepared owner did not retain a coherent storage/accounting pair.
+    InvalidState,
 }
 
 /// Failure before any aggregate subscription is published.
@@ -187,10 +200,9 @@ impl<'a, R: RetainedRegistration> PreparedSubscription<'a, R> {
     /// Arms and retains one source. If `arm` fails, the prepared owner remains
     /// intact so normal error propagation drops it and rolls back prior slots.
     pub fn arm_with<E>(&mut self, arm: impl FnOnce() -> Result<R, E>) -> Result<(), ArmError<E>> {
-        let registrations = self
-            .registrations
-            .as_mut()
-            .expect("prepared subscription retains registration storage");
+        let Some(registrations) = self.registrations.as_mut() else {
+            return Err(ArmError::InvalidState);
+        };
         let index = registrations.len();
         if index >= self.maximum {
             // The caller violated its declared topology. Do not run `arm`,
@@ -209,20 +221,22 @@ impl<'a, R: RetainedRegistration> PreparedSubscription<'a, R> {
     }
 
     /// Publishes the complete aggregate and refunds unused planned credits.
-    pub fn commit(mut self) -> Subscription<'a, R> {
-        let registrations = self
-            .registrations
-            .take()
-            .expect("prepared subscription retains registration storage");
-        let mut charge = self
-            .charge
-            .take()
-            .expect("prepared subscription retains its charge");
-        charge.reduce_to(registrations.len());
-        Subscription {
+    pub fn commit(mut self) -> Result<Subscription<'a, R>, CommitSubscriptionError> {
+        let Some(mut registrations) = self.registrations.take() else {
+            return Err(CommitSubscriptionError::InvalidState);
+        };
+        let Some(mut charge) = self.charge.take() else {
+            cancel_all(&mut registrations);
+            return Err(CommitSubscriptionError::InvalidState);
+        };
+        if let Err(error) = charge.reduce_to(registrations.len()) {
+            cancel_all(&mut registrations);
+            return Err(error);
+        }
+        Ok(Subscription {
             registrations: Some(registrations),
             charge: Some(charge),
-        }
+        })
     }
 }
 
@@ -394,7 +408,7 @@ mod tests {
             prepared
                 .arm_with::<()>(|| Ok(registration(&cancels, &updates)))
                 .unwrap();
-            let mut subscription = prepared.commit();
+            let mut subscription = prepared.commit().unwrap();
             assert_eq!(account.used(), 2);
             subscription.update_all(&noop_waker()).unwrap();
             assert_eq!(updates.load(Ordering::SeqCst), 2);
