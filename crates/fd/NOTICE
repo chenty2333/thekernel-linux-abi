@@ -1,0 +1,7 @@
+This package is derived from TheKernel FD, readiness, and epoll lifecycle work
+distributed under Apache-2.0. TheKernel in turn retains StarryOS and ArceOS
+provenance for the surrounding kernel and generic wake-source implementation.
+
+The Linux and FreeBSD source snapshots listed in VENDOR.md were consulted to
+understand observable behavior and architecture. No Linux or FreeBSD source
+text is copied into this package.
