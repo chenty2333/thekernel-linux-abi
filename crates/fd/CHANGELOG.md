@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0
+## 0.1.0 - 2026-07-12
 
 - Add fixed-capacity FD-table reservation, publication, dup/fork, and
   transactional close semantics with generation-tagged identities.

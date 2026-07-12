@@ -41,6 +41,10 @@ Queue accounts and each process-local endpoint registry have immutable finite
 limits; `usize::MAX` is never a policy value. Bare-metal signal consumers use a
 sleepable lifecycle mutex, and unsupported no-`multitask` builds fail at
 compile time rather than taking an IRQ-off lock across usercopy or allocation.
+The immutable registry owner is acquired under that sleepable mutex as well;
+registration rollback moves strong ownership out of IRQ-safe slots before
+destruction. Process registry charges use checked admission and non-wrapping
+release, so duplicate cleanup cannot manufacture effective infinity.
 
 One-shot dispositions and signal return are transactions rather than syscall
 side effects. `SA_RESETHAND` claims are generation checked, and `uc_stack`
@@ -68,3 +72,10 @@ callback, or destruction code. Defensive ready recovery is likewise explicit:
 generation-tagged rescan tokens carry persistent bounded progress, a full
 queue leaves the current slot retryable, and a newer overflow invalidates an
 older recovery worker.
+
+The release boundary is the Cargo-normalized archive, not the workspace source
+tree. CI rejects dependency path/git/workspace leakage while allowing Cargo's
+package-local lib/test target paths, tests every unpacked archive, and runs
+registry-only publication dry-runs. Signal's first release remains a deliberate
+two-step gate: package-workspace testing against the packaged usercopy source,
+then a true registry-only dry-run after usercopy is visible.

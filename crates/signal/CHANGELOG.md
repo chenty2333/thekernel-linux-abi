@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - release candidate
+## 0.1.0 - 2026-07-12
 
 - Preserve bounded standard/real-time pending queues and exact account refunds.
 - Preserve fallible endpoint registration and disposition-transition rollback.

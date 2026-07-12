@@ -4,7 +4,7 @@
 owned by TheKernel. It is deliberately separate from generic ArceOS
 mechanisms and from TheKernel's syscall and evaluator layers.
 
-The release candidates currently contain five packages:
+The 0.1.0 line contains five packages:
 
 - `thekernel-linux-usercopy` 0.1.0: explicit-context, bounded, fallible access
   to a caller-provided userspace memory implementation.
@@ -39,12 +39,13 @@ because preserving fallible standard `Arc` allocation currently requires
 
 ```bash
 cargo test --workspace --all-features
-cargo check -p thekernel-linux-usercopy --no-default-features
-cargo check -p thekernel-linux-signal --no-default-features
-cargo check -p thekernel-linux-vfs --no-default-features
-cargo check -p thekernel-linux-fd --no-default-features
-./scripts/ci.sh
-PACKAGE_ALLOW_DIRTY=1 ./scripts/test-package.sh
+cargo check -p thekernel-linux-usercopy --no-default-features --locked
+cargo check -p thekernel-linux-signal --no-default-features --locked
+cargo check -p thekernel-linux-vfs --no-default-features --locked
+cargo check -p thekernel-linux-fd --no-default-features --locked
+CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh
+PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
+  ./scripts/test-package.sh
 ```
 
 ## Boundaries
@@ -57,12 +58,15 @@ PACKAGE_ALLOW_DIRTY=1 ./scripts/test-package.sh
   queues are bounded and their shared accounting is refunded on every terminal
   path; the crate does not turn delivery pressure into an unbounded queue.
   One-shot actions cannot wrap into ABA reuse, and endpoint cancellation waits
-  for an already-started delivery before returning.
+  for an already-started delivery before returning. Bare-metal registry
+  snapshots and destruction use an explicit sleepable lifecycle boundary.
 - VFS and FD policy consume caller-supplied stable handles and snapshots. They
   do not choose generic filesystem walkers, source-waker storage, locks, task
   globals, or concrete RCU/indexing algorithms.
 - Pathwalk, descriptor, watch, ready-queue, graph, and recovery work are all
-  finite. Unsupported exclusive selection is rejected rather than simulated.
+  finite. Epoll payload preparation is lock-external and recovery is
+  generation-tagged and incrementally bounded. Unsupported exclusive selection
+  is rejected rather than simulated.
 - Syscall decoding, evaluator policy, and benchmark profiles stay in
   TheKernel.
 - Unsupported functionality is reported honestly; a package name is not a

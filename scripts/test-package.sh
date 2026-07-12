@@ -168,6 +168,8 @@ for package in "${packages[@]}"; do
             ;;
     esac
 
+    "$script_dir/check-packaged-manifest.py" "$package_dir/Cargo.toml"
+
     unpacked_cargo_config=()
     if [ "$package" = thekernel-linux-signal ]; then
         grep -Fq 'thekernel-linux-usercopy' "$package_dir/Cargo.toml"

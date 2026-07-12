@@ -20,12 +20,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Stable crates minimum supported Rust tests
         run: |
-          cargo +1.85.0 test -p thekernel-linux-usercopy --all-features
-          cargo +1.85.0 check -p thekernel-linux-usercopy --no-default-features --lib
-          cargo +1.85.0 test -p thekernel-linux-vfs --all-features
-          cargo +1.85.0 check -p thekernel-linux-vfs --no-default-features --lib
-          cargo +1.85.0 test -p thekernel-linux-fd --all-features
-          cargo +1.85.0 check -p thekernel-linux-fd --no-default-features --lib
+          cargo +1.85.0 test -p thekernel-linux-usercopy --all-features --locked
+          cargo +1.85.0 check -p thekernel-linux-usercopy --no-default-features --lib --locked
+          cargo +1.85.0 test -p thekernel-linux-vfs --all-features --locked
+          cargo +1.85.0 check -p thekernel-linux-vfs --no-default-features --lib --locked
+          cargo +1.85.0 test -p thekernel-linux-fd --all-features --locked
+          cargo +1.85.0 check -p thekernel-linux-fd --no-default-features --lib --locked
 
   stable:
     runs-on: ubuntu-latest

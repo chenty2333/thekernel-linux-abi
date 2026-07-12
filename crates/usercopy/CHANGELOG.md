@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-07-12
 
 - Migrate the maintained `starry-vm` user-memory leaf under TheKernel package
   and Rust library identity. Existing consumers may preserve the old extern

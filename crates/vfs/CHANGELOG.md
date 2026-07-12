@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0
+## 0.1.0 - 2026-07-12
 
 - Add explicit immutable pathname-operation contexts.
 - Add strict Linux `openat2()` resolve policy and typed topology events.
