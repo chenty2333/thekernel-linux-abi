@@ -112,13 +112,16 @@ fn thread_admissions_are_bounded_ordered_and_rollback_safe() {
     let domain = ProcessDomain::<Zombie>::try_with_membership_limit(3).unwrap();
     let init = init(&domain);
 
-    init.prepare_thread(30).unwrap().commit();
-    init.prepare_thread(10).unwrap().commit();
-    let pending = init.prepare_thread(20).unwrap();
+    domain.prepare_thread(&init, 30).unwrap().commit().unwrap();
+    domain.prepare_thread(&init, 10).unwrap().commit().unwrap();
+    let pending = domain.prepare_thread(&init, 20).unwrap();
     assert_eq!(init.try_threads().unwrap(), [10, 30]);
-    assert_eq!(init.prepare_thread(40).err(), Some(ProcessError::Capacity));
+    assert_eq!(
+        domain.prepare_thread(&init, 40).err(),
+        Some(ProcessError::Capacity)
+    );
     drop(pending);
-    init.prepare_thread(20).unwrap().commit();
+    domain.prepare_thread(&init, 20).unwrap().commit().unwrap();
     assert_eq!(init.thread_ids().collect::<Vec<_>>(), [10, 20, 30]);
 
     assert_eq!(init.exit_thread(999, 55), ThreadExitOutcome::NotFound);
@@ -159,14 +162,74 @@ fn domain_thread_limit_is_shared_across_processes() {
     let init = init(&domain);
     let child = child(&domain, &init, 2);
 
-    init.prepare_thread(10).unwrap().commit();
-    child.prepare_thread(20).unwrap().commit();
+    domain.prepare_thread(&init, 10).unwrap().commit().unwrap();
+    domain.prepare_thread(&child, 20).unwrap().commit().unwrap();
     assert_eq!(domain.registry().thread_membership_count(), 2);
-    assert_eq!(init.prepare_thread(30).err(), Some(ProcessError::Capacity));
+    assert_eq!(
+        domain.prepare_thread(&init, 30).err(),
+        Some(ProcessError::Capacity)
+    );
     assert!(child.remove_thread(20));
-    init.prepare_thread(30).unwrap().commit();
+    domain.prepare_thread(&init, 30).unwrap().commit().unwrap();
     assert_eq!(domain.registry().thread_membership_count(), 2);
     assert!(init.remove_thread(10));
     assert!(init.remove_thread(30));
     exit_and_reap(&domain, &child);
+}
+
+#[test]
+fn fork_admission_publishes_process_and_initial_thread_together() {
+    let domain = domain();
+    let init = init(&domain);
+    let admission = domain.prepare_fork(&init, 2, None).unwrap();
+    let thread = admission.prepare_thread(20).unwrap();
+
+    assert!(domain.registry().get(2).is_none());
+    let child = admission.commit_with_thread(thread).unwrap();
+    assert!(Arc::ptr_eq(&domain.registry().get(2).unwrap(), &child));
+    assert_eq!(child.thread_ids().collect::<Vec<_>>(), [20]);
+    assert_eq!(child.exit_thread(20, 0), ThreadExitOutcome::FinalThread);
+    exit_and_reap(&domain, &child);
+}
+
+#[test]
+fn unpublished_thread_token_cannot_escape_a_rolled_back_process_admission() {
+    let domain = domain();
+    let init = init(&domain);
+    let admission = domain.prepare_fork(&init, 2, None).unwrap();
+    let child = admission.process().clone();
+    let thread = admission.prepare_thread(20).unwrap();
+    drop(admission);
+
+    assert_eq!(thread.commit(), Err(ProcessError::NotPublished));
+    assert!(domain.registry().get(2).is_none());
+    assert_eq!(child.thread_count(), 0);
+    assert_eq!(domain.registry().thread_membership_count(), 0);
+}
+
+#[test]
+fn pending_or_zombie_process_rejects_new_thread_publication() {
+    let domain = domain();
+    let init = init(&domain);
+    let child = child(&domain, &init, 2);
+    let pending = domain.prepare_thread(&child, 20).unwrap();
+
+    assert_eq!(
+        domain.exit(&child, zombie(2), drop),
+        Err(ProcessError::NotLive)
+    );
+    drop(pending);
+    assert_eq!(
+        domain.exit(&child, zombie(2), drop),
+        Ok(ExitOutcome::BecameZombie)
+    );
+    assert_eq!(
+        domain.prepare_thread(&child, 21).err(),
+        Some(ProcessError::NotLive)
+    );
+    assert!(domain.reap(&child).unwrap());
+    assert_eq!(
+        domain.prepare_thread(&child, 22).err(),
+        Some(ProcessError::NotPublished)
+    );
 }

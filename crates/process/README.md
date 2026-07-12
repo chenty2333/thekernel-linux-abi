@@ -30,8 +30,10 @@ struct LinuxZombie {
 let domain = ProcessDomain::<LinuxZombie>::try_new().unwrap();
 let init = domain.try_new_init(1, None).unwrap();
 let child_admission = domain.prepare_fork(&init, 2, Some(17)).unwrap();
-let child = child_admission.process().clone();
-child_admission.commit();
+let initial_thread = child_admission.prepare_thread(2).unwrap();
+let child = child_admission
+    .commit_with_thread(initial_thread)
+    .unwrap();
 
 assert_eq!(
     domain.exit(
@@ -54,6 +56,9 @@ owns one explicitly initialized domain. Historical calls change as follows:
 
 - `Process::try_new_init(...)` becomes `PROCESS_DOMAIN.try_new_init(...)`;
 - `parent.prepare_fork(...)` becomes `PROCESS_DOMAIN.prepare_fork(&parent, ...)`;
+- live thread admission becomes `PROCESS_DOMAIN.prepare_thread(&process, tid)`;
+- an unpublished fork can create its initial thread only through its
+  `ProcessAdmission`, then publish both with `commit_with_thread()`;
 - `process.exit(...)` becomes `PROCESS_DOMAIN.exit(&process, snapshot, ...)`,
   making the durable wait/security snapshot mandatory before zombie state;
 - `process.reap()` becomes `PROCESS_DOMAIN.reap(&process)`;
@@ -66,9 +71,11 @@ owns one explicitly initialized domain. Historical calls change as follows:
 - the historical `ZombieSnapshot` and `ProcessUsage` fields move into the
   kernel's `LinuxZombieSnapshot`/accounting adapter.
 
-The adapter must serialize fork admission/commit against exit for the same
-parent with its existing process-lifecycle lock. The crate does not obtain a
-current task or hide that kernel lock.
+The adapter must serialize runtime-resource construction around fork, but the
+crate itself now linearizes process/thread publication with exit. Reserved
+thread tokens count as lifecycle ownership, stale process Arcs cannot add a
+thread after zombie/reap, and an initial-thread token cannot escape a rolled
+back process admission.
 
 Domain capacity now bounds total reserved/live thread memberships across all
 processes, not merely each process in isolation. `kspin/smp` is mandatory even

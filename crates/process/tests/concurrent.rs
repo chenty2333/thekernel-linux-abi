@@ -39,11 +39,12 @@ fn concurrent_thread_admission_and_removal_refund_domain_credits() {
 
     std::thread::scope(|scope| {
         for worker in 0..WORKERS {
+            let domain = domain.clone();
             let init = init.clone();
             let admitted = admitted.clone();
             scope.spawn(move || {
                 let tid = worker as u32 + 100;
-                init.prepare_thread(tid).unwrap().commit();
+                domain.prepare_thread(&init, tid).unwrap().commit().unwrap();
                 admitted.wait();
                 assert!(init.remove_thread(tid));
             });
@@ -52,6 +53,48 @@ fn concurrent_thread_admission_and_removal_refund_domain_credits() {
 
     assert_eq!(init.thread_count(), 0);
     assert_eq!(domain.registry().thread_membership_count(), 0);
+}
+
+#[test]
+fn concurrent_thread_admission_and_exit_have_one_winner() {
+    for round in 0..64 {
+        let domain = Arc::new(domain());
+        let init = init(&domain);
+        let process = child(&domain, &init, 2);
+        let start = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let worker_domain = domain.clone();
+            let worker_process = process.clone();
+            let worker_start = start.clone();
+            let admission = scope.spawn(move || {
+                worker_start.wait();
+                worker_domain
+                    .prepare_thread(&worker_process, 100 + round)
+                    .and_then(|thread| thread.commit())
+            });
+
+            start.wait();
+            let exit = domain.exit(&process, zombie(2), drop);
+            let admission = admission.join().unwrap();
+
+            match (exit, admission) {
+                (Ok(_), Err(thekernel_linux_process::ProcessError::NotLive)) => {
+                    assert_eq!(process.thread_count(), 0)
+                }
+                (Err(thekernel_linux_process::ProcessError::NotLive), Ok(())) => {
+                    assert_eq!(process.thread_count(), 1)
+                }
+                other => panic!("unexpected exit/admission result: {other:?}"),
+            }
+        });
+
+        if process.thread_count() != 0 {
+            assert!(process.remove_thread(100 + round));
+            domain.exit(&process, zombie(2), drop).unwrap();
+        }
+        assert!(domain.reap(&process).unwrap());
+    }
 }
 
 #[test]

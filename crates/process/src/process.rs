@@ -277,11 +277,27 @@ impl<Z> ProcessRegistry<Z> {
         core::ptr::eq(process.registry.as_ptr(), self)
     }
 
+    fn current_process_locked(state: &RegistryState<Z>, process: &Process<Z>) -> bool {
+        state
+            .entries
+            .find(&process.pid)
+            .get()
+            .is_some_and(|current| core::ptr::eq(current, process))
+    }
+
+    fn contains_process(&self, process: &Process<Z>) -> bool {
+        let state = self.state.lock();
+        Self::current_process_locked(&state, process)
+    }
+
     fn ensure_published(&self, process: &Process<Z>) -> Result<(), ProcessError> {
         if !self.belongs(process) {
             return Err(ProcessError::WrongDomain);
         }
-        if !process.published.load(Ordering::Acquire) || !process.registry_link.is_linked() {
+        let state = self.state.lock();
+        if !process.published.load(Ordering::Acquire)
+            || !Self::current_process_locked(&state, process)
+        {
             return Err(ProcessError::NotPublished);
         }
         Ok(())
@@ -645,6 +661,21 @@ impl<Z> ProcessDomain<Z> {
         self.registry.admit(process)
     }
 
+    /// Reserves a thread membership in an already published live process.
+    ///
+    /// Admission and the zombie transition share the process thread-group
+    /// lock. If exit linearizes first this returns [`ProcessError::NotLive`];
+    /// if this reservation linearizes first, exit fails until the token is
+    /// committed and the thread exits or the token is dropped.
+    pub fn prepare_thread(
+        &self,
+        process: &Arc<Process<Z>>,
+        tid: Pid,
+    ) -> Result<ThreadAdmission<Z>, ProcessError> {
+        self.registry.ensure_published(process)?;
+        process.prepare_thread_in(&self.registry, tid, false)
+    }
+
     /// Creates a new session/group identity and moves `process` into it.
     pub fn try_create_session(
         &self,
@@ -739,18 +770,23 @@ impl<Z> ProcessDomain<Z> {
         if process.is_init() {
             return Ok(ExitOutcome::InitProcess);
         }
-        if process.thread_count() != 0 {
+        let reaper = self.reaper_for_exit(process)?;
+        let tg = process.tg.lock();
+        // Reserved admissions count as lifecycle ownership even before their
+        // TID is visible. Otherwise a pending token could publish a live thread
+        // after the zero-thread check and zombie publication.
+        if tg.memberships != 0 {
             return Err(ProcessError::NotLive);
         }
-        let reaper = self.reaper_for_exit(process)?;
-        let mut payload_slot = process.zombie_payload.lock();
         if process.is_zombie.load(Ordering::Acquire) {
             return Ok(ExitOutcome::AlreadyZombie);
         }
+        let mut payload_slot = process.zombie_payload.lock();
         debug_assert!(payload_slot.is_none());
         *payload_slot = Some(payload);
         process.is_zombie.store(true, Ordering::Release);
         drop(payload_slot);
+        drop(tg);
 
         let reaper_weak = Arc::downgrade(&reaper);
         for child in self.registry.processes() {
@@ -771,7 +807,7 @@ impl<Z> ProcessDomain<Z> {
             return Ok(false);
         }
         self.registry.ensure_published(process)?;
-        if process.thread_count() != 0 {
+        if process.tg.lock().memberships != 0 {
             return Err(ProcessError::NotLive);
         }
         if !process.is_zombie()
@@ -958,18 +994,36 @@ impl<Z> Process<Z> {
         core::mem::replace(&mut *self.group.lock(), group)
     }
 
-    /// Reserves capacity for a thread without publishing its TID.
-    pub fn prepare_thread(self: &Arc<Self>, tid: Pid) -> Result<ThreadAdmission<Z>, ProcessError> {
+    fn prepare_thread_in(
+        self: &Arc<Self>,
+        registry: &Arc<ProcessRegistry<Z>>,
+        tid: Pid,
+        allow_unpublished: bool,
+    ) -> Result<ThreadAdmission<Z>, ProcessError> {
+        if !registry.belongs(self) {
+            return Err(ProcessError::WrongDomain);
+        }
         let node = Arc::try_new(ThreadNode {
             link: RBTreeAtomicLink::new(),
             tid,
             live: AtomicBool::new(false),
         })
         .map_err(|_| ProcessError::NoMemory)?;
-        let registry = self.registry.upgrade().ok_or(ProcessError::WrongDomain)?;
         registry.reserve_thread_member()?;
         let limit = registry.membership_limit;
         let mut tg = self.tg.lock();
+        if self.is_zombie.load(Ordering::Acquire) || self.reaped.load(Ordering::Acquire) {
+            drop(tg);
+            registry.release_thread_member();
+            return Err(ProcessError::NotLive);
+        }
+        if !allow_unpublished
+            && (!self.published.load(Ordering::Acquire) || !registry.contains_process(self))
+        {
+            drop(tg);
+            registry.release_thread_member();
+            return Err(ProcessError::NotPublished);
+        }
         if tg.memberships >= limit {
             drop(tg);
             registry.release_thread_member();
@@ -984,7 +1038,7 @@ impl<Z> Process<Z> {
         tg.memberships += 1;
         drop(tg);
         Ok(ThreadAdmission {
-            registry,
+            registry: registry.clone(),
             process: self.clone(),
             node,
             committed: false,
@@ -1224,10 +1278,54 @@ impl<Z> ProcessAdmission<Z> {
         &self.process
     }
 
+    /// Reserves an initial thread while this token still owns the unpublished
+    /// process identity.
+    ///
+    /// The returned thread token cannot publish by itself until the process is
+    /// published. Use [`commit_with_thread`](Self::commit_with_thread) to make
+    /// both identities visible in one release publication.
+    pub fn prepare_thread(&self, tid: Pid) -> Result<ThreadAdmission<Z>, ProcessError> {
+        self.process.prepare_thread_in(&self.registry, tid, true)
+    }
+
     /// Publishes the process against its reserved registry membership slot.
     pub fn commit(mut self) {
-        self.process.published.store(true, Ordering::Release);
+        let process = self.process.clone();
+        let _tg = process.tg.lock();
+        process.published.store(true, Ordering::Release);
         self.committed = true;
+    }
+
+    /// Publishes this process and one prepared initial thread atomically.
+    ///
+    /// Every allocation and capacity charge has already completed. A registry
+    /// reader that observes the process's release publication also observes
+    /// the initial live thread. Tokens from another process or domain are
+    /// rejected and both reservations roll back when this call returns an
+    /// error.
+    pub fn commit_with_thread(
+        mut self,
+        mut thread: ThreadAdmission<Z>,
+    ) -> Result<Arc<Process<Z>>, ProcessError> {
+        if !Arc::ptr_eq(&self.registry, &thread.registry)
+            || !Arc::ptr_eq(&self.process, &thread.process)
+        {
+            return Err(ProcessError::WrongDomain);
+        }
+
+        let process = self.process.clone();
+        let mut tg = process.tg.lock();
+        if process.published.load(Ordering::Acquire) || !self.registry.contains_process(&process) {
+            return Err(ProcessError::NotPublished);
+        }
+        if process.is_zombie.load(Ordering::Acquire) || process.reaped.load(Ordering::Acquire) {
+            return Err(ProcessError::NotLive);
+        }
+        thread.publish_locked(&mut tg, true)?;
+        process.published.store(true, Ordering::Release);
+        self.committed = true;
+        drop(tg);
+        Ok(process)
     }
 }
 
@@ -1273,19 +1371,43 @@ pub struct ThreadAdmission<Z> {
 }
 
 impl<Z> ThreadAdmission<Z> {
-    /// Marks this already-linked thread membership live without consuming the token.
-    pub fn publish(&mut self) {
-        let mut tg = self.process.tg.lock();
+    fn publish_locked(
+        &mut self,
+        tg: &mut ThreadGroup,
+        allow_unpublished: bool,
+    ) -> Result<(), ProcessError> {
+        if !self.node.link.is_linked() {
+            return Err(ProcessError::NotPublished);
+        }
+        if self.process.is_zombie.load(Ordering::Acquire)
+            || self.process.reaped.load(Ordering::Acquire)
+        {
+            return Err(ProcessError::NotLive);
+        }
+        if !allow_unpublished
+            && (!self.process.published.load(Ordering::Acquire)
+                || !self.registry.contains_process(&self.process))
+        {
+            return Err(ProcessError::NotPublished);
+        }
         if !self.node.live.swap(true, Ordering::Relaxed) {
             tg.live_threads += 1;
         }
-        drop(tg);
         self.committed = true;
+        Ok(())
+    }
+
+    /// Marks this already-linked membership live after revalidating process
+    /// publication and lifecycle state.
+    pub fn publish(&mut self) -> Result<(), ProcessError> {
+        let process = self.process.clone();
+        let mut tg = process.tg.lock();
+        self.publish_locked(&mut tg, false)
     }
 
     /// Publishes the TID against its reserved process membership capacity.
-    pub fn commit(mut self) {
-        self.publish();
+    pub fn commit(mut self) -> Result<(), ProcessError> {
+        self.publish()
     }
 }
 

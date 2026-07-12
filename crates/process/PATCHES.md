@@ -35,6 +35,13 @@ This ledger records semantic changes relative to the immutable
   SID/PGID liveness, and prevent stale empty-group Arcs from being revived.
 - Bound total thread membership across the domain and refund every admission,
   rollback, removal, and exit path exactly once.
+- Bind unpublished initial-thread authority to `ProcessAdmission`; provide a
+  joint process/initial-thread publication transaction, and make every live
+  thread commit revalidate publication and zombie/reap state.
+- Count pending thread reservations during exit so admission and zombie
+  publication have one lock-serialized winner.
+- Revalidate exact process identity under the registry lock instead of reading
+  an intrusive link while concurrent tree rotations are in flight.
 - Enable `kspin/smp` in the workspace dependency so standalone/concurrent tests
   use real locks instead of the single-core no-lock specialization.
 
