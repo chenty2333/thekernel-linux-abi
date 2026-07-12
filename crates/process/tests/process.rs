@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use thekernel_linux_process::{ExitOutcome, ProcessDomain, ProcessError};
+use thekernel_linux_process::{ExitOutcome, ProcessDomain, ProcessError, ThreadExitOutcome};
 
 mod common;
-use common::{Zombie, child, domain, exit_and_reap, init};
+use common::{Zombie, child, domain, exit_and_reap, init, zombie};
 
 #[test]
 fn domains_isolate_pid_identity_and_registry_queries() {
@@ -43,7 +43,7 @@ fn process_admission_is_invisible_until_commit_and_rolls_back() {
     drop(admission);
     assert_eq!(domain.registry().membership_count(), 1);
     assert_eq!(
-        domain.exit(&unpublished, drop),
+        domain.exit(&unpublished, zombie(2), drop),
         Err(ProcessError::NotPublished)
     );
 
@@ -64,21 +64,14 @@ fn typed_zombie_payload_is_once_only_and_survives_runtime_exit() {
         user_ns_cookie: 0xabc,
     };
 
-    assert_eq!(child.try_publish_zombie_payload(payload), Ok(()));
     assert_eq!(
-        child.try_publish_zombie_payload(Zombie {
-            wait_status: 1,
-            uid: 2,
-            user_ns_cookie: 3,
-        }),
-        Err(Zombie {
-            wait_status: 1,
-            uid: 2,
-            user_ns_cookie: 3,
-        })
+        domain.exit(&child, payload, drop),
+        Ok(ExitOutcome::BecameZombie)
     );
-    assert_eq!(domain.exit(&child, drop), Ok(ExitOutcome::BecameZombie));
-    assert_eq!(domain.exit(&child, drop), Ok(ExitOutcome::AlreadyZombie));
+    assert_eq!(
+        domain.exit(&child, zombie(99), drop),
+        Ok(ExitOutcome::AlreadyZombie)
+    );
     assert_eq!(
         domain.prepare_fork(&child, 3, None).err(),
         Some(ProcessError::NotLive)
@@ -97,10 +90,13 @@ fn nearest_live_subreaper_inherits_children_and_zombie_notification() {
     let parent = child(&domain, &subreaper, 3);
     let child = child(&domain, &parent, 4);
 
-    assert_eq!(domain.exit(&child, drop), Ok(ExitOutcome::BecameZombie));
+    assert_eq!(
+        domain.exit(&child, zombie(4), drop),
+        Ok(ExitOutcome::BecameZombie)
+    );
     let mut inherited = Vec::new();
     assert_eq!(
-        domain.exit(&parent, |process| inherited.push(process.pid())),
+        domain.exit(&parent, zombie(3), |process| inherited.push(process.pid())),
         Ok(ExitOutcome::BecameZombie)
     );
     assert_eq!(inherited, [4]);
@@ -125,11 +121,21 @@ fn thread_admissions_are_bounded_ordered_and_rollback_safe() {
     init.prepare_thread(20).unwrap().commit();
     assert_eq!(init.thread_ids().collect::<Vec<_>>(), [10, 20, 30]);
 
-    assert!(!init.exit_thread(10, 7));
-    init.group_exit();
-    assert!(!init.exit_thread(20, 3));
-    assert!(init.exit_thread(30, 3));
-    assert_eq!(init.exit_code(), 7);
+    assert_eq!(init.exit_thread(999, 55), ThreadExitOutcome::NotFound);
+    assert_eq!(init.exit_code(), 0);
+    assert_eq!(
+        init.exit_thread(10, 7),
+        ThreadExitOutcome::LiveThreadsRemain
+    );
+    assert!(init.group_exit(42));
+    assert!(!init.group_exit(99));
+    assert_eq!(
+        init.exit_thread(20, 3),
+        ThreadExitOutcome::LiveThreadsRemain
+    );
+    assert_eq!(init.exit_thread(30, 3), ThreadExitOutcome::FinalThread);
+    assert_eq!(init.exit_code(), 42);
+    assert_eq!(domain.registry().thread_membership_count(), 0);
 }
 
 #[test]
@@ -140,6 +146,27 @@ fn init_is_unique_and_cannot_be_exited() {
         domain.try_new_init(2, None).unwrap_err(),
         ProcessError::AlreadyExists
     );
-    assert_eq!(domain.exit(&init, drop), Ok(ExitOutcome::InitProcess));
+    assert_eq!(
+        domain.exit(&init, zombie(1), drop),
+        Ok(ExitOutcome::InitProcess)
+    );
     assert!(!init.is_zombie());
+}
+
+#[test]
+fn domain_thread_limit_is_shared_across_processes() {
+    let domain = ProcessDomain::<Zombie>::try_with_membership_limit(2).unwrap();
+    let init = init(&domain);
+    let child = child(&domain, &init, 2);
+
+    init.prepare_thread(10).unwrap().commit();
+    child.prepare_thread(20).unwrap().commit();
+    assert_eq!(domain.registry().thread_membership_count(), 2);
+    assert_eq!(init.prepare_thread(30).err(), Some(ProcessError::Capacity));
+    assert!(child.remove_thread(20));
+    init.prepare_thread(30).unwrap().commit();
+    assert_eq!(domain.registry().thread_membership_count(), 2);
+    assert!(init.remove_thread(10));
+    assert!(init.remove_thread(30));
+    exit_and_reap(&domain, &child);
 }

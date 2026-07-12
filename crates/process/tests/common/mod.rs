@@ -11,6 +11,14 @@ pub struct Zombie {
     pub user_ns_cookie: u64,
 }
 
+pub fn zombie(pid: u32) -> Zombie {
+    Zombie {
+        wait_status: pid as i32,
+        uid: pid,
+        user_ns_cookie: 1,
+    }
+}
+
 pub fn domain() -> ProcessDomain<Zombie> {
     ProcessDomain::try_new().unwrap()
 }
@@ -32,7 +40,7 @@ pub fn child(
 
 pub fn exit_and_reap(domain: &ProcessDomain<Zombie>, process: &Arc<Process<Zombie>>) {
     if !process.is_zombie() {
-        domain.exit(process, drop).unwrap();
+        domain.exit(process, zombie(process.pid()), drop).unwrap();
     }
     assert!(domain.reap(process).unwrap());
 }

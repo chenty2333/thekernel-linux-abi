@@ -1,18 +1,28 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::fmt;
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use crate::{Pid, Process, ProcessError, ProcessRegistry, Session};
+use intrusive_collections::RBTreeAtomicLink;
 
 /// A collection of processes inside one session and process registry.
 pub struct ProcessGroup<Z> {
-    pgid: Pid,
+    pub(crate) registry_link: RBTreeAtomicLink,
+    pub(crate) published: AtomicBool,
+    pub(crate) pgid: Pid,
+    pub(crate) memberships: AtomicUsize,
     pub(crate) session: Arc<Session<Z>>,
 }
 
 impl<Z> ProcessGroup<Z> {
     pub(crate) fn try_new(pgid: Pid, session: &Arc<Session<Z>>) -> Result<Arc<Self>, ProcessError> {
         Arc::try_new(Self {
+            registry_link: RBTreeAtomicLink::new(),
+            published: AtomicBool::new(false),
             pgid,
+            memberships: AtomicUsize::new(0),
             session: session.clone(),
         })
         .map_err(|_| ProcessError::NoMemory)
@@ -21,6 +31,16 @@ impl<Z> ProcessGroup<Z> {
     /// The process group ID.
     pub fn pgid(&self) -> Pid {
         self.pgid
+    }
+
+    /// Returns whether this exact group identity is registered and usable.
+    pub fn is_live(&self) -> bool {
+        self.published.load(Ordering::Acquire) && self.registry_link.is_linked()
+    }
+
+    /// Returns live plus reserved process memberships in this group.
+    pub fn membership_count(&self) -> usize {
+        self.memberships.load(Ordering::Acquire)
     }
 
     /// The session containing this process group.
@@ -33,9 +53,7 @@ impl<Z> ProcessGroup<Z> {
         self: &Arc<Self>,
         registry: &ProcessRegistry<Z>,
     ) -> Result<Vec<Arc<Process<Z>>>, ProcessError> {
-        if !self.session.belongs_to(registry) {
-            return Err(ProcessError::WrongDomain);
-        }
+        registry.ensure_group_live(self)?;
         registry.try_collect_process_values(|process| {
             Arc::ptr_eq(&process.group(), self).then(|| process.clone())
         })
@@ -47,9 +65,7 @@ impl<Z> ProcessGroup<Z> {
         registry: &ProcessRegistry<Z>,
         mut visitor: impl FnMut(&Arc<Process<Z>>),
     ) -> Result<(), ProcessError> {
-        if !self.session.belongs_to(registry) {
-            return Err(ProcessError::WrongDomain);
-        }
+        registry.ensure_group_live(self)?;
         for process in registry.processes() {
             if Arc::ptr_eq(&process.group(), self) {
                 visitor(&process);
@@ -64,9 +80,7 @@ impl<Z> ProcessGroup<Z> {
         registry: &ProcessRegistry<Z>,
         mut predicate: impl FnMut(&Arc<Process<Z>>) -> bool,
     ) -> Result<bool, ProcessError> {
-        if !self.session.belongs_to(registry) {
-            return Err(ProcessError::WrongDomain);
-        }
+        registry.ensure_group_live(self)?;
         Ok(registry
             .processes()
             .any(|process| Arc::ptr_eq(&process.group(), self) && predicate(&process)))

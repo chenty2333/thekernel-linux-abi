@@ -13,7 +13,7 @@ fn session_groups_are_registry_scoped_and_deduplicated() {
     let _other_init = init(&other_domain);
     let session = init_process.group().session();
     let child = child(&process_domain, &init_process, 2);
-    let child_group = child.try_create_group().unwrap().unwrap();
+    let child_group = process_domain.try_create_group(&child).unwrap().unwrap();
 
     let groups = session
         .try_process_groups(process_domain.registry())

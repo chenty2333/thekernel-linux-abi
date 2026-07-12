@@ -17,7 +17,7 @@ homepage = "https://github.com/chenty2333/thekernel-linux-abi"
 [workspace.dependencies]
 bytemuck = { version = "1.24", default-features = false }
 intrusive-collections = "0.9"
-kspin = "0.1"
+kspin = { version = "0.1", features = ["smp"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

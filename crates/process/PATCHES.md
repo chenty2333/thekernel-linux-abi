@@ -21,11 +21,22 @@ This ledger records semantic changes relative to the immutable
 - Route fork, exit, and reap through the owning domain; require the registry
   argument for child, group, and session enumeration.
 - Replace `ZombieSnapshot { wait_status, uid, self_usage, child_usage }` and
-  `ProcessUsage` with an opaque generic payload `Z` published at most once.
+  `ProcessUsage` with an opaque generic payload `Z` that must be supplied to
+  the successful zombie transition.
   Linux wait encoding, credentials, resource accounting, and errno mapping are
   now kernel-adapter policy.
-- Make duplicate zombie-payload publication explicit and idempotently report
-  duplicate process-exit transitions.
+- Make duplicate process-exit transitions idempotent without overwriting the
+  first durable payload.
+- Validate a live TID before changing the stored exit code; return a typed
+  `ThreadExitOutcome`, and record the first group-exit code atomically.
+- Compare-and-replace child parent pointers during exit so a racing ancestor
+  cannot overwrite a newer reparent decision.
+- Register session and process-group identities in the domain, enforce unique
+  SID/PGID liveness, and prevent stale empty-group Arcs from being revived.
+- Bound total thread membership across the domain and refund every admission,
+  rollback, removal, and exit path exactly once.
+- Enable `kspin/smp` in the workspace dependency so standalone/concurrent tests
+  use real locks instead of the single-core no-lock specialization.
 
 ## Why 0.1.0 remains nightly-only
 

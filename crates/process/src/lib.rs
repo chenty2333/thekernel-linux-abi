@@ -20,7 +20,8 @@ pub type Pid = u32;
 
 pub use process::{
     CreatedSession, ExitOutcome, PROCESS_MEMBERSHIP_LIMIT, Process, ProcessAdmission,
-    ProcessDomain, ProcessError, ProcessRegistry, Processes, ThreadAdmission, ThreadIds,
+    ProcessDomain, ProcessError, ProcessRegistry, Processes, ThreadAdmission, ThreadExitOutcome,
+    ThreadIds,
 };
 pub use process_group::ProcessGroup;
 pub use session::Session;

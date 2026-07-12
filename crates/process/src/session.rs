@@ -1,14 +1,22 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::{any::Any, fmt};
+use core::{
+    any::Any,
+    fmt,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
+use intrusive_collections::RBTreeAtomicLink;
 use kspin::SpinNoIrq;
 
 use crate::{Pid, ProcessError, ProcessGroup, ProcessRegistry};
 
 /// A collection of process groups inside one explicit process registry.
 pub struct Session<Z> {
-    sid: Pid,
+    pub(crate) registry_link: RBTreeAtomicLink,
+    pub(crate) published: AtomicBool,
+    pub(crate) sid: Pid,
     registry: alloc::sync::Weak<ProcessRegistry<Z>>,
+    pub(crate) groups: AtomicUsize,
     terminal: SpinNoIrq<Option<Arc<dyn Any + Send + Sync>>>,
 }
 
@@ -18,8 +26,11 @@ impl<Z> Session<Z> {
         registry: &Arc<ProcessRegistry<Z>>,
     ) -> Result<Arc<Self>, ProcessError> {
         Arc::try_new(Self {
+            registry_link: RBTreeAtomicLink::new(),
+            published: AtomicBool::new(false),
             sid,
             registry: Arc::downgrade(registry),
+            groups: AtomicUsize::new(0),
             terminal: SpinNoIrq::new(None),
         })
         .map_err(|_| ProcessError::NoMemory)
@@ -34,6 +45,16 @@ impl<Z> Session<Z> {
         self.sid
     }
 
+    /// Returns whether this exact session identity is registered and usable.
+    pub fn is_live(&self) -> bool {
+        self.published.load(Ordering::Acquire) && self.registry_link.is_linked()
+    }
+
+    /// Returns the number of live process-group identities in this session.
+    pub fn group_count(&self) -> usize {
+        self.groups.load(Ordering::Acquire)
+    }
+
     /// Fallibly snapshots the live process groups in this registry and session.
     pub fn try_process_groups(
         self: &Arc<Self>,
@@ -42,13 +63,7 @@ impl<Z> Session<Z> {
         if !self.belongs_to(registry) {
             return Err(ProcessError::WrongDomain);
         }
-        let mut groups = registry.try_collect_process_values(|process| {
-            let group = process.group();
-            Arc::ptr_eq(&group.session(), self).then_some(group)
-        })?;
-        groups.sort_unstable_by_key(|group| group.pgid());
-        groups.dedup_by_key(|group| group.pgid());
-        Ok(groups)
+        registry.try_session_groups(self)
     }
 
     /// Installs a terminal if this session does not already own one.

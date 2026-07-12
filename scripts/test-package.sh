@@ -93,6 +93,7 @@ for package in "${packages[@]}"; do
         }
         grep -Fq 'toolchain = "nightly-2025-05-20"' "$package_dir/Cargo.toml"
         grep -Fq 'nightly-features = ["allocator_api"]' "$package_dir/Cargo.toml"
+        grep -Fq 'features = ["smp"]' "$package_dir/Cargo.toml"
     fi
 
     run_cargo test --manifest-path "$package_dir/Cargo.toml" --all-features

@@ -9,4 +9,5 @@ crate-local change and provenance ledger.
   baseline.
 - Prepare `thekernel-linux-usercopy` 0.1.0 as the first release candidate.
 - Prepare `thekernel-linux-process` 0.1.0 with explicit domain/registry
-  ownership and a generic durable zombie payload.
+  ownership, mandatory generic zombie snapshots, unique job-control identities,
+  domain-wide thread accounting, and SMP concurrency gates.

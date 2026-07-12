@@ -4,7 +4,7 @@ use alloc::{
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use intrusive_collections::{Bound, KeyAdapter, RBTree, RBTreeAtomicLink, intrusive_adapter};
@@ -12,10 +12,11 @@ use kspin::SpinNoIrq;
 
 use crate::{Pid, ProcessGroup, Session};
 
-/// Default maximum number of process or per-process thread membership records.
+/// Default maximum for process identities and domain-wide thread memberships.
 ///
-/// A [`ProcessDomain`] may choose a lower process-registry limit. Its processes
-/// use that same lower limit for each thread group.
+/// A [`ProcessDomain`] may choose a lower limit. The same bound applies to its
+/// process identities, group/session identities, total threads, and each
+/// individual thread group.
 pub const PROCESS_MEMBERSHIP_LIMIT: usize = 65_536;
 
 /// Failure returned by fallible process-lifecycle operations.
@@ -61,6 +62,17 @@ pub enum ExitOutcome {
     AlreadyZombie,
     /// This call performed the zombie transition and child reparenting.
     BecameZombie,
+}
+
+/// Result of removing one live thread from a process.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ThreadExitOutcome {
+    /// The requested TID was not a live member and no state changed.
+    NotFound,
+    /// The thread exited while at least one live thread remained.
+    LiveThreadsRemain,
+    /// The thread exited and no live threads remained.
+    FinalThread,
 }
 
 /// A newly created session together with its initial process group.
@@ -131,9 +143,37 @@ impl<'a, Z> KeyAdapter<'a> for ProcessAdapter<Z> {
     }
 }
 
+intrusive_adapter!(ProcessGroupAdapter<Z> = Arc<ProcessGroup<Z>>: ProcessGroup<Z> {
+    registry_link: RBTreeAtomicLink
+});
+
+impl<'a, Z> KeyAdapter<'a> for ProcessGroupAdapter<Z> {
+    type Key = Pid;
+
+    fn get_key(&self, group: &'a ProcessGroup<Z>) -> Self::Key {
+        group.pgid
+    }
+}
+
+intrusive_adapter!(SessionAdapter<Z> = Arc<Session<Z>>: Session<Z> {
+    registry_link: RBTreeAtomicLink
+});
+
+impl<'a, Z> KeyAdapter<'a> for SessionAdapter<Z> {
+    type Key = Pid;
+
+    fn get_key(&self, session: &'a Session<Z>) -> Self::Key {
+        session.sid
+    }
+}
+
 struct RegistryState<Z> {
     entries: RBTree<ProcessAdapter<Z>>,
     memberships: usize,
+    groups: RBTree<ProcessGroupAdapter<Z>>,
+    group_count: usize,
+    sessions: RBTree<SessionAdapter<Z>>,
+    session_count: usize,
 }
 
 impl<Z> RegistryState<Z> {
@@ -141,6 +181,10 @@ impl<Z> RegistryState<Z> {
         Self {
             entries: RBTree::new(ProcessAdapter::new()),
             memberships: 0,
+            groups: RBTree::new(ProcessGroupAdapter::new()),
+            group_count: 0,
+            sessions: RBTree::new(SessionAdapter::new()),
+            session_count: 0,
         }
     }
 }
@@ -152,6 +196,7 @@ impl<Z> RegistryState<Z> {
 pub struct ProcessRegistry<Z> {
     state: SpinNoIrq<RegistryState<Z>>,
     membership_limit: usize,
+    thread_memberships: AtomicUsize,
 }
 
 impl<Z> ProcessRegistry<Z> {
@@ -159,10 +204,11 @@ impl<Z> ProcessRegistry<Z> {
         Self {
             state: SpinNoIrq::new(RegistryState::new()),
             membership_limit: membership_limit.min(PROCESS_MEMBERSHIP_LIMIT),
+            thread_memberships: AtomicUsize::new(0),
         }
     }
 
-    /// Returns the configured process and per-process thread membership limit.
+    /// Returns the configured identity and domain-wide thread membership limit.
     pub fn membership_limit(&self) -> usize {
         self.membership_limit
     }
@@ -172,12 +218,43 @@ impl<Z> ProcessRegistry<Z> {
         self.state.lock().memberships
     }
 
+    /// Returns the domain-wide number of live and reserved thread memberships.
+    pub fn thread_membership_count(&self) -> usize {
+        self.thread_memberships.load(Ordering::Acquire)
+    }
+
+    /// Returns the number of registered process-group identities.
+    pub fn process_group_count(&self) -> usize {
+        self.state.lock().group_count
+    }
+
+    /// Returns the number of registered session identities.
+    pub fn session_count(&self) -> usize {
+        self.state.lock().session_count
+    }
+
     /// Looks up one published process by PID.
     pub fn get(&self, pid: Pid) -> Option<Arc<Process<Z>>> {
         let state = self.state.lock();
         let process = state.entries.find(&pid).clone_pointer();
         drop(state);
         process.filter(|process| process.published.load(Ordering::Acquire))
+    }
+
+    /// Looks up one live process-group identity by PGID.
+    pub fn get_process_group(&self, pgid: Pid) -> Option<Arc<ProcessGroup<Z>>> {
+        let state = self.state.lock();
+        let group = state.groups.find(&pgid).clone_pointer();
+        drop(state);
+        group.filter(|group| group.published.load(Ordering::Acquire))
+    }
+
+    /// Looks up one live session identity by SID.
+    pub fn get_session(&self, sid: Pid) -> Option<Arc<Session<Z>>> {
+        let state = self.state.lock();
+        let session = state.sessions.find(&sid).clone_pointer();
+        drop(state);
+        session.filter(|session| session.published.load(Ordering::Acquire))
     }
 
     /// Iterates published processes in PID order without allocating.
@@ -210,6 +287,191 @@ impl<Z> ProcessRegistry<Z> {
         Ok(())
     }
 
+    fn current_group_locked(state: &RegistryState<Z>, group: &ProcessGroup<Z>) -> bool {
+        state
+            .groups
+            .find(&group.pgid)
+            .get()
+            .is_some_and(|current| core::ptr::eq(current, group))
+    }
+
+    fn current_session_locked(state: &RegistryState<Z>, session: &Session<Z>) -> bool {
+        state
+            .sessions
+            .find(&session.sid)
+            .get()
+            .is_some_and(|current| core::ptr::eq(current, session))
+    }
+
+    pub(crate) fn ensure_group_live(&self, group: &ProcessGroup<Z>) -> Result<(), ProcessError> {
+        if !group.session.belongs_to(self) {
+            return Err(ProcessError::WrongDomain);
+        }
+        let state = self.state.lock();
+        let current =
+            Self::current_group_locked(&state, group) && group.published.load(Ordering::Acquire);
+        drop(state);
+        current.then_some(()).ok_or(ProcessError::NotPublished)
+    }
+
+    fn admit_session_group(
+        self: &Arc<Self>,
+        session: Arc<Session<Z>>,
+        group: Arc<ProcessGroup<Z>>,
+        new_session: bool,
+    ) -> Result<JobControlAdmission<Z>, ProcessError> {
+        if !session.belongs_to(self)
+            || !group.session.belongs_to(self)
+            || !Arc::ptr_eq(&group.session, &session)
+        {
+            return Err(ProcessError::WrongDomain);
+        }
+
+        let mut state = self.state.lock();
+        if state.group_count >= self.membership_limit
+            || (new_session && state.session_count >= self.membership_limit)
+        {
+            return Err(ProcessError::Capacity);
+        }
+        if !state.groups.find(&group.pgid).is_null() {
+            return Err(ProcessError::AlreadyExists);
+        }
+        if new_session {
+            if !state.sessions.find(&session.sid).is_null() {
+                return Err(ProcessError::AlreadyExists);
+            }
+            state.sessions.insert(session.clone());
+            state.session_count += 1;
+        } else if !Self::current_session_locked(&state, &session)
+            || !session.published.load(Ordering::Acquire)
+        {
+            return Err(ProcessError::NotPublished);
+        }
+
+        state.groups.insert(group.clone());
+        state.group_count += 1;
+        session.groups.fetch_add(1, Ordering::AcqRel);
+        drop(state);
+        Ok(JobControlAdmission {
+            registry: self.clone(),
+            session,
+            group,
+            new_session,
+            committed: false,
+        })
+    }
+
+    fn reserve_group_member(
+        &self,
+        group: &Arc<ProcessGroup<Z>>,
+        allow_unpublished: bool,
+    ) -> Result<(), ProcessError> {
+        if !group.session.belongs_to(self) {
+            return Err(ProcessError::WrongDomain);
+        }
+        let state = self.state.lock();
+        if !Self::current_group_locked(&state, group)
+            || (!allow_unpublished && !group.published.load(Ordering::Acquire))
+        {
+            return Err(ProcessError::NotPublished);
+        }
+        group.memberships.fetch_add(1, Ordering::AcqRel);
+        drop(state);
+        Ok(())
+    }
+
+    fn remove_empty_group(&self, group: &Arc<ProcessGroup<Z>>) {
+        let (removed_group, removed_session) = {
+            let mut state = self.state.lock();
+            if group.memberships.load(Ordering::Acquire) != 0
+                || !Self::current_group_locked(&state, group)
+            {
+                return;
+            }
+            group.published.store(false, Ordering::Release);
+            // SAFETY: pointer identity was checked under the registry lock.
+            let removed_group = unsafe {
+                state
+                    .groups
+                    .cursor_mut_from_ptr(Arc::as_ptr(group))
+                    .remove()
+            };
+            if removed_group.is_some() {
+                state.group_count -= 1;
+            }
+
+            let session = &group.session;
+            let previous = session.groups.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0, "session group count underflow");
+            let removed_session = if previous == 1 && Self::current_session_locked(&state, session)
+            {
+                session.published.store(false, Ordering::Release);
+                // SAFETY: pointer identity was checked under the registry lock.
+                let removed = unsafe {
+                    state
+                        .sessions
+                        .cursor_mut_from_ptr(Arc::as_ptr(session))
+                        .remove()
+                };
+                if removed.is_some() {
+                    state.session_count -= 1;
+                }
+                removed
+            } else {
+                None
+            };
+            (removed_group, removed_session)
+        };
+        drop(removed_group);
+        drop(removed_session);
+    }
+
+    fn release_group_member(&self, group: &Arc<ProcessGroup<Z>>) {
+        let previous = group.memberships.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "process group membership underflow");
+        if previous == 1 {
+            self.remove_empty_group(group);
+        }
+    }
+
+    fn reserve_thread_member(&self) -> Result<(), ProcessError> {
+        self.thread_memberships
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.membership_limit).then_some(current + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| ProcessError::Capacity)
+    }
+
+    fn release_thread_member(&self) {
+        let previous = self.thread_memberships.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "domain thread membership underflow");
+    }
+
+    pub(crate) fn try_session_groups(
+        &self,
+        session: &Arc<Session<Z>>,
+    ) -> Result<Vec<Arc<ProcessGroup<Z>>>, ProcessError> {
+        if !session.belongs_to(self) {
+            return Err(ProcessError::WrongDomain);
+        }
+        {
+            let state = self.state.lock();
+            if !Self::current_session_locked(&state, session)
+                || !session.published.load(Ordering::Acquire)
+            {
+                return Err(ProcessError::NotPublished);
+            }
+        }
+        let mut groups = self.try_collect_process_values(|process| {
+            let group = process.group();
+            (group.is_live() && Arc::ptr_eq(&group.session(), session)).then_some(group)
+        })?;
+        groups.sort_unstable_by_key(|group| group.pgid());
+        groups.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        Ok(groups)
+    }
+
     fn admit(
         self: &Arc<Self>,
         process: Arc<Process<Z>>,
@@ -217,6 +479,7 @@ impl<Z> ProcessRegistry<Z> {
         if !self.belongs(&process) {
             return Err(ProcessError::WrongDomain);
         }
+        let group = process.group();
         let mut state = self.state.lock();
         if state.memberships >= self.membership_limit {
             return Err(ProcessError::Capacity);
@@ -224,8 +487,12 @@ impl<Z> ProcessRegistry<Z> {
         if !state.entries.find(&process.pid).is_null() {
             return Err(ProcessError::AlreadyExists);
         }
+        if !Self::current_group_locked(&state, &group) {
+            return Err(ProcessError::NotPublished);
+        }
         state.entries.insert(process.clone());
         state.memberships += 1;
+        group.memberships.fetch_add(1, Ordering::AcqRel);
         drop(state);
         Ok(ProcessAdmission {
             registry: self.clone(),
@@ -283,6 +550,22 @@ pub struct ProcessDomain<Z> {
     init: SpinNoIrq<Option<Arc<Process<Z>>>>,
 }
 
+fn reparent_if_owned<Z>(
+    child: &Process<Z>,
+    expected_parent: &Arc<Process<Z>>,
+    replacement: &Weak<Process<Z>>,
+) -> bool {
+    let old_parent = {
+        let mut parent = child.parent.lock();
+        if parent.as_ptr() != Arc::as_ptr(expected_parent) {
+            return false;
+        }
+        core::mem::replace(&mut *parent, replacement.clone())
+    };
+    drop(old_parent);
+    true
+}
+
 impl<Z> ProcessDomain<Z> {
     /// Fallibly creates a domain with the default bounded membership limit.
     pub fn try_new() -> Result<Self, ProcessError> {
@@ -317,6 +600,9 @@ impl<Z> ProcessDomain<Z> {
     ) -> Result<Arc<Process<Z>>, ProcessError> {
         let session = Session::try_new(pid, &self.registry)?;
         let group = ProcessGroup::try_new(pid, &session)?;
+        let job_control =
+            self.registry
+                .admit_session_group(session.clone(), group.clone(), true)?;
         let process = Process::try_allocate(&self.registry, pid, true, None, group, exit_signal)?;
         let admission = self.registry.admit(process.clone())?;
 
@@ -324,8 +610,10 @@ impl<Z> ProcessDomain<Z> {
         if init.is_some() {
             drop(init);
             drop(admission);
+            drop(job_control);
             return Err(ProcessError::AlreadyExists);
         }
+        job_control.commit();
         admission.commit();
         *init = Some(process.clone());
         Ok(process)
@@ -357,6 +645,72 @@ impl<Z> ProcessDomain<Z> {
         self.registry.admit(process)
     }
 
+    /// Creates a new session/group identity and moves `process` into it.
+    pub fn try_create_session(
+        &self,
+        process: &Arc<Process<Z>>,
+    ) -> Result<Option<CreatedSession<Z>>, ProcessError> {
+        self.registry.ensure_published(process)?;
+        let old_group = process.group();
+        if old_group.session.sid() == process.pid {
+            return Ok(None);
+        }
+        let session = Session::try_new(process.pid, &self.registry)?;
+        let group = ProcessGroup::try_new(process.pid, &session)?;
+        let admission = self
+            .registry
+            .admit_session_group(session.clone(), group.clone(), true)?;
+        self.registry.reserve_group_member(&group, true)?;
+        let previous = process.replace_group(group.clone());
+        admission.commit();
+        self.registry.release_group_member(&previous);
+        Ok(Some((session, group)))
+    }
+
+    /// Creates a unique group in the current session and moves `process` into it.
+    pub fn try_create_group(
+        &self,
+        process: &Arc<Process<Z>>,
+    ) -> Result<Option<Arc<ProcessGroup<Z>>>, ProcessError> {
+        self.registry.ensure_published(process)?;
+        let old_group = process.group();
+        if old_group.pgid() == process.pid {
+            return Ok(None);
+        }
+        let session = old_group.session();
+        let group = ProcessGroup::try_new(process.pid, &session)?;
+        let admission = self
+            .registry
+            .admit_session_group(session, group.clone(), false)?;
+        self.registry.reserve_group_member(&group, true)?;
+        let previous = process.replace_group(group.clone());
+        admission.commit();
+        self.registry.release_group_member(&previous);
+        Ok(Some(group))
+    }
+
+    /// Moves `process` to a live group in the same session.
+    pub fn move_to_group(
+        &self,
+        process: &Arc<Process<Z>>,
+        group: &Arc<ProcessGroup<Z>>,
+    ) -> Result<bool, ProcessError> {
+        self.registry.ensure_published(process)?;
+        self.registry.ensure_group_live(group)?;
+        let mut current = process.group.lock();
+        if Arc::ptr_eq(&current, group) {
+            return Ok(true);
+        }
+        if !Arc::ptr_eq(&current.session, &group.session) {
+            return Ok(false);
+        }
+        self.registry.reserve_group_member(group, false)?;
+        let previous = core::mem::replace(&mut *current, group.clone());
+        drop(current);
+        self.registry.release_group_member(&previous);
+        Ok(true)
+    }
+
     fn reaper_for_exit(&self, process: &Arc<Process<Z>>) -> Result<Arc<Process<Z>>, ProcessError> {
         let init = self.init_process().ok_or(ProcessError::NotInitialized)?;
         let mut ancestor = process.parent();
@@ -378,30 +732,30 @@ impl<Z> ProcessDomain<Z> {
     pub fn exit(
         &self,
         process: &Arc<Process<Z>>,
+        payload: Z,
         mut inherited_zombie: impl FnMut(Arc<Process<Z>>),
     ) -> Result<ExitOutcome, ProcessError> {
         self.registry.ensure_published(process)?;
         if process.is_init() {
             return Ok(ExitOutcome::InitProcess);
         }
+        if process.thread_count() != 0 {
+            return Err(ProcessError::NotLive);
+        }
         let reaper = self.reaper_for_exit(process)?;
-        if process
-            .is_zombie
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let mut payload_slot = process.zombie_payload.lock();
+        if process.is_zombie.load(Ordering::Acquire) {
             return Ok(ExitOutcome::AlreadyZombie);
         }
+        debug_assert!(payload_slot.is_none());
+        *payload_slot = Some(payload);
+        process.is_zombie.store(true, Ordering::Release);
+        drop(payload_slot);
 
         let reaper_weak = Arc::downgrade(&reaper);
-        for child in self.registry.processes().filter(|child| {
-            child
-                .parent()
-                .is_some_and(|parent| Arc::ptr_eq(&parent, process))
-        }) {
-            let old_parent = core::mem::replace(&mut *child.parent.lock(), reaper_weak.clone());
-            drop(old_parent);
-            if child.is_zombie() {
+        for child in self.registry.processes() {
+            let moved = reparent_if_owned(&child, process, &reaper_weak);
+            if moved && child.is_zombie() {
                 inherited_zombie(child);
             }
         }
@@ -417,6 +771,9 @@ impl<Z> ProcessDomain<Z> {
             return Ok(false);
         }
         self.registry.ensure_published(process)?;
+        if process.thread_count() != 0 {
+            return Err(ProcessError::NotLive);
+        }
         if !process.is_zombie()
             || process
                 .reaped
@@ -426,6 +783,7 @@ impl<Z> ProcessDomain<Z> {
             return Ok(false);
         }
 
+        let group = process.group();
         let removed = {
             let mut state = self.registry.state.lock();
             // SAFETY: registry identity was checked above, the linked bit is
@@ -443,6 +801,9 @@ impl<Z> ProcessDomain<Z> {
         };
         let existed = removed.is_some();
         drop(removed);
+        if existed {
+            self.registry.release_group_member(&group);
+        }
         Ok(existed)
     }
 }
@@ -547,18 +908,6 @@ impl<Z> Process<Z> {
         self.exit_signal
     }
 
-    /// Publishes the caller-defined durable zombie payload exactly once.
-    ///
-    /// On duplicate publication, ownership of `payload` is returned unchanged.
-    pub fn try_publish_zombie_payload(&self, payload: Z) -> Result<(), Z> {
-        let mut slot = self.zombie_payload.lock();
-        if slot.is_some() {
-            return Err(payload);
-        }
-        *slot = Some(payload);
-        Ok(())
-    }
-
     /// Copies the caller-defined zombie payload, if it has been published.
     ///
     /// Requiring `Copy` keeps arbitrary clone or allocation code out of the
@@ -605,47 +954,8 @@ impl<Z> Process<Z> {
         self.group.lock().clone()
     }
 
-    fn set_group(self: &Arc<Self>, group: &Arc<ProcessGroup<Z>>) {
-        let old = core::mem::replace(&mut *self.group.lock(), group.clone());
-        drop(old);
-    }
-
-    /// Fallibly creates a new session and group, then moves this process into it.
-    pub fn try_create_session(self: &Arc<Self>) -> Result<Option<CreatedSession<Z>>, ProcessError> {
-        if self.group().session.sid() == self.pid {
-            return Ok(None);
-        }
-        let registry = self.registry.upgrade().ok_or(ProcessError::WrongDomain)?;
-        let session = Session::try_new(self.pid, &registry)?;
-        let group = ProcessGroup::try_new(self.pid, &session)?;
-        self.set_group(&group);
-        Ok(Some((session, group)))
-    }
-
-    /// Fallibly creates a new process group, then moves this process into it.
-    pub fn try_create_group(
-        self: &Arc<Self>,
-    ) -> Result<Option<Arc<ProcessGroup<Z>>>, ProcessError> {
-        let old_group = self.group();
-        if old_group.pgid() == self.pid {
-            return Ok(None);
-        }
-        let group = ProcessGroup::try_new(self.pid, &old_group.session)?;
-        self.set_group(&group);
-        Ok(Some(group))
-    }
-
-    /// Moves this process to a group in the same session and registry.
-    pub fn move_to_group(self: &Arc<Self>, group: &Arc<ProcessGroup<Z>>) -> bool {
-        let old_group = self.group();
-        if Arc::ptr_eq(&old_group, group) {
-            return true;
-        }
-        if !Arc::ptr_eq(&old_group.session, &group.session) {
-            return false;
-        }
-        self.set_group(group);
-        true
+    fn replace_group(&self, group: Arc<ProcessGroup<Z>>) -> Arc<ProcessGroup<Z>> {
+        core::mem::replace(&mut *self.group.lock(), group)
     }
 
     /// Reserves capacity for a thread without publishing its TID.
@@ -656,22 +966,25 @@ impl<Z> Process<Z> {
             live: AtomicBool::new(false),
         })
         .map_err(|_| ProcessError::NoMemory)?;
-        let limit = self
-            .registry
-            .upgrade()
-            .ok_or(ProcessError::WrongDomain)?
-            .membership_limit;
+        let registry = self.registry.upgrade().ok_or(ProcessError::WrongDomain)?;
+        registry.reserve_thread_member()?;
+        let limit = registry.membership_limit;
         let mut tg = self.tg.lock();
         if tg.memberships >= limit {
+            drop(tg);
+            registry.release_thread_member();
             return Err(ProcessError::Capacity);
         }
         if !tg.threads.find(&tid).is_null() {
+            drop(tg);
+            registry.release_thread_member();
             return Err(ProcessError::AlreadyExists);
         }
         tg.threads.insert(node.clone());
         tg.memberships += 1;
         drop(tg);
         Ok(ThreadAdmission {
+            registry,
             process: self.clone(),
             node,
             committed: false,
@@ -694,7 +1007,7 @@ impl<Z> Process<Z> {
     }
 
     /// Removes a live thread without updating process exit state.
-    pub fn remove_thread(&self, tid: Pid) {
+    pub fn remove_thread(&self, tid: Pid) -> bool {
         let removed = {
             let mut tg = self.tg.lock();
             let node = tg.threads.find(&tid).get().and_then(|thread| {
@@ -705,26 +1018,43 @@ impl<Z> Process<Z> {
             });
             node.and_then(|node| Self::detach_thread_locked(&mut tg, node))
         };
+        let existed = removed.is_some();
         drop(removed);
+        if existed && let Some(registry) = self.registry.upgrade() {
+            registry.release_thread_member();
+        }
+        existed
     }
 
-    /// Removes a thread and reports whether it was the final live thread.
-    pub fn exit_thread(&self, tid: Pid, exit_code: i32) -> bool {
+    /// Removes a live thread and reports the exact transition.
+    pub fn exit_thread(&self, tid: Pid, exit_code: i32) -> ThreadExitOutcome {
         let mut tg = self.tg.lock();
-        if !tg.group_exited {
-            tg.exit_code = exit_code;
-        }
         let node = tg.threads.find(&tid).get().and_then(|thread| {
             thread
                 .live
                 .load(Ordering::Relaxed)
                 .then_some(thread as *const ThreadNode)
         });
-        let removed = node.and_then(|node| Self::detach_thread_locked(&mut tg, node));
+        let Some(node) = node else {
+            return ThreadExitOutcome::NotFound;
+        };
+        if !tg.group_exited {
+            tg.exit_code = exit_code;
+        }
+        let removed = Self::detach_thread_locked(&mut tg, node);
         let empty = tg.live_threads == 0;
         drop(tg);
+        let existed = removed.is_some();
         drop(removed);
-        empty
+        debug_assert!(existed);
+        if let Some(registry) = self.registry.upgrade() {
+            registry.release_thread_member();
+        }
+        if empty {
+            ThreadExitOutcome::FinalThread
+        } else {
+            ThreadExitOutcome::LiveThreadsRemain
+        }
     }
 
     /// Returns the live thread count without allocating.
@@ -812,9 +1142,17 @@ impl<Z> Process<Z> {
         self.tg.lock().group_exited
     }
 
-    /// Marks this process as group-exited.
-    pub fn group_exit(&self) {
-        self.tg.lock().group_exited = true;
+    /// Atomically records the first group-exit code and marks group exit.
+    ///
+    /// Returns `true` only for the caller that established the group exit.
+    pub fn group_exit(&self, exit_code: i32) -> bool {
+        let mut tg = self.tg.lock();
+        if tg.group_exited {
+            return false;
+        }
+        tg.exit_code = exit_code;
+        tg.group_exited = true;
+        true
     }
 
     /// Returns the stored process exit code.
@@ -847,6 +1185,32 @@ impl<Z> fmt::Debug for Process<Z> {
     }
 }
 
+struct JobControlAdmission<Z> {
+    registry: Arc<ProcessRegistry<Z>>,
+    session: Arc<Session<Z>>,
+    group: Arc<ProcessGroup<Z>>,
+    new_session: bool,
+    committed: bool,
+}
+
+impl<Z> JobControlAdmission<Z> {
+    fn commit(mut self) {
+        if self.new_session {
+            self.session.published.store(true, Ordering::Release);
+        }
+        self.group.published.store(true, Ordering::Release);
+        self.committed = true;
+    }
+}
+
+impl<Z> Drop for JobControlAdmission<Z> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.registry.remove_empty_group(&self.group);
+        }
+    }
+}
+
 /// Reserved, fully allocated child process awaiting final publication.
 pub struct ProcessAdmission<Z> {
     registry: Arc<ProcessRegistry<Z>>,
@@ -872,6 +1236,7 @@ impl<Z> Drop for ProcessAdmission<Z> {
         if self.committed {
             return;
         }
+        let group = self.process.group();
         let removed = {
             let mut state = self.registry.state.lock();
             if !self.process.registry_link.is_linked() {
@@ -891,12 +1256,17 @@ impl<Z> Drop for ProcessAdmission<Z> {
                 removed
             }
         };
+        let existed = removed.is_some();
         drop(removed);
+        if existed {
+            self.registry.release_group_member(&group);
+        }
     }
 }
 
 /// Reserved thread-group membership awaiting final publication.
 pub struct ThreadAdmission<Z> {
+    registry: Arc<ProcessRegistry<Z>>,
     process: Arc<Process<Z>>,
     node: Arc<ThreadNode>,
     committed: bool,
@@ -930,7 +1300,11 @@ impl<Z> Drop for ThreadAdmission<Z> {
                     Process::<Z>::detach_thread_locked(&mut tg, Arc::as_ptr(&self.node))
                 }
             };
+            let existed = removed.is_some();
             drop(removed);
+            if existed {
+                self.registry.release_thread_member();
+            }
         }
     }
 }
@@ -982,5 +1356,36 @@ impl<Z> Iterator for ThreadIds<Z> {
         let last = self.last.take();
         drop(last);
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reparent_compare_does_not_overwrite_a_newer_parent() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let init = domain.try_new_init(1, None).unwrap();
+        let first = domain.prepare_fork(&init, 2, None).unwrap();
+        let first_process = first.process().clone();
+        first.commit();
+        let second = domain.prepare_fork(&init, 3, None).unwrap();
+        let second_process = second.process().clone();
+        second.commit();
+        let child = domain.prepare_fork(&first_process, 4, None).unwrap();
+        let child_process = child.process().clone();
+        child.commit();
+
+        *child_process.parent.lock() = Arc::downgrade(&second_process);
+        assert!(!reparent_if_owned(
+            &child_process,
+            &first_process,
+            &Arc::downgrade(&init),
+        ));
+        assert!(Arc::ptr_eq(
+            &child_process.parent().unwrap(),
+            &second_process
+        ));
     }
 }
