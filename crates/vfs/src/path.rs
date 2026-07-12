@@ -3,6 +3,8 @@
 pub struct ResolveFlags(u64);
 
 impl ResolveFlags {
+    /// No scoped-resolution restrictions.
+    pub const EMPTY: Self = Self(0);
     /// Reject crossing mount points, including bind-style mount aliases.
     pub const NO_XDEV: Self = Self(0x01);
     /// Reject magic-link traversal.

@@ -40,6 +40,8 @@ pub trait DacCredentials {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeKind {
+    /// Filesystem-specific or currently unknown inode kind.
+    Unknown,
     /// Regular file.
     Regular,
     /// Directory.
