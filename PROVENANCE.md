@@ -1,6 +1,6 @@
 # Provenance Policy
 
-Every migrated or derived crate records:
+Every migrated registry crate records:
 
 - the immutable upstream package/version and archive checksum;
 - the source repository and Cargo-recorded source commit;
@@ -8,6 +8,11 @@ Every migrated or derived crate records:
 - the exact original manifest as `Cargo.toml.orig`;
 - a `VENDOR.md` narrative and a maintained patch ledger; and
 - the local changes that establish TheKernel's public contract.
+
+A new extraction with no upstream registry identity instead records the exact
+TheKernel source commit and paths, contract/RFC commit, research snapshots,
+authors, and license. Its active manifest is the original manifest; maintainers
+must not invent an upstream archive, `Cargo.toml.orig`, or Cargo VCS record.
 
 Original metadata remains in Git even when it is excluded as package source.
 Published packages include the human-readable provenance and patch ledger, but

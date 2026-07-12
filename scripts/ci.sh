@@ -25,7 +25,7 @@ cd "$repo_root"
 run_cargo fmt --all -- --check
 
 if [ "$stable_only" = 1 ]; then
-    for package in thekernel-linux-usercopy thekernel-linux-vfs; do
+    for package in thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd; do
         run_cargo clippy -p "$package" --all-targets --all-features -- -D warnings
         run_cargo test -p "$package" --all-features
     done
@@ -38,11 +38,15 @@ fi
 
 run_cargo check -p thekernel-linux-usercopy --no-default-features --lib
 run_cargo check -p thekernel-linux-vfs --no-default-features --lib
+run_cargo check -p thekernel-linux-fd --no-default-features --lib
+run_cargo check -p thekernel-linux-fd --features alloc --lib
 
 for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
     run_cargo check -p thekernel-linux-usercopy --no-default-features --target "$target"
     run_cargo check -p thekernel-linux-usercopy --features alloc --target "$target"
     run_cargo check -p thekernel-linux-vfs --no-default-features --target "$target"
+    run_cargo check -p thekernel-linux-fd --no-default-features --target "$target"
+    run_cargo check -p thekernel-linux-fd --features alloc --target "$target"
     if [ "$stable_only" = 0 ]; then
         run_cargo check -p thekernel-linux-process --no-default-features --target "$target"
         run_cargo check -p thekernel-linux-signal --no-default-features --target "$target"
@@ -52,13 +56,14 @@ done
 
 "$script_dir/check-provenance.sh"
 if [ "$stable_only" = 1 ]; then
-    package_list=(thekernel-linux-usercopy thekernel-linux-vfs)
+    package_list=(thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd)
 else
     package_list=(
         thekernel-linux-usercopy
         thekernel-linux-process
         thekernel-linux-signal
         thekernel-linux-vfs
+        thekernel-linux-fd
     )
 fi
 CARGO_TOOLCHAIN=${CARGO_TOOLCHAIN:-} \

@@ -18,6 +18,8 @@ bump the minor version; compatible fixes bump the patch version.
 
 ## Dependency order
 
-The initial order is usercopy, process, then signal. Future credential, VFS,
-FD, and MM packages are published only after their respective semantic gates,
-in that order. No empty `thekernel-linux-abi` facade is published.
+The 0.1.0 registry order is usercopy, process, VFS, FD, then signal. Signal is
+last because its registry manifest depends on the published usercopy version;
+the other three packages are independent. Future credential and MM packages
+are published only after their respective semantic and real-consumer gates.
+No empty `thekernel-linux-abi` facade is published.

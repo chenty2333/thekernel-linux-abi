@@ -18,12 +18,14 @@ jobs:
         with:
           toolchain: 1.85.0
       - uses: Swatinem/rust-cache@v2
-      - name: Usercopy minimum supported Rust tests
+      - name: Stable crates minimum supported Rust tests
         run: |
           cargo +1.85.0 test -p thekernel-linux-usercopy --all-features
           cargo +1.85.0 check -p thekernel-linux-usercopy --no-default-features --lib
           cargo +1.85.0 test -p thekernel-linux-vfs --all-features
           cargo +1.85.0 check -p thekernel-linux-vfs --no-default-features --lib
+          cargo +1.85.0 test -p thekernel-linux-fd --all-features
+          cargo +1.85.0 check -p thekernel-linux-fd --no-default-features --lib
 
   stable:
     runs-on: ubuntu-latest
@@ -34,7 +36,7 @@ jobs:
           components: clippy,rustfmt
           targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
       - uses: Swatinem/rust-cache@v2
-      - name: Usercopy stable release-candidate gate
+      - name: Stable crates release-candidate gate
         env:
           CARGO_TOOLCHAIN: stable
         run: ./scripts/ci.sh
@@ -49,7 +51,7 @@ jobs:
           components: clippy,rustfmt
           targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
       - uses: Swatinem/rust-cache@v2
-      - name: Full usercopy, process, and signal release-candidate gate
+      - name: Full Linux ABI workspace release-candidate gate
         env:
           CARGO_TOOLCHAIN: nightly-2025-05-20
         run: ./scripts/ci.sh

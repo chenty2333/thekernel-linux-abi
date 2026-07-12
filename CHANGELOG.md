@@ -16,3 +16,9 @@ crate-local change and provenance ledger.
   refunds, cancellation-safe two-phase thread registration and delivery
   quiescence, generation-safe one-shot actions, transactional
   context/mask/alternate-stack restore, and dual-architecture gates.
+- Prepare `thekernel-linux-vfs` 0.1.0 with immutable path contexts, strict
+  resolve policy, bounded traversal, Linux DAC/create rules, and rollback-safe
+  mutation publication.
+- Prepare `thekernel-linux-fd` 0.1.0 with bounded FD/OFD state, retained
+  registration accounting, transactional close/publication, epoll delivery,
+  finite graph validation, and explicit recovery budgets.

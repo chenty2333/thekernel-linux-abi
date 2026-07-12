@@ -8,13 +8,15 @@ The initial graph is:
 
 ```text
 thekernel-linux-signal -> thekernel-linux-usercopy
+thekernel-linux-vfs       (independent policy core)
+thekernel-linux-fd        (independent policy core)
 thekernel-linux-process   (independent)
 thekernel-linux-usercopy  (independent)
 ```
 
-Future credentials remain independent. VFS may depend on credentials and a
-generic VFS contract; FD may depend on credentials, signals, and generic
-readiness; MM may depend on credentials, usercopy, and generic mapping
+Future credentials remain independent. VFS and FD currently accept typed
+caller snapshots rather than depending on a credential, signal, or generic
+mechanism package. MM may depend on credentials, usercopy, and generic mapping
 mechanisms. VFS objects and file-backed MM are connected through explicit
 adapter traits rather than dependency cycles.
 
@@ -40,3 +42,16 @@ side effects. `SA_RESETHAND` claims are generation checked, and `uc_stack`
 restore separates crate-owned structural validation from caller-owned address,
 minimum-size, and active-stack policy. The syscall adapter may select policy,
 but it must not reconstruct frame, reset, or rollback semantics.
+
+The VFS crate owns Linux path scope, traversal budgets, DAC/create decisions,
+and mutation rollback over a generic walker supplied by the consumer. The FD
+crate owns descriptor/OFD identity and Linux readiness/epoll state over
+retained generic source registrations. Neither crate fixes a concrete lock,
+map, RCU scheme, filesystem object, waker, task, errno, or syscall record.
+
+The FD adapter must publish `EpollGraph` and `EpollCore` changes as one
+transaction, retain every source token until cancellation, and run
+check-arm-check around source installation. Timeout, signal interruption,
+close, `DEL`, `MOD`, copyout failure, and partial arm failure all terminate in
+an explicit cancel, replay, or rollback path; no periodic scan or hidden
+busy-poll fallback is part of the contract.
