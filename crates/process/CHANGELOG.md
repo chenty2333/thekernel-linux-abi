@@ -18,6 +18,10 @@
   process handles cannot create threads after exit or reap.
 - Make published-process validation exact and registry-locked under concurrent
   intrusive-tree mutation.
+- Make all registry and lifecycle counters checked on admission and
+  non-wrapping on release, including duplicate-refund fail-closed tests.
+- Remove public lifecycle reliance on invariant assertions when exit or thread
+  state is stale or inconsistent.
 - Exercise admission, removal, reparenting, exit, and reap concurrently with
   `kspin/smp` enabled.
 - Declare and test the package as nightly-only while fallible standard `Arc`

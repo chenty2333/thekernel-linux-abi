@@ -82,4 +82,11 @@ processes, not merely each process in isolation. `kspin/smp` is mandatory even
 for the unpacked standalone package, and concurrent admission, removal,
 reparent, exit, and reap tests exercise the real inter-CPU locks.
 
+Every process, group, session, and thread charge uses checked bounded
+admission. Release uses non-wrapping compare/update or checked arithmetic; an
+impossible duplicate internal release leaves a zero counter at zero instead
+of manufacturing `usize::MAX` capacity. Public lifecycle calls return typed
+outcomes for stale, duplicate, exhausted, or non-live state and do not depend
+on `panic!`, `expect`, or wrapping arithmetic to enforce registry invariants.
+
 See `VENDOR.md` and `PATCHES.md` for the immutable StarryOS source lineage.

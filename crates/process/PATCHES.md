@@ -42,6 +42,11 @@ This ledger records semantic changes relative to the immutable
   publication have one lock-serialized winner.
 - Revalidate exact process identity under the registry lock instead of reading
   an intrusive link while concurrent tree rotations are in flight.
+- Use checked bounded increments for process, group, session, and thread
+  charges. Every release is non-wrapping, so a duplicate internal refund keeps
+  zero at zero and fails closed instead of creating effective infinity.
+- Replace the final public exit/thread invariant assertions with idempotent or
+  typed outcomes; lifecycle input cannot reach a panic/expect path.
 - Enable `kspin/smp` in the workspace dependency so standalone/concurrent tests
   use real locks instead of the single-core no-lock specialization.
 

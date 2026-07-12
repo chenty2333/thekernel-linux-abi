@@ -19,6 +19,34 @@ use crate::{Pid, ProcessGroup, Session};
 /// individual thread group.
 pub const PROCESS_MEMBERSHIP_LIMIT: usize = 65_536;
 
+fn reserve_bounded_counter(counter: &AtomicUsize, limit: usize) -> Result<(), ProcessError> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1).filter(|next| *next <= limit)
+        })
+        .map(|_| ())
+        .map_err(|_| ProcessError::Capacity)
+}
+
+/// Releases one internal resource charge without ever wrapping through
+/// `usize::MAX`. `None` means the counter was already zero; callers then retain
+/// surrounding registry state instead of turning corruption into new capacity.
+fn release_counter(counter: &AtomicUsize) -> Option<usize> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_sub(1)
+        })
+        .ok()
+}
+
+fn decrement_count(counter: &mut usize) -> bool {
+    let Some(next) = counter.checked_sub(1) else {
+        return false;
+    };
+    *counter = next;
+    true
+}
+
 /// Failure returned by fallible process-lifecycle operations.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
@@ -352,21 +380,38 @@ impl<Z> ProcessRegistry<Z> {
         if !state.groups.find(&group.pgid).is_null() {
             return Err(ProcessError::AlreadyExists);
         }
+        let next_group_count = state
+            .group_count
+            .checked_add(1)
+            .filter(|next| *next <= self.membership_limit)
+            .ok_or(ProcessError::Capacity)?;
+        let next_session_count = new_session
+            .then(|| {
+                state
+                    .session_count
+                    .checked_add(1)
+                    .filter(|next| *next <= self.membership_limit)
+                    .ok_or(ProcessError::Capacity)
+            })
+            .transpose()?;
         if new_session {
             if !state.sessions.find(&session.sid).is_null() {
                 return Err(ProcessError::AlreadyExists);
             }
-            state.sessions.insert(session.clone());
-            state.session_count += 1;
         } else if !Self::current_session_locked(&state, &session)
             || !session.published.load(Ordering::Acquire)
         {
             return Err(ProcessError::NotPublished);
         }
 
+        reserve_bounded_counter(&session.groups, self.membership_limit)?;
+        if let Some(next_session_count) = next_session_count {
+            state.sessions.insert(session.clone());
+            state.session_count = next_session_count;
+        }
+
         state.groups.insert(group.clone());
-        state.group_count += 1;
-        session.groups.fetch_add(1, Ordering::AcqRel);
+        state.group_count = next_group_count;
         drop(state);
         Ok(JobControlAdmission {
             registry: self.clone(),
@@ -391,7 +436,7 @@ impl<Z> ProcessRegistry<Z> {
         {
             return Err(ProcessError::NotPublished);
         }
-        group.memberships.fetch_add(1, Ordering::AcqRel);
+        reserve_bounded_counter(&group.memberships, self.membership_limit)?;
         drop(state);
         Ok(())
     }
@@ -413,13 +458,13 @@ impl<Z> ProcessRegistry<Z> {
                     .remove()
             };
             if removed_group.is_some() {
-                state.group_count -= 1;
+                decrement_count(&mut state.group_count);
             }
 
             let session = &group.session;
-            let previous = session.groups.fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(previous > 0, "session group count underflow");
-            let removed_session = if previous == 1 && Self::current_session_locked(&state, session)
+            let removed_session = if removed_group.is_some()
+                && release_counter(&session.groups) == Some(1)
+                && Self::current_session_locked(&state, session)
             {
                 session.published.store(false, Ordering::Release);
                 // SAFETY: pointer identity was checked under the registry lock.
@@ -430,7 +475,7 @@ impl<Z> ProcessRegistry<Z> {
                         .remove()
                 };
                 if removed.is_some() {
-                    state.session_count -= 1;
+                    decrement_count(&mut state.session_count);
                 }
                 removed
             } else {
@@ -443,25 +488,17 @@ impl<Z> ProcessRegistry<Z> {
     }
 
     fn release_group_member(&self, group: &Arc<ProcessGroup<Z>>) {
-        let previous = group.memberships.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "process group membership underflow");
-        if previous == 1 {
+        if release_counter(&group.memberships) == Some(1) {
             self.remove_empty_group(group);
         }
     }
 
     fn reserve_thread_member(&self) -> Result<(), ProcessError> {
-        self.thread_memberships
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.membership_limit).then_some(current + 1)
-            })
-            .map(|_| ())
-            .map_err(|_| ProcessError::Capacity)
+        reserve_bounded_counter(&self.thread_memberships, self.membership_limit)
     }
 
     fn release_thread_member(&self) {
-        let previous = self.thread_memberships.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "domain thread membership underflow");
+        release_counter(&self.thread_memberships);
     }
 
     pub(crate) fn try_session_groups(
@@ -500,15 +537,20 @@ impl<Z> ProcessRegistry<Z> {
         if state.memberships >= self.membership_limit {
             return Err(ProcessError::Capacity);
         }
+        let next_memberships = state
+            .memberships
+            .checked_add(1)
+            .filter(|next| *next <= self.membership_limit)
+            .ok_or(ProcessError::Capacity)?;
         if !state.entries.find(&process.pid).is_null() {
             return Err(ProcessError::AlreadyExists);
         }
         if !Self::current_group_locked(&state, &group) {
             return Err(ProcessError::NotPublished);
         }
+        reserve_bounded_counter(&group.memberships, self.membership_limit)?;
         state.entries.insert(process.clone());
-        state.memberships += 1;
-        group.memberships.fetch_add(1, Ordering::AcqRel);
+        state.memberships = next_memberships;
         drop(state);
         Ok(ProcessAdmission {
             registry: self.clone(),
@@ -782,7 +824,11 @@ impl<Z> ProcessDomain<Z> {
             return Ok(ExitOutcome::AlreadyZombie);
         }
         let mut payload_slot = process.zombie_payload.lock();
-        debug_assert!(payload_slot.is_none());
+        if payload_slot.is_some() {
+            // Preserve the first durable exit snapshot even if an embedding
+            // bug exposed an inconsistent publication state.
+            return Ok(ExitOutcome::AlreadyZombie);
+        }
         *payload_slot = Some(payload);
         process.is_zombie.store(true, Ordering::Release);
         drop(payload_slot);
@@ -831,7 +877,7 @@ impl<Z> ProcessDomain<Z> {
                     .remove()
             };
             if removed.is_some() {
-                state.memberships -= 1;
+                decrement_count(&mut state.memberships);
             }
             removed
         };
@@ -1034,8 +1080,17 @@ impl<Z> Process<Z> {
             registry.release_thread_member();
             return Err(ProcessError::AlreadyExists);
         }
+        let Some(next_memberships) = tg
+            .memberships
+            .checked_add(1)
+            .filter(|next| *next <= limit)
+        else {
+            drop(tg);
+            registry.release_thread_member();
+            return Err(ProcessError::Capacity);
+        };
         tg.threads.insert(node.clone());
-        tg.memberships += 1;
+        tg.memberships = next_memberships;
         drop(tg);
         Ok(ThreadAdmission {
             registry: registry.clone(),
@@ -1052,9 +1107,9 @@ impl<Z> Process<Z> {
         // SAFETY: callers obtain `node` from this tree while holding `tg`.
         let removed = unsafe { tg.threads.cursor_mut_from_ptr(node).remove() };
         if let Some(node) = removed.as_ref() {
-            tg.memberships -= 1;
+            decrement_count(&mut tg.memberships);
             if node.live.swap(false, Ordering::Relaxed) {
-                tg.live_threads -= 1;
+                decrement_count(&mut tg.live_threads);
             }
         }
         removed
@@ -1098,9 +1153,10 @@ impl<Z> Process<Z> {
         let removed = Self::detach_thread_locked(&mut tg, node);
         let empty = tg.live_threads == 0;
         drop(tg);
-        let existed = removed.is_some();
+        let Some(removed) = removed else {
+            return ThreadExitOutcome::NotFound;
+        };
         drop(removed);
-        debug_assert!(existed);
         if let Some(registry) = self.registry.upgrade() {
             registry.release_thread_member();
         }
@@ -1349,7 +1405,7 @@ impl<Z> Drop for ProcessAdmission<Z> {
                         .remove()
                 };
                 if removed.is_some() {
-                    state.memberships -= 1;
+                    decrement_count(&mut state.memberships);
                 }
                 removed
             }
@@ -1390,8 +1446,14 @@ impl<Z> ThreadAdmission<Z> {
         {
             return Err(ProcessError::NotPublished);
         }
-        if !self.node.live.swap(true, Ordering::Relaxed) {
-            tg.live_threads += 1;
+        if !self.node.live.load(Ordering::Relaxed) {
+            let next_live = tg
+                .live_threads
+                .checked_add(1)
+                .filter(|next| *next <= tg.memberships)
+                .ok_or(ProcessError::Capacity)?;
+            self.node.live.store(true, Ordering::Relaxed);
+            tg.live_threads = next_live;
         }
         self.committed = true;
         Ok(())
@@ -1484,6 +1546,32 @@ impl<Z> Iterator for ThreadIds<Z> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_counters_never_wrap_at_either_edge() {
+        let counter = AtomicUsize::new(0);
+        assert_eq!(release_counter(&counter), None);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        counter.store(usize::MAX, Ordering::Release);
+        assert_eq!(
+            reserve_bounded_counter(&counter, usize::MAX),
+            Err(ProcessError::Capacity)
+        );
+        assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
+
+        let mut plain = 0usize;
+        assert!(!decrement_count(&mut plain));
+        assert_eq!(plain, 0);
+    }
+
+    #[test]
+    fn duplicate_internal_release_keeps_zero_domain_charge() {
+        let domain = ProcessDomain::<()>::try_with_membership_limit(1).unwrap();
+        domain.registry.release_thread_member();
+        domain.registry.release_thread_member();
+        assert_eq!(domain.registry.thread_membership_count(), 0);
+    }
 
     #[test]
     fn reparent_compare_does_not_overwrite_a_newer_parent() {
