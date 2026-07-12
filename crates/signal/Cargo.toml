@@ -1,0 +1,47 @@
+[package]
+name = "thekernel-linux-signal"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+description = "Bounded signal queues and explicit-usercopy frames for no_std Linux ABI kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "signal"]
+categories = ["no-std", "os"]
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
+
+[features]
+default = []
+multitask = ["dep:axsync", "axsync/multitask"]
+
+[dependencies]
+axcpu.workspace = true
+bitflags.workspace = true
+cfg-if.workspace = true
+derive_more.workspace = true
+kspin.workspace = true
+linux-raw-sys.workspace = true
+log.workspace = true
+strum.workspace = true
+thekernel-linux-usercopy.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+axsync = { workspace = true, optional = true }
+
+# axcpu accepts any x86_64 0.15 release, but 0.15.5 requires a newer Step
+# contract than this package's pinned nightly. A direct target constraint keeps
+# standalone and unpacked package builds reproducible.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[package.metadata.thekernel]
+toolchain = "nightly-2025-05-20"
+nightly-features = ["allocator_api"]
+
+[lints]
+workspace = true

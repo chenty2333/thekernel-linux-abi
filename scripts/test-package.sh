@@ -13,9 +13,34 @@ run_cargo() {
 }
 
 if [ "$#" -eq 0 ]; then
-    packages=(thekernel-linux-usercopy thekernel-linux-process)
+    packages=(
+        thekernel-linux-usercopy
+        thekernel-linux-process
+        thekernel-linux-signal
+    )
 else
     packages=("$@")
+fi
+
+# The signal package intentionally depends on the unpublished usercopy release
+# candidate. Test it against the packaged usercopy source, not the workspace
+# checkout, including when signal is the only package requested.
+needs_packaged_usercopy=0
+for package in "${packages[@]}"; do
+    case "$package" in
+        thekernel-linux-signal)
+            needs_packaged_usercopy=1
+            ;;
+    esac
+done
+if [ "$needs_packaged_usercopy" = 1 ]; then
+    ordered_packages=(thekernel-linux-usercopy)
+    for package in "${packages[@]}"; do
+        if [ "$package" != thekernel-linux-usercopy ]; then
+            ordered_packages+=("$package")
+        fi
+    done
+    packages=("${ordered_packages[@]}")
 fi
 
 unpack_root=$(mktemp -d)
@@ -32,15 +57,41 @@ for package in "${packages[@]}"; do
             version=0.1.0
             crate_path=crates/process
             ;;
+        thekernel-linux-signal)
+            version=0.1.0
+            crate_path=crates/signal
+            ;;
         *)
             printf 'unknown workspace package: %s\n' "$package" >&2
             exit 1
             ;;
     esac
 
-    package_args=(package --locked -p "$package")
+    if [ "$package" = thekernel-linux-signal ]; then
+        # Cargo's nightly workspace packager can assemble an unpublished
+        # intra-workspace dependency and its consumer in one release set.
+        # The explicit unpacked tests below replace Cargo's staging verifier.
+        package_args=(
+            -Z package-workspace
+            package
+            --locked
+            --no-verify
+            -p thekernel-linux-usercopy
+            -p thekernel-linux-signal
+        )
+    else
+        package_args=(package --locked -p "$package")
+    fi
     if [ "${PACKAGE_ALLOW_DIRTY:-0}" = 1 ]; then
         package_args+=(--allow-dirty)
+    fi
+    if [ "$package" = thekernel-linux-signal ]; then
+        packaged_usercopy_dir="$unpack_root/thekernel-linux-usercopy-0.1.0"
+        [ -d "$packaged_usercopy_dir" ] || {
+            printf 'packaged usercopy dependency missing: %s\n' \
+                "$packaged_usercopy_dir" >&2
+            exit 1
+        }
     fi
     run_cargo "${package_args[@]}"
 
@@ -86,18 +137,45 @@ for package in "${packages[@]}"; do
     grep -Fq 'license = "Apache-2.0"' "$package_dir/Cargo.toml"
     grep -Fq 'repository = "https://github.com/chenty2333/thekernel-linux-abi"' \
         "$package_dir/Cargo.toml"
-    if [ "$package" = thekernel-linux-process ]; then
-        ! grep -Fq 'rust-version' "$package_dir/Cargo.toml" || {
-            printf '%s must not claim a stable rust-version\n' "$package" >&2
-            exit 1
-        }
-        grep -Fq 'toolchain = "nightly-2025-05-20"' "$package_dir/Cargo.toml"
-        grep -Fq 'nightly-features = ["allocator_api"]' "$package_dir/Cargo.toml"
-        grep -Fq 'features = ["smp"]' "$package_dir/Cargo.toml"
+    case "$package" in
+        thekernel-linux-process|thekernel-linux-signal)
+            ! grep -Fq 'rust-version' "$package_dir/Cargo.toml" || {
+                printf '%s must not claim a stable rust-version\n' "$package" >&2
+                exit 1
+            }
+            grep -Fq 'toolchain = "nightly-2025-05-20"' "$package_dir/Cargo.toml"
+            grep -Fq 'nightly-features = ["allocator_api"]' "$package_dir/Cargo.toml"
+            awk '
+                $0 == "[dependencies.kspin]" { in_kspin = 1; next }
+                in_kspin && /^\[/ { in_kspin = 0 }
+                in_kspin && $0 == "features = [\"smp\"]" { found = 1 }
+                END { exit(found ? 0 : 1) }
+            ' "$package_dir/Cargo.toml" || {
+                printf '%s packaged kspin dependency must enable smp\n' \
+                    "$package" >&2
+                exit 1
+            }
+            ;;
+    esac
+
+    unpacked_cargo_config=()
+    if [ "$package" = thekernel-linux-signal ]; then
+        grep -Fq 'thekernel-linux-usercopy' "$package_dir/Cargo.toml"
+        unpacked_cargo_config=(
+            --config
+            "patch.crates-io.thekernel-linux-usercopy.path=\"$packaged_usercopy_dir\""
+        )
     fi
 
-    run_cargo test --manifest-path "$package_dir/Cargo.toml" --all-features
-    run_cargo check --manifest-path "$package_dir/Cargo.toml" --no-default-features --lib
+    run_cargo test \
+        --manifest-path "$package_dir/Cargo.toml" \
+        --all-features \
+        "${unpacked_cargo_config[@]}"
+    run_cargo check \
+        --manifest-path "$package_dir/Cargo.toml" \
+        --no-default-features \
+        --lib \
+        "${unpacked_cargo_config[@]}"
 
     printf 'package-unpack: PASS (%s)\n' "$archive"
 done

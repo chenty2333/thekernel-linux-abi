@@ -5,6 +5,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 usercopy_dir="$repo_root/crates/usercopy"
 process_dir="$repo_root/crates/process"
+signal_dir="$repo_root/crates/signal"
 
 check_sha256() {
     local expected=$1
@@ -48,5 +49,20 @@ grep -Fq '88fa031a95c25b7bcfe8883f9f53238c9053a2a89f790bb1a7c35d080c6d3b65' \
 grep -Fq 'ab4fd0e8f91587ca18d3d2ab3e79dcf88b4200a8' "$process_dir/VENDOR.md"
 grep -Fq 'ad905ce0f555026609fd874c6ef58fca6d510162' "$process_dir/VENDOR.md"
 grep -Fq 'dbbaea9ff0ee6c63bdfb9d9828d4a8d25ba8d0b1' "$process_dir/VENDOR.md"
+
+check_sha256 \
+    e0eaa00fb0430f9a29f19ea632bf3bce0a27cbf37536c1fa81054b10aae4ff53 \
+    "$signal_dir/Cargo.toml.orig"
+check_sha256 \
+    4f0f5db3891f208616ae362c6ea0e0c63d7cc7ac2dc2b774c7b1b9a08171a11f \
+    "$signal_dir/.cargo_vcs_info.json"
+check_sha256 \
+    58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd \
+    "$signal_dir/LICENSE"
+
+grep -Fq 'f72adf2bff529986c36c6b3920332afbefd0f6f6178855347f1bac15f4304d37' \
+    "$signal_dir/VENDOR.md"
+grep -Fq '0a39846c582895555816145f47f82ceb0c89aa62' "$signal_dir/VENDOR.md"
+grep -Fq 'dbbaea9ff0ee6c63bdfb9d9828d4a8d25ba8d0b1' "$signal_dir/VENDOR.md"
 
 printf 'provenance: PASS\n'

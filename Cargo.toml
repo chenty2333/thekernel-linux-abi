@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/process", "crates/usercopy"]
+members = ["crates/process", "crates/signal", "crates/usercopy"]
 
 [workspace.package]
 edition = "2024"
@@ -15,9 +15,22 @@ repository = "https://github.com/chenty2333/thekernel-linux-abi"
 homepage = "https://github.com/chenty2333/thekernel-linux-abi"
 
 [workspace.dependencies]
+axcpu = { version = "=0.3.0-preview.8", features = ["uspace"] }
+axsync = { version = "=0.3.0-preview.2", default-features = false }
+bitflags = "2.6"
 bytemuck = { version = "1.24", default-features = false }
+cfg-if = "1"
+derive_more = { version = "2.0", default-features = false, features = ["full"] }
 intrusive-collections = "0.9"
 kspin = { version = "0.1", features = ["smp"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = [
+    "general",
+    "no_std",
+] }
+log = "0.4"
+strum = { version = "0.27", default-features = false, features = ["derive"] }
+thekernel-linux-usercopy = { path = "crates/usercopy", version = "0.1" }
+x86_64 = { version = "=0.15.4", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
