@@ -47,4 +47,7 @@ pub use subscription::{
     PreparedSubscription, RetainedRegistration, Subscription, WatchAccount, WatchChargeError,
 };
 #[cfg(feature = "alloc")]
-pub use table::CloseBatch;
+pub use table::{
+    CancelPreparedError, CloseBatch, CommittedCloseOnExec, PreparePublicationError,
+    PreparedCloseOnExec, PreparedPublication,
+};

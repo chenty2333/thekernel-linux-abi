@@ -87,6 +87,11 @@ fn nearest_live_subreaper_inherits_children_and_zombie_notification() {
     let domain = domain();
     let init = init(&domain);
     let subreaper = child(&domain, &init, 2);
+    domain
+        .prepare_thread(&subreaper, 2)
+        .unwrap()
+        .commit()
+        .unwrap();
     subreaper.set_child_subreaper(true);
     let parent = child(&domain, &subreaper, 3);
     let child = child(&domain, &parent, 4);
@@ -105,6 +110,7 @@ fn nearest_live_subreaper_inherits_children_and_zombie_notification() {
 
     assert!(domain.reap(&child).unwrap());
     assert!(domain.reap(&parent).unwrap());
+    assert!(subreaper.remove_thread(2));
     exit_and_reap(&domain, &subreaper);
 }
 
@@ -113,7 +119,10 @@ fn thread_admissions_are_bounded_ordered_and_rollback_safe() {
     let domain = ProcessDomain::<Zombie>::try_with_membership_limit(3).unwrap();
     let init = init(&domain);
 
-    domain.prepare_thread(&init, 30).unwrap().commit().unwrap();
+    let _ = domain
+        .prepare_thread(&init, 30)
+        .unwrap()
+        .commit_infallible();
     domain.prepare_thread(&init, 10).unwrap().commit().unwrap();
     let pending = domain.prepare_thread(&init, 20).unwrap();
     assert_eq!(init.try_threads().unwrap(), [10, 30]);
@@ -182,15 +191,41 @@ fn domain_thread_limit_is_shared_across_processes() {
 fn fork_admission_publishes_process_and_initial_thread_together() {
     let domain = domain();
     let init = init(&domain);
-    let admission = domain.prepare_fork(&init, 2, None).unwrap();
-    let thread = admission.prepare_thread(20).unwrap();
+    let admission = domain
+        .prepare_fork(&init, 2, None)
+        .unwrap()
+        .prepare_initial_thread(20)
+        .unwrap();
+    let reserved = admission.process().clone();
 
     assert!(domain.registry().get(2).is_none());
-    let child = admission.commit_with_thread(thread).unwrap();
+    let child = admission.commit();
+    assert!(Arc::ptr_eq(&child, &reserved));
     assert!(Arc::ptr_eq(&domain.registry().get(2).unwrap(), &child));
     assert_eq!(child.thread_ids().collect::<Vec<_>>(), [20]);
     assert_eq!(child.exit_thread(20, 0), ThreadExitOutcome::FinalThread);
     exit_and_reap(&domain, &child);
+}
+
+#[test]
+fn typed_initial_process_transaction_rolls_back_both_reservations() {
+    let domain = domain();
+    let init = init(&domain);
+    let admission = domain
+        .prepare_fork(&init, 2, None)
+        .unwrap()
+        .prepare_initial_thread(20)
+        .unwrap();
+    let child = admission.process().clone();
+
+    assert_eq!(domain.registry().membership_count(), 2);
+    assert_eq!(domain.registry().thread_membership_count(), 1);
+    drop(admission);
+
+    assert!(domain.registry().get(2).is_none());
+    assert_eq!(domain.registry().membership_count(), 1);
+    assert_eq!(domain.registry().thread_membership_count(), 0);
+    assert_eq!(child.thread_count(), 0);
 }
 
 #[test]
@@ -233,4 +268,29 @@ fn pending_or_zombie_process_rejects_new_thread_publication() {
         domain.prepare_thread(&child, 22).err(),
         Some(ProcessError::NotPublished)
     );
+}
+
+#[test]
+fn prepared_exit_excludes_competing_lifecycle_work_and_rolls_back() {
+    let domain = domain();
+    let init = init(&domain);
+    let child = child(&domain, &init, 2);
+    let exit = domain.prepare_exit(&child).unwrap();
+
+    assert!(Arc::ptr_eq(exit.process(), &child));
+    assert_eq!(
+        domain.prepare_thread(&child, 20).err(),
+        Some(ProcessError::NotLive)
+    );
+    assert_eq!(
+        domain.exit(&child, zombie(2), drop),
+        Err(ProcessError::Busy)
+    );
+    drop(exit);
+
+    assert_eq!(
+        domain.exit(&child, zombie(2), drop),
+        Ok(ExitOutcome::BecameZombie)
+    );
+    assert!(domain.reap(&child).unwrap());
 }

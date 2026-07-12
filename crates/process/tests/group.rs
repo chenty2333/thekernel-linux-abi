@@ -1,9 +1,30 @@
 use std::sync::Arc;
 
-use thekernel_linux_process::ProcessError;
+use thekernel_linux_process::{Process, ProcessDomain, ProcessError, ThreadExitOutcome};
 
 mod common;
-use common::{child, domain, exit_and_reap, init};
+use common::{Zombie, domain, exit_and_reap, init, zombie};
+
+fn live_child(
+    domain: &ProcessDomain<Zombie>,
+    parent: &Arc<Process<Zombie>>,
+    pid: u32,
+) -> Arc<Process<Zombie>> {
+    domain
+        .prepare_fork(parent, pid, Some(17))
+        .unwrap()
+        .prepare_initial_thread(pid)
+        .unwrap()
+        .commit()
+}
+
+fn exit_live_and_reap(domain: &ProcessDomain<Zombie>, process: &Arc<Process<Zombie>>) {
+    assert_eq!(
+        process.exit_thread(process.pid(), 0),
+        ThreadExitOutcome::FinalThread
+    );
+    exit_and_reap(domain, process);
+}
 
 #[test]
 fn group_membership_uses_an_explicit_registry() {
@@ -12,7 +33,7 @@ fn group_membership_uses_an_explicit_registry() {
     let init_process = init(&process_domain);
     let other_init = init(&other_domain);
     let group = init_process.group();
-    let child = child(&process_domain, &init_process, 2);
+    let child = live_child(&process_domain, &init_process, 2);
 
     let processes = group.try_processes(process_domain.registry()).unwrap();
     assert_eq!(processes.len(), 2);
@@ -45,16 +66,16 @@ fn group_membership_uses_an_explicit_registry() {
             .any_process(process_domain.registry(), |process| process.pid() == 2)
             .unwrap()
     );
-    exit_and_reap(&process_domain, &child);
+    exit_live_and_reap(&process_domain, &child);
 }
 
 #[test]
 fn create_and_move_group_preserve_session_identity() {
     let process_domain = domain();
     let init_process = init(&process_domain);
-    let first = child(&process_domain, &init_process, 2);
+    let first = live_child(&process_domain, &init_process, 2);
     let first_group = process_domain.try_create_group(&first).unwrap().unwrap();
-    let second = child(&process_domain, &init_process, 3);
+    let second = live_child(&process_domain, &init_process, 3);
     let second_group = process_domain.try_create_group(&second).unwrap().unwrap();
 
     assert!(process_domain.move_to_group(&second, &first_group).unwrap());
@@ -71,7 +92,7 @@ fn create_and_move_group_preserve_session_identity() {
         Some(ProcessError::NotPublished)
     );
 
-    let session_candidate = child(&process_domain, &init_process, 4);
+    let session_candidate = live_child(&process_domain, &init_process, 4);
     let (new_session, new_group) = process_domain
         .try_create_session(&session_candidate)
         .unwrap()
@@ -79,7 +100,7 @@ fn create_and_move_group_preserve_session_identity() {
     assert!(Arc::ptr_eq(&new_group.session(), &new_session));
     assert!(!process_domain.move_to_group(&second, &new_group).unwrap());
 
-    exit_and_reap(&process_domain, &session_candidate);
+    exit_live_and_reap(&process_domain, &session_candidate);
     assert!(!new_group.is_live());
     assert!(!new_session.is_live());
     assert_eq!(
@@ -88,15 +109,15 @@ fn create_and_move_group_preserve_session_identity() {
             .err(),
         Some(ProcessError::NotPublished)
     );
-    exit_and_reap(&process_domain, &second);
-    exit_and_reap(&process_domain, &first);
+    exit_live_and_reap(&process_domain, &second);
+    exit_live_and_reap(&process_domain, &first);
 }
 
 #[test]
 fn retired_group_arcs_cannot_be_revived_when_pgid_is_reused() {
     let process_domain = domain();
     let init_process = init(&process_domain);
-    let child = child(&process_domain, &init_process, 2);
+    let child = live_child(&process_domain, &init_process, 2);
     let init_group = init_process.group();
     let retired = process_domain.try_create_group(&child).unwrap().unwrap();
 
@@ -120,5 +141,39 @@ fn retired_group_arcs_cannot_be_revived_when_pgid_is_reused() {
         &process_domain.registry().get_process_group(2).unwrap(),
         &replacement
     ));
-    exit_and_reap(&process_domain, &child);
+    exit_live_and_reap(&process_domain, &child);
+}
+
+#[test]
+fn zombie_process_cannot_mutate_job_control_membership() {
+    let process_domain = domain();
+    let init_process = init(&process_domain);
+    let child = live_child(&process_domain, &init_process, 2);
+    let group = init_process.group();
+
+    assert_eq!(child.exit_thread(2, 0), ThreadExitOutcome::FinalThread);
+    assert_eq!(
+        process_domain.try_create_group(&child).err(),
+        Some(ProcessError::NotLive)
+    );
+    let prepared = process_domain.prepare_exit(&child).unwrap();
+    assert_eq!(
+        process_domain.move_to_group(&child, &group),
+        Err(ProcessError::NotLive)
+    );
+    drop(prepared);
+    process_domain.exit(&child, zombie(2), drop).unwrap();
+    assert_eq!(
+        process_domain.try_create_group(&child).err(),
+        Some(ProcessError::NotLive)
+    );
+    assert_eq!(
+        process_domain.try_create_session(&child).err(),
+        Some(ProcessError::NotLive)
+    );
+    assert_eq!(
+        process_domain.move_to_group(&child, &group),
+        Err(ProcessError::NotLive)
+    );
+    assert!(process_domain.reap(&child).unwrap());
 }

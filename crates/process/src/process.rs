@@ -19,6 +19,13 @@ use crate::{Pid, ProcessGroup, Session};
 /// individual thread group.
 pub const PROCESS_MEMBERSHIP_LIMIT: usize = 65_536;
 
+/// Maximum child parent-pointer mutations performed while one topology guard
+/// keeps interrupts disabled during process exit.
+const REPARENT_BATCH_LIMIT: usize = 64;
+
+#[cfg(test)]
+static MAX_REPARENT_BATCH_OBSERVED: AtomicUsize = AtomicUsize::new(0);
+
 fn reserve_bounded_counter(counter: &AtomicUsize, limit: usize) -> Result<(), ProcessError> {
     counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -63,6 +70,8 @@ pub enum ProcessError {
     NotPublished,
     /// The process has already entered zombie state.
     NotLive,
+    /// A reversible lifecycle dependency must complete before retrying.
+    Busy,
     /// The domain does not yet have an init process.
     NotInitialized,
 }
@@ -76,6 +85,7 @@ impl fmt::Display for ProcessError {
             Self::WrongDomain => f.write_str("object belongs to another process domain"),
             Self::NotPublished => f.write_str("process is not published"),
             Self::NotLive => f.write_str("process is no longer live"),
+            Self::Busy => f.write_str("process lifecycle transition is busy"),
             Self::NotInitialized => f.write_str("process domain has no init process"),
         }
     }
@@ -103,6 +113,31 @@ pub enum ThreadExitOutcome {
     FinalThread,
 }
 
+/// State observed when an already validated thread reservation is published.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[must_use = "a thread published after group exit must be terminated before it can run"]
+pub enum ThreadPublicationOutcome {
+    /// No group-wide exit had linearized at publication.
+    Live,
+    /// Group exit had already linearized; the adapter must terminate this TID.
+    GroupExited,
+}
+
+/// Domain-coordinated result of removing one live thread.
+///
+/// The final-thread case carries the exclusive zombie-publication token that
+/// was prepared in the same thread-group critical section as membership
+/// removal. Dropping that token restores the final live membership, so a
+/// caller cannot strand a zero-thread, non-zombie process.
+pub enum ThreadExitTransition<Z> {
+    /// The requested TID was not a live member and no state changed.
+    NotFound,
+    /// The thread exited while at least one live thread remained.
+    LiveThreadsRemain,
+    /// The final live thread was removed and zombie publication is reserved.
+    FinalThread(ProcessExitAdmission<Z>),
+}
+
 /// A newly created session together with its initial process group.
 pub type CreatedSession<Z> = (Arc<Session<Z>>, Arc<ProcessGroup<Z>>);
 
@@ -128,6 +163,7 @@ struct ThreadGroup {
     live_threads: usize,
     exit_code: i32,
     group_exited: bool,
+    exit_prepared: bool,
 }
 
 impl ThreadGroup {
@@ -138,6 +174,7 @@ impl ThreadGroup {
             live_threads: 0,
             exit_code: 0,
             group_exited: false,
+            exit_prepared: false,
         }
     }
 }
@@ -222,7 +259,10 @@ impl<Z> RegistryState<Z> {
 /// The registry has no singleton instance. Read-only enumeration is explicit,
 /// and mutation is mediated by the owning domain and admission tokens.
 pub struct ProcessRegistry<Z> {
+    // When both guards are needed, topology is always acquired before state.
+    // Admission paths that touch state first release it before taking topology.
     state: SpinNoIrq<RegistryState<Z>>,
+    topology: SpinNoIrq<()>,
     membership_limit: usize,
     thread_memberships: AtomicUsize,
 }
@@ -231,6 +271,7 @@ impl<Z> ProcessRegistry<Z> {
     fn new(membership_limit: usize) -> Self {
         Self {
             state: SpinNoIrq::new(RegistryState::new()),
+            topology: SpinNoIrq::new(()),
             membership_limit: membership_limit.min(PROCESS_MEMBERSHIP_LIMIT),
             thread_memberships: AtomicUsize::new(0),
         }
@@ -293,6 +334,27 @@ impl<Z> ProcessRegistry<Z> {
             after: None,
             remaining: self.membership_count(),
             finished: false,
+        }
+    }
+
+    /// Iterates monotonically through the PID range that existed when this
+    /// cursor was created. Concurrent insertion above the captured maximum is
+    /// ignored, while insertion below/after the cursor cannot consume a fixed
+    /// item budget and make an original higher-PID entry disappear.
+    fn processes_through_current_max(&self) -> ProcessesThroughCurrentMax<'_, Z> {
+        let upper_bound = self
+            .state
+            .lock()
+            .entries
+            .back()
+            .get()
+            .map(|process| process.pid);
+        ProcessesThroughCurrentMax {
+            registry: self,
+            last: None,
+            after: None,
+            upper_bound,
+            finished: upper_bound.is_none(),
         }
     }
 
@@ -624,6 +686,27 @@ fn reparent_if_owned<Z>(
     true
 }
 
+fn select_reaper_for_exit_locked<Z>(
+    process: &Arc<Process<Z>>,
+    init: &Arc<Process<Z>>,
+) -> Arc<Process<Z>> {
+    let mut ancestor = process.parent();
+    while let Some(candidate) = ancestor {
+        if candidate.is_child_subreaper() {
+            let tg = candidate.tg.lock();
+            if tg.live_threads != 0
+                && !tg.exit_prepared
+                && !candidate.is_zombie.load(Ordering::Acquire)
+            {
+                drop(tg);
+                return candidate;
+            }
+        }
+        ancestor = candidate.parent();
+    }
+    init.clone()
+}
+
 impl<Z> ProcessDomain<Z> {
     /// Fallibly creates a domain with the default bounded membership limit.
     pub fn try_new() -> Result<Self, ProcessError> {
@@ -718,12 +801,123 @@ impl<Z> ProcessDomain<Z> {
         process.prepare_thread_in(&self.registry, tid, false)
     }
 
+    /// Removes one live thread with an atomic final-exit admission.
+    ///
+    /// Non-final removal completes immediately. For the final membership, this
+    /// method marks exit prepared before unlinking the TID while holding the
+    /// domain topology and process thread-group locks. Dropping the returned
+    /// final token restores the exact removed node without allocation.
+    pub fn exit_thread(
+        &self,
+        process: &Arc<Process<Z>>,
+        tid: Pid,
+        exit_code: i32,
+    ) -> Result<ThreadExitTransition<Z>, ProcessError> {
+        self.registry.ensure_published(process)?;
+        let init = self.init_process().ok_or(ProcessError::NotInitialized)?;
+        let topology = self.registry.topology.lock();
+        let mut tg = process.tg.lock();
+        let node = tg.threads.find(&tid).get().and_then(|thread| {
+            thread
+                .live
+                .load(Ordering::Relaxed)
+                .then_some(thread as *const ThreadNode)
+        });
+        let Some(node) = node else {
+            return Ok(ThreadExitTransition::NotFound);
+        };
+
+        if tg.live_threads != 1 {
+            if !tg.group_exited {
+                tg.exit_code = exit_code;
+            }
+            let removed = Process::<Z>::detach_thread_locked(&mut tg, node);
+            drop(tg);
+            drop(topology);
+            let Some(removed) = removed else {
+                return Ok(ThreadExitTransition::NotFound);
+            };
+            drop(removed);
+            self.registry.release_thread_member();
+            return Ok(ThreadExitTransition::LiveThreadsRemain);
+        }
+
+        if process.is_init() || process.is_zombie.load(Ordering::Acquire) {
+            return Err(ProcessError::NotLive);
+        }
+        if tg.exit_prepared {
+            return Err(ProcessError::Busy);
+        }
+
+        if !tg.group_exited {
+            tg.exit_code = exit_code;
+        }
+        let removed = Process::<Z>::detach_thread_locked(&mut tg, node);
+        let Some(departing_thread) = removed else {
+            drop(tg);
+            drop(topology);
+            return Ok(ThreadExitTransition::NotFound);
+        };
+        tg.exit_prepared = true;
+        drop(tg);
+        drop(topology);
+
+        Ok(ThreadExitTransition::FinalThread(ProcessExitAdmission {
+            registry: self.registry.clone(),
+            process: process.clone(),
+            init,
+            departing_thread: Some(departing_thread),
+            committed: false,
+        }))
+    }
+
+    /// Validates and exclusively reserves the final zombie transition.
+    ///
+    /// The returned token proves that `process` belongs to this domain, is
+    /// published, has no live or reserved thread memberships, is not init or
+    /// already a zombie, and has a valid reaper. While the token exists, new
+    /// thread admission and competing exit publication are rejected.
+    pub fn prepare_exit(
+        &self,
+        process: &Arc<Process<Z>>,
+    ) -> Result<ProcessExitAdmission<Z>, ProcessError> {
+        self.registry.ensure_published(process)?;
+        if process.is_init() || process.is_zombie() {
+            return Err(ProcessError::NotLive);
+        }
+        let init = self.init_process().ok_or(ProcessError::NotInitialized)?;
+        let topology = self.registry.topology.lock();
+        let mut tg = process.tg.lock();
+        if tg.memberships != 0 {
+            return Err(ProcessError::NotLive);
+        }
+        if tg.exit_prepared {
+            return Err(ProcessError::Busy);
+        }
+        if process.zombie_payload.lock().is_some() {
+            return Err(ProcessError::NotLive);
+        }
+        tg.exit_prepared = true;
+        drop(tg);
+        drop(topology);
+        Ok(ProcessExitAdmission {
+            registry: self.registry.clone(),
+            process: process.clone(),
+            init,
+            departing_thread: None,
+            committed: false,
+        })
+    }
+
     /// Creates a new session/group identity and moves `process` into it.
     pub fn try_create_session(
         &self,
         process: &Arc<Process<Z>>,
     ) -> Result<Option<CreatedSession<Z>>, ProcessError> {
         self.registry.ensure_published(process)?;
+        if !process.is_live() {
+            return Err(ProcessError::NotLive);
+        }
         let old_group = process.group();
         if old_group.session.sid() == process.pid {
             return Ok(None);
@@ -734,8 +928,22 @@ impl<Z> ProcessDomain<Z> {
             .registry
             .admit_session_group(session.clone(), group.clone(), true)?;
         self.registry.reserve_group_member(&group, true)?;
+        let topology = self.registry.topology.lock();
+        if !process.is_live() {
+            drop(topology);
+            self.registry.release_group_member(&group);
+            drop(admission);
+            return Err(ProcessError::NotLive);
+        }
+        if process.group().session.sid() == process.pid {
+            drop(topology);
+            self.registry.release_group_member(&group);
+            drop(admission);
+            return Ok(None);
+        }
         let previous = process.replace_group(group.clone());
         admission.commit();
+        drop(topology);
         self.registry.release_group_member(&previous);
         Ok(Some((session, group)))
     }
@@ -746,6 +954,9 @@ impl<Z> ProcessDomain<Z> {
         process: &Arc<Process<Z>>,
     ) -> Result<Option<Arc<ProcessGroup<Z>>>, ProcessError> {
         self.registry.ensure_published(process)?;
+        if !process.is_live() {
+            return Err(ProcessError::NotLive);
+        }
         let old_group = process.group();
         if old_group.pgid() == process.pid {
             return Ok(None);
@@ -756,8 +967,29 @@ impl<Z> ProcessDomain<Z> {
             .registry
             .admit_session_group(session, group.clone(), false)?;
         self.registry.reserve_group_member(&group, true)?;
+        let topology = self.registry.topology.lock();
+        if !process.is_live() {
+            drop(topology);
+            self.registry.release_group_member(&group);
+            drop(admission);
+            return Err(ProcessError::NotLive);
+        }
+        let current_group = process.group();
+        if current_group.pgid() == process.pid {
+            drop(topology);
+            self.registry.release_group_member(&group);
+            drop(admission);
+            return Ok(None);
+        }
+        if !Arc::ptr_eq(&current_group.session, &group.session) {
+            drop(topology);
+            self.registry.release_group_member(&group);
+            drop(admission);
+            return Err(ProcessError::Busy);
+        }
         let previous = process.replace_group(group.clone());
         admission.commit();
+        drop(topology);
         self.registry.release_group_member(&previous);
         Ok(Some(group))
     }
@@ -769,31 +1001,43 @@ impl<Z> ProcessDomain<Z> {
         group: &Arc<ProcessGroup<Z>>,
     ) -> Result<bool, ProcessError> {
         self.registry.ensure_published(process)?;
+        if !process.is_live() {
+            return Err(ProcessError::NotLive);
+        }
         self.registry.ensure_group_live(group)?;
-        let mut current = process.group.lock();
+        let current = process.group.lock();
         if Arc::ptr_eq(&current, group) {
             return Ok(true);
         }
         if !Arc::ptr_eq(&current.session, &group.session) {
             return Ok(false);
         }
+        drop(current);
         self.registry.reserve_group_member(group, false)?;
+        let topology = self.registry.topology.lock();
+        if !process.is_live() || self.registry.ensure_group_live(group).is_err() {
+            drop(topology);
+            self.registry.release_group_member(group);
+            return Err(ProcessError::NotLive);
+        }
+        let mut current = process.group.lock();
+        if Arc::ptr_eq(&current, group) {
+            drop(current);
+            drop(topology);
+            self.registry.release_group_member(group);
+            return Ok(true);
+        }
+        if !Arc::ptr_eq(&current.session, &group.session) {
+            drop(current);
+            drop(topology);
+            self.registry.release_group_member(group);
+            return Ok(false);
+        }
         let previous = core::mem::replace(&mut *current, group.clone());
         drop(current);
+        drop(topology);
         self.registry.release_group_member(&previous);
         Ok(true)
-    }
-
-    fn reaper_for_exit(&self, process: &Arc<Process<Z>>) -> Result<Arc<Process<Z>>, ProcessError> {
-        let init = self.init_process().ok_or(ProcessError::NotInitialized)?;
-        let mut ancestor = process.parent();
-        while let Some(candidate) = ancestor {
-            if candidate.is_child_subreaper() && !candidate.is_zombie() {
-                return Ok(candidate);
-            }
-            ancestor = candidate.parent();
-        }
-        Ok(init)
     }
 
     /// Marks a process zombie and reparents its children without allocation.
@@ -812,36 +1056,11 @@ impl<Z> ProcessDomain<Z> {
         if process.is_init() {
             return Ok(ExitOutcome::InitProcess);
         }
-        let reaper = self.reaper_for_exit(process)?;
-        let tg = process.tg.lock();
-        // Reserved admissions count as lifecycle ownership even before their
-        // TID is visible. Otherwise a pending token could publish a live thread
-        // after the zero-thread check and zombie publication.
-        if tg.memberships != 0 {
-            return Err(ProcessError::NotLive);
-        }
-        if process.is_zombie.load(Ordering::Acquire) {
+        if process.is_zombie() {
             return Ok(ExitOutcome::AlreadyZombie);
         }
-        let mut payload_slot = process.zombie_payload.lock();
-        if payload_slot.is_some() {
-            // Preserve the first durable exit snapshot even if an embedding
-            // bug exposed an inconsistent publication state.
-            return Ok(ExitOutcome::AlreadyZombie);
-        }
-        *payload_slot = Some(payload);
-        process.is_zombie.store(true, Ordering::Release);
-        drop(payload_slot);
-        drop(tg);
-
-        let reaper_weak = Arc::downgrade(&reaper);
-        for child in self.registry.processes() {
-            let moved = reparent_if_owned(&child, process, &reaper_weak);
-            if moved && child.is_zombie() {
-                inherited_zombie(child);
-            }
-        }
-        Ok(ExitOutcome::BecameZombie)
+        let exit = self.prepare_exit(process)?;
+        Ok(exit.commit(payload, &mut inherited_zombie).outcome())
     }
 
     /// Reaps a zombie from this domain, returning false for invalid or duplicate reap.
@@ -887,6 +1106,138 @@ impl<Z> ProcessDomain<Z> {
             self.registry.release_group_member(&group);
         }
         Ok(existed)
+    }
+}
+
+/// Result of one committed final process-exit transaction.
+///
+/// The notification parent is captured while holding the exiting process's
+/// parent pointer at the zombie publication linearization point.
+pub struct CommittedProcessExit<Z> {
+    outcome: ExitOutcome,
+    notification_parent: Option<Arc<Process<Z>>>,
+}
+
+impl<Z> CommittedProcessExit<Z> {
+    /// Returns the zombie transition outcome.
+    pub fn outcome(&self) -> ExitOutcome {
+        self.outcome
+    }
+
+    /// Returns the parent observed atomically with zombie publication.
+    pub fn notification_parent(&self) -> Option<&Arc<Process<Z>>> {
+        self.notification_parent.as_ref()
+    }
+}
+
+/// Exclusive, fully validated final process-exit transaction.
+///
+/// The token reserves the zero-membership zombie transition without taking a
+/// payload. Dropping it rolls that reservation back; consuming it with
+/// [`commit`](Self::commit) publishes the supplied immutable payload and
+/// reparents children without a fallible branch.
+pub struct ProcessExitAdmission<Z> {
+    registry: Arc<ProcessRegistry<Z>>,
+    process: Arc<Process<Z>>,
+    init: Arc<Process<Z>>,
+    departing_thread: Option<Arc<ThreadNode>>,
+    committed: bool,
+}
+
+impl<Z> ProcessExitAdmission<Z> {
+    /// Returns the exact process reserved for final exit.
+    pub fn process(&self) -> &Arc<Process<Z>> {
+        &self.process
+    }
+
+    /// Publishes the durable payload, transitions to zombie state, and
+    /// reparents children without allocation or a recoverable error.
+    pub fn commit(
+        mut self,
+        payload: Arc<Z>,
+        mut inherited_zombie: impl FnMut(Arc<Process<Z>>),
+    ) -> CommittedProcessExit<Z> {
+        // Job-control replacement and the zombie state transition share this
+        // topology lock. The nested lifecycle order is topology -> thread
+        // group -> own parent pointer -> payload slot. No adapter callback runs
+        // while any of those IRQ-disabled guards is held.
+        let topology = self.registry.topology.lock();
+        let mut tg = self.process.tg.lock();
+        debug_assert!(tg.exit_prepared);
+        debug_assert_eq!(tg.memberships, 0);
+        let parent = self.process.parent.lock();
+        let notification_parent = parent.upgrade();
+        let mut payload_slot = self.process.zombie_payload.lock();
+        debug_assert!(payload_slot.is_none());
+        *payload_slot = Some(payload);
+        self.process.is_zombie.store(true, Ordering::Release);
+        tg.exit_prepared = false;
+        self.committed = true;
+        drop(payload_slot);
+        drop(parent);
+        drop(tg);
+        drop(topology);
+
+        if let Some(departing_thread) = self.departing_thread.take() {
+            drop(departing_thread);
+            self.registry.release_thread_member();
+        }
+
+        // Reparent all non-zombie children in one or more topology sections.
+        // A moved zombie is reported immediately after releasing the IRQ-off
+        // guard, then selection is repeated. If the previously selected
+        // subreaper exits between sections, its own commit either reparents the
+        // children already moved to it or this loop selects the next live
+        // ancestor for the remaining children.
+        let mut children = self.registry.processes_through_current_max();
+        let mut finished = false;
+        while !finished {
+            let topology = self.registry.topology.lock();
+            let reaper = select_reaper_for_exit_locked(&self.process, &self.init);
+            let reaper = Arc::downgrade(&reaper);
+            let mut moved_zombie = None;
+            let mut batch_len = 0;
+            while batch_len < REPARENT_BATCH_LIMIT {
+                let Some(child) = children.next() else {
+                    finished = true;
+                    break;
+                };
+                batch_len += 1;
+                let moved = reparent_if_owned(&child, &self.process, &reaper);
+                if moved && child.is_zombie() {
+                    moved_zombie = Some(child);
+                    break;
+                }
+            }
+            #[cfg(test)]
+            MAX_REPARENT_BATCH_OBSERVED.fetch_max(batch_len, Ordering::Relaxed);
+            drop(topology);
+            if let Some(child) = moved_zombie {
+                inherited_zombie(child);
+            }
+        }
+
+        CommittedProcessExit {
+            outcome: ExitOutcome::BecameZombie,
+            notification_parent,
+        }
+    }
+}
+
+impl<Z> Drop for ProcessExitAdmission<Z> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut tg = self.process.tg.lock();
+            if let Some(departing_thread) = self.departing_thread.take() {
+                debug_assert!(!departing_thread.link.is_linked());
+                debug_assert!(!departing_thread.live.load(Ordering::Relaxed));
+                departing_thread.live.store(true, Ordering::Relaxed);
+                tg.threads.insert(departing_thread);
+                tg.memberships += 1;
+                tg.live_threads += 1;
+            }
+            tg.exit_prepared = false;
+        }
     }
 }
 
@@ -942,6 +1293,61 @@ impl<Z> Iterator for Processes<'_, Z> {
         }
 
         self.finished = true;
+        let last = self.last.take();
+        drop(last);
+        None
+    }
+}
+
+/// PID-monotonic process cursor bounded by the registry maximum captured at
+/// construction. Used by multi-section exit reparenting.
+struct ProcessesThroughCurrentMax<'a, Z> {
+    registry: &'a ProcessRegistry<Z>,
+    last: Option<Arc<Process<Z>>>,
+    after: Option<Pid>,
+    upper_bound: Option<Pid>,
+    finished: bool,
+}
+
+impl<Z> Iterator for ProcessesThroughCurrentMax<'_, Z> {
+    type Item = Arc<Process<Z>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let upper_bound = self.upper_bound?;
+        while !self.finished {
+            let state = self.registry.state.lock();
+            let next = if let Some(last) = self
+                .last
+                .as_ref()
+                .filter(|last| last.registry_link.is_linked())
+            {
+                // SAFETY: a linked node with matching registry identity is in
+                // this tree; the state lock prevents concurrent removal.
+                let mut cursor = unsafe { state.entries.cursor_from_ptr(Arc::as_ptr(last)) };
+                cursor.move_next();
+                cursor.clone_pointer()
+            } else if let Some(after) = self.after.as_ref() {
+                state
+                    .entries
+                    .lower_bound(Bound::Excluded(after))
+                    .clone_pointer()
+            } else {
+                state.entries.front().clone_pointer()
+            };
+            drop(state);
+
+            let Some(next) = next.filter(|process| process.pid <= upper_bound) else {
+                self.finished = true;
+                break;
+            };
+            self.after = Some(next.pid);
+            let last = self.last.replace(next.clone());
+            drop(last);
+            if next.published.load(Ordering::Acquire) {
+                return Some(next);
+            }
+        }
+
         let last = self.last.take();
         drop(last);
         None
@@ -1061,6 +1467,11 @@ impl<Z> Process<Z> {
             registry.release_thread_member();
             return Err(ProcessError::NotLive);
         }
+        if tg.exit_prepared || tg.group_exited {
+            drop(tg);
+            registry.release_thread_member();
+            return Err(ProcessError::NotLive);
+        }
         if !allow_unpublished
             && (!self.published.load(Ordering::Acquire) || !registry.contains_process(self))
         {
@@ -1112,6 +1523,8 @@ impl<Z> Process<Z> {
 
     /// Removes a live thread without updating process exit state.
     pub fn remove_thread(&self, tid: Pid) -> bool {
+        let registry = self.registry.upgrade();
+        let topology = registry.as_ref().map(|registry| registry.topology.lock());
         let removed = {
             let mut tg = self.tg.lock();
             let node = tg.threads.find(&tid).get().and_then(|thread| {
@@ -1122,9 +1535,10 @@ impl<Z> Process<Z> {
             });
             node.and_then(|node| Self::detach_thread_locked(&mut tg, node))
         };
+        drop(topology);
         let existed = removed.is_some();
         drop(removed);
-        if existed && let Some(registry) = self.registry.upgrade() {
+        if existed && let Some(registry) = registry {
             registry.release_thread_member();
         }
         existed
@@ -1132,6 +1546,8 @@ impl<Z> Process<Z> {
 
     /// Removes a live thread and reports the exact transition.
     pub fn exit_thread(&self, tid: Pid, exit_code: i32) -> ThreadExitOutcome {
+        let registry = self.registry.upgrade();
+        let topology = registry.as_ref().map(|registry| registry.topology.lock());
         let mut tg = self.tg.lock();
         let node = tg.threads.find(&tid).get().and_then(|thread| {
             thread
@@ -1148,11 +1564,12 @@ impl<Z> Process<Z> {
         let removed = Self::detach_thread_locked(&mut tg, node);
         let empty = tg.live_threads == 0;
         drop(tg);
+        drop(topology);
         let Some(removed) = removed else {
             return ThreadExitOutcome::NotFound;
         };
         drop(removed);
-        if let Some(registry) = self.registry.upgrade() {
+        if let Some(registry) = registry {
             registry.release_thread_member();
         }
         if empty {
@@ -1339,6 +1756,24 @@ impl<Z> ProcessAdmission<Z> {
         self.process.prepare_thread_in(&self.registry, tid, true)
     }
 
+    /// Consumes this unpublished process admission and binds its initial
+    /// thread into one infallibly publishable transaction.
+    ///
+    /// All allocation, identity, capacity, and domain checks finish before
+    /// this returns. Keeping both tokens private inside
+    /// [`InitialProcessAdmission`] prevents callers from mixing identities or
+    /// publishing the thread separately from the process.
+    pub fn prepare_initial_thread(
+        self,
+        tid: Pid,
+    ) -> Result<InitialProcessAdmission<Z>, ProcessError> {
+        let thread = self.prepare_thread(tid)?;
+        Ok(InitialProcessAdmission {
+            process: self,
+            thread,
+        })
+    }
+
     /// Publishes the process against its reserved registry membership slot.
     pub fn commit(mut self) {
         let process = self.process.clone();
@@ -1413,6 +1848,41 @@ impl<Z> Drop for ProcessAdmission<Z> {
     }
 }
 
+/// Fully prepared process plus initial-thread publication transaction.
+///
+/// This type can only be constructed by
+/// [`ProcessAdmission::prepare_initial_thread`], which proves that both
+/// reservations belong to the same unpublished process and registry.
+pub struct InitialProcessAdmission<Z> {
+    process: ProcessAdmission<Z>,
+    thread: ThreadAdmission<Z>,
+}
+
+impl<Z> InitialProcessAdmission<Z> {
+    /// Returns the unpublished process while runtime resources are prepared.
+    pub fn process(&self) -> &Arc<Process<Z>> {
+        self.process.process()
+    }
+
+    /// Publishes the process and its initial live thread as one infallible
+    /// transition.
+    ///
+    /// The composite owns the only process-publication token and a thread
+    /// reservation created from that exact token. An unpublished process
+    /// cannot concurrently exit or be reaped, so no checked lifecycle outcome
+    /// remains at this point.
+    pub fn commit(mut self) -> Arc<Process<Z>> {
+        let process = self.process.process.clone();
+        let mut tg = process.tg.lock();
+        let outcome = self.thread.publish_locked_infallible(&mut tg);
+        debug_assert_eq!(outcome, ThreadPublicationOutcome::Live);
+        process.published.store(true, Ordering::Release);
+        self.process.committed = true;
+        drop(tg);
+        process
+    }
+}
+
 /// Reserved thread-group membership awaiting final publication.
 pub struct ThreadAdmission<Z> {
     registry: Arc<ProcessRegistry<Z>>,
@@ -1422,6 +1892,22 @@ pub struct ThreadAdmission<Z> {
 }
 
 impl<Z> ThreadAdmission<Z> {
+    fn publish_locked_infallible(&mut self, tg: &mut ThreadGroup) -> ThreadPublicationOutcome {
+        debug_assert!(!self.node.live.load(Ordering::Relaxed));
+        // Construction charged and linked this exact membership before
+        // exposing the consuming token, so one unpublished membership exists.
+        self.node.live.store(true, Ordering::Relaxed);
+        let next_live = tg.live_threads + 1;
+        debug_assert!(next_live <= tg.memberships);
+        tg.live_threads = next_live;
+        self.committed = true;
+        if tg.group_exited {
+            ThreadPublicationOutcome::GroupExited
+        } else {
+            ThreadPublicationOutcome::Live
+        }
+    }
+
     fn publish_locked(
         &mut self,
         tg: &mut ThreadGroup,
@@ -1432,6 +1918,8 @@ impl<Z> ThreadAdmission<Z> {
         }
         if self.process.is_zombie.load(Ordering::Acquire)
             || self.process.reaped.load(Ordering::Acquire)
+            || tg.group_exited
+            || tg.exit_prepared
         {
             return Err(ProcessError::NotLive);
         }
@@ -1454,17 +1942,24 @@ impl<Z> ThreadAdmission<Z> {
         Ok(())
     }
 
-    /// Marks this already-linked membership live after revalidating process
-    /// publication and lifecycle state.
-    pub fn publish(&mut self) -> Result<(), ProcessError> {
+    /// Publishes the TID against its reserved process membership capacity.
+    pub fn commit(mut self) -> Result<(), ProcessError> {
         let process = self.process.clone();
         let mut tg = process.tg.lock();
         self.publish_locked(&mut tg, false)
     }
 
-    /// Publishes the TID against its reserved process membership capacity.
-    pub fn commit(mut self) -> Result<(), ProcessError> {
-        self.publish()
+    /// Publishes this already validated live-process thread reservation
+    /// without a fallible post-publication branch.
+    ///
+    /// The token's reserved membership prevents the process from completing
+    /// exit while it exists. The process and registry identity were validated
+    /// before the token was returned, and the linked node is private to this
+    /// consuming value.
+    pub fn commit_infallible(mut self) -> ThreadPublicationOutcome {
+        let process = self.process.clone();
+        let mut tg = process.tg.lock();
+        self.publish_locked_infallible(&mut tg)
     }
 }
 
@@ -1592,5 +2087,64 @@ mod tests {
             &child_process.parent().unwrap(),
             &second_process
         ));
+    }
+
+    #[test]
+    fn exit_reparenting_bounds_each_topology_section() {
+        MAX_REPARENT_BATCH_OBSERVED.store(0, Ordering::Release);
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let init = domain.try_new_init(1, None).unwrap();
+        domain.prepare_thread(&init, 1).unwrap().commit().unwrap();
+        let parent = domain
+            .prepare_fork(&init, 2, None)
+            .unwrap()
+            .prepare_initial_thread(2)
+            .unwrap()
+            .commit();
+        let mut children = Vec::new();
+        children.try_reserve_exact(257).unwrap();
+        for pid in 3..260 {
+            let admission = domain.prepare_fork(&parent, pid, None).unwrap();
+            children.push(admission.process().clone());
+            admission.commit();
+        }
+
+        let exit = match domain.exit_thread(&parent, 2, 0).unwrap() {
+            ThreadExitTransition::FinalThread(exit) => exit,
+            _ => panic!("parent must publish a final-exit admission"),
+        };
+        assert_eq!(
+            exit.commit(Arc::new(()), drop).outcome(),
+            ExitOutcome::BecameZombie
+        );
+
+        assert_eq!(
+            MAX_REPARENT_BATCH_OBSERVED.load(Ordering::Acquire),
+            REPARENT_BATCH_LIMIT
+        );
+        assert!(children.iter().all(|child| {
+            child
+                .parent()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &init))
+        }));
+    }
+
+    #[test]
+    fn reparent_cursor_keeps_original_high_pid_under_concurrent_insertion() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let init = domain.try_new_init(1, None).unwrap();
+        for pid in [10, 30] {
+            domain.prepare_fork(&init, pid, None).unwrap().commit();
+        }
+        let mut cursor = domain.registry.processes_through_current_max();
+        assert_eq!(cursor.next().unwrap().pid(), 1);
+
+        // A newly inserted PID after the cursor must not consume a fixed
+        // remaining-item budget, and an insertion above the start maximum must
+        // not extend exit work indefinitely.
+        domain.prepare_fork(&init, 2, None).unwrap().commit();
+        domain.prepare_fork(&init, 40, None).unwrap().commit();
+        let seen: Vec<_> = cursor.map(|process| process.pid()).collect();
+        assert_eq!(seen, [2, 10, 30]);
     }
 }

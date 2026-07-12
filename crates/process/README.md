@@ -61,15 +61,21 @@ owns one explicitly initialized domain. Historical calls change as follows:
 - `Process::try_new_init(...)` becomes `PROCESS_DOMAIN.try_new_init(...)`;
 - `parent.prepare_fork(...)` becomes `PROCESS_DOMAIN.prepare_fork(&parent, ...)`;
 - live thread admission becomes `PROCESS_DOMAIN.prepare_thread(&process, tid)`;
-- an unpublished fork can create its initial thread only through its
-  `ProcessAdmission`, then publish both with `commit_with_thread()`;
+- an unpublished fork consumes its `ProcessAdmission` into
+  `prepare_initial_thread()`, then publishes the type-bound pair with the
+  infallible composite `commit()`;
 - `process.exit(...)` becomes `PROCESS_DOMAIN.exit(&process, snapshot, ...)`,
   making the durable wait/security snapshot mandatory before zombie state;
 - `process.reap()` becomes `PROCESS_DOMAIN.reap(&process)`;
 - session/group creation and group moves become domain operations over unique,
   liveness-checked identities;
-- `exit_thread` returns `ThreadExitOutcome`, while `group_exit(code)` records
-  the group code atomically;
+- final thread removal uses `PROCESS_DOMAIN.exit_thread(...)`; its
+  `FinalThread(ProcessExitAdmission)` variant binds membership removal and
+  zombie authority in one reversible transaction, while `group_exit(code)`
+  records the group code atomically;
+- an infallible late thread publication returns `ThreadPublicationOutcome`, so
+  an adapter can terminate a reservation that crossed an already-linearized
+  group exit before making the task runnable;
 - child, process-group, and session snapshots receive
   `PROCESS_DOMAIN.registry()`; and
 - the historical `ZombieSnapshot` and `ProcessUsage` fields move into the
@@ -92,5 +98,8 @@ impossible duplicate internal release leaves a zero counter at zero instead
 of manufacturing `usize::MAX` capacity. Public lifecycle calls return typed
 outcomes for stale, duplicate, exhausted, or non-live state and do not depend
 on `panic!`, `expect`, or wrapping arithmetic to enforce registry invariants.
+Consuming thread and initial-process composite tokens also expose infallible
+commit paths after all fallible admission has completed, so an embedding can
+place irreversible runtime publication strictly after core lifecycle commit.
 
 See `VENDOR.md` and `PATCHES.md` for the immutable StarryOS source lineage.

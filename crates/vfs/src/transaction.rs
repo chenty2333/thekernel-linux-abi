@@ -3,7 +3,16 @@
 /// Authorization and pathwalk complete before [`reserve`](Self::reserve).
 /// `publish` must make the name/tree change visible at most once. Rollback is
 /// infallible and is invoked for every prepared transaction that does not
-/// publish successfully.
+/// report successful publication.
+///
+/// Rollback releases only the private reservation or hidden admission owned by
+/// this transaction. It never promises to reverse a namespace change. A
+/// filesystem that can report an indeterminate or partially committed metadata
+/// mutation must enforce its own fail-closed policy (for example, poison the
+/// writable metadata state) before returning that error. A backend whose
+/// namespace decision is already known to be committed must complete with the
+/// committed outcome rather than convert a secondary cleanup failure into an
+/// apparently retryable publication error.
 pub trait MutationBackend {
     /// Mutation request after pathname and authorization validation.
     type Request;
@@ -20,18 +29,30 @@ pub trait MutationBackend {
     /// Revalidates parent/name generations immediately before publication.
     fn revalidate(&self, reservation: &Self::Reservation) -> Result<(), Self::Error>;
 
-    /// Publishes exactly once. On error, the reservation remains rollbackable.
+    /// Publishes exactly once.
+    ///
+    /// On error, the *private reservation* remains releasable by
+    /// [`rollback`](Self::rollback); rollback does not undo filesystem
+    /// namespace metadata. Clean errors therefore precede publication, while
+    /// indeterminate lower metadata errors must already have triggered the
+    /// backend's fail-closed policy.
     fn publish(&self, reservation: &mut Self::Reservation) -> Result<Self::Output, Self::Error>;
 
     /// Releases every reservation after abort or failure without allocating.
-    fn rollback(&self, reservation: Self::Reservation);
+    ///
+    /// Rollback operates in place so the transaction can retain structural
+    /// ownership of the reservation without an `Option` or an unreachable
+    /// runtime panic. Implementations must leave the value safe to drop after
+    /// releasing its external charges and hidden backend state.
+    fn rollback(&self, reservation: &mut Self::Reservation);
 }
 
 /// RAII owner for a prepared VFS mutation.
 #[must_use = "dropping a prepared mutation rolls it back"]
 pub struct MutationTransaction<'a, B: MutationBackend> {
     backend: &'a B,
-    reservation: Option<B::Reservation>,
+    reservation: B::Reservation,
+    completed: bool,
 }
 
 impl<'a, B: MutationBackend> MutationTransaction<'a, B> {
@@ -39,37 +60,35 @@ impl<'a, B: MutationBackend> MutationTransaction<'a, B> {
     pub fn prepare(backend: &'a B, request: B::Request) -> Result<Self, B::Error> {
         Ok(Self {
             backend,
-            reservation: Some(backend.reserve(request)?),
+            reservation: backend.reserve(request)?,
+            completed: false,
         })
     }
 
     /// Revalidates and publishes the mutation once.
     ///
-    /// Any failure leaves the reservation owned by `self`, so `Drop` performs
-    /// rollback before the error reaches the syscall adapter.
+    /// Any failure leaves the reservation owned by `self`, so `Drop` releases
+    /// that private admission before the error reaches the syscall adapter.
+    /// This cleanup does not imply compensation of a lower filesystem's
+    /// partially committed namespace operation.
     pub fn commit(mut self) -> Result<B::Output, B::Error> {
-        let reservation = self
-            .reservation
-            .as_mut()
-            .expect("prepared mutation always owns a reservation");
-        self.backend.revalidate(reservation)?;
-        let output = self.backend.publish(reservation)?;
-        self.reservation = None;
+        self.backend.revalidate(&self.reservation)?;
+        let output = self.backend.publish(&mut self.reservation)?;
+        self.completed = true;
         Ok(output)
     }
 
     /// Explicitly aborts; rollback runs before this function returns.
     pub fn abort(mut self) {
-        if let Some(reservation) = self.reservation.take() {
-            self.backend.rollback(reservation);
-        }
+        self.backend.rollback(&mut self.reservation);
+        self.completed = true;
     }
 }
 
 impl<B: MutationBackend> Drop for MutationTransaction<'_, B> {
     fn drop(&mut self) {
-        if let Some(reservation) = self.reservation.take() {
-            self.backend.rollback(reservation);
+        if !self.completed {
+            self.backend.rollback(&mut self.reservation);
         }
     }
 }
@@ -138,7 +157,7 @@ mod tests {
             Ok(*reservation)
         }
 
-        fn rollback(&self, _reservation: Self::Reservation) {
+        fn rollback(&self, _reservation: &mut Self::Reservation) {
             self.rolled_back.set(self.rolled_back.get() + 1);
         }
     }

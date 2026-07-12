@@ -4,7 +4,10 @@ use core::array;
 use crate::{DescriptorFlags, FdNumber, FdTableId};
 
 #[cfg(feature = "alloc")]
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+
+#[cfg(feature = "alloc")]
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Opaque generation-tagged identity for one published descriptor slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,6 +41,88 @@ pub struct ReservationToken {
     table: FdTableId,
     fd: FdNumber,
     generation: u64,
+}
+
+#[cfg(feature = "alloc")]
+const PUBLICATION_PENDING: u8 = 0;
+#[cfg(feature = "alloc")]
+const PUBLICATION_VISIBLE: u8 = 1;
+#[cfg(feature = "alloc")]
+const PUBLICATION_ABORTED: u8 = 2;
+
+#[cfg(feature = "alloc")]
+#[derive(Debug)]
+struct PublicationState {
+    phase: AtomicU8,
+}
+
+#[cfg(feature = "alloc")]
+impl PublicationState {
+    fn pending() -> Self {
+        Self {
+            phase: AtomicU8::new(PUBLICATION_PENDING),
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == PUBLICATION_VISIBLE
+    }
+}
+
+/// Exact unpublished descriptor whose fallible table preparation is complete.
+///
+/// The token is branded by shared state installed in one table slot. Committing
+/// it does not receive a table, allocate, validate a caller-selected target, or
+/// return an error: it only makes that exact prepared slot visible. Dropping an
+/// uncommitted token marks the slot aborted; adapters should normally call
+/// [`FdTable::cancel_prepared`] first so the invisible entry is detached too.
+#[cfg(feature = "alloc")]
+#[derive(Debug)]
+#[must_use = "a prepared descriptor must be committed or explicitly cancelled"]
+pub struct PreparedPublication {
+    table: FdTableId,
+    fd: FdNumber,
+    generation: u64,
+    state: Arc<PublicationState>,
+    active: bool,
+}
+
+#[cfg(feature = "alloc")]
+impl PreparedPublication {
+    /// Returns the exact prepared descriptor number.
+    pub const fn fd(&self) -> FdNumber {
+        self.fd
+    }
+
+    /// Returns the exact owning table identity.
+    pub const fn table(&self) -> FdTableId {
+        self.table
+    }
+
+    /// Makes the already prepared descriptor visible without allocation or a
+    /// fallible table operation.
+    pub fn commit(mut self) -> DescriptorToken {
+        self.state
+            .phase
+            .store(PUBLICATION_VISIBLE, Ordering::Release);
+        self.active = false;
+        DescriptorToken {
+            table: self.table,
+            fd: self.fd,
+            generation: self.generation,
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Drop for PreparedPublication {
+    fn drop(&mut self) {
+        if self.active {
+            self.state
+                .phase
+                .store(PUBLICATION_ABORTED, Ordering::Release);
+        }
+    }
 }
 
 impl ReservationToken {
@@ -92,10 +177,65 @@ enum Slot<D> {
         generation: u64,
         flags: DescriptorFlags,
     },
+    #[cfg(feature = "alloc")]
+    Prepared {
+        generation: u64,
+        entry: DescriptorEntry<D>,
+        state: Arc<PublicationState>,
+    },
     Occupied {
         generation: u64,
         entry: DescriptorEntry<D>,
     },
+}
+
+impl<D> Slot<D> {
+    fn visible_entry(&self) -> Option<&DescriptorEntry<D>> {
+        match self {
+            Self::Occupied { entry, .. } => Some(entry),
+            #[cfg(feature = "alloc")]
+            Self::Prepared { entry, state, .. } if state.is_visible() => Some(entry),
+            _ => None,
+        }
+    }
+
+    fn visible_entry_mut(&mut self) -> Option<&mut DescriptorEntry<D>> {
+        match self {
+            Self::Occupied { entry, .. } => Some(entry),
+            #[cfg(feature = "alloc")]
+            Self::Prepared { entry, state, .. } if state.is_visible() => Some(entry),
+            _ => None,
+        }
+    }
+
+    fn visible_generation(&self) -> Option<u64> {
+        match self {
+            Self::Occupied { generation, .. } => Some(*generation),
+            #[cfg(feature = "alloc")]
+            Self::Prepared {
+                generation, state, ..
+            } if state.is_visible() => Some(*generation),
+            _ => None,
+        }
+    }
+
+    fn blocks_replacement(&self) -> bool {
+        match self {
+            Self::Reserved { .. } => true,
+            #[cfg(feature = "alloc")]
+            Self::Prepared { state, .. } => !state.is_visible(),
+            _ => false,
+        }
+    }
+
+    fn into_visible_entry(self) -> Result<DescriptorEntry<D>, Self> {
+        match self {
+            Self::Occupied { entry, .. } => Ok(entry),
+            #[cfg(feature = "alloc")]
+            Self::Prepared { entry, state, .. } if state.is_visible() => Ok(entry),
+            other => Err(other),
+        }
+    }
 }
 
 /// Bounded caller-owned Linux files-table state.
@@ -142,6 +282,30 @@ pub struct PublishError<D> {
     pub error: FdTableError,
     /// Description handle that was never published.
     pub description: D,
+}
+
+/// Preparation failure which preserves both reservation authority and OFD
+/// ownership so the caller can roll back the exact original table.
+#[cfg(feature = "alloc")]
+#[derive(Debug)]
+pub struct PreparePublicationError<D> {
+    /// Typed table error.
+    pub error: FdTableError,
+    /// Reservation that was not consumed by preparation.
+    pub reservation: ReservationToken,
+    /// Description handle that was never installed in a prepared slot.
+    pub description: D,
+}
+
+/// Cancellation failure which returns the still-active exact publication
+/// authority so it can be retried against its owning table.
+#[cfg(feature = "alloc")]
+#[derive(Debug)]
+pub struct CancelPreparedError {
+    /// Typed table error.
+    pub error: FdTableError,
+    /// Prepared publication that was not detached.
+    pub publication: PreparedPublication,
 }
 
 impl<D, const N: usize> FdTable<D, N> {
@@ -198,7 +362,7 @@ impl<D, const N: usize> FdTable<D, N> {
     pub fn len(&self) -> usize {
         self.slots
             .iter()
-            .filter(|slot| matches!(slot, Slot::Occupied { .. }))
+            .filter(|slot| slot.visible_entry().is_some())
             .count()
     }
 
@@ -215,9 +379,7 @@ impl<D, const N: usize> FdTable<D, N> {
     /// synchronization.
     pub fn iter(&self) -> impl Iterator<Item = (FdNumber, &DescriptorEntry<D>)> {
         self.slots.iter().enumerate().filter_map(|(fd, slot)| {
-            let Slot::Occupied { entry, .. } = slot else {
-                return None;
-            };
+            let entry = slot.visible_entry()?;
             let fd = u32::try_from(fd).ok()?;
             Some((FdNumber::new(fd), entry))
         })
@@ -314,32 +476,136 @@ impl<D, const N: usize> FdTable<D, N> {
         Ok(token)
     }
 
+    /// Completes every fallible table-side step for a later infallible
+    /// publication.
+    ///
+    /// The prepared entry remains invisible and keeps the numeric slot busy.
+    /// [`PreparedPublication::commit`] is the sole operation that can make this
+    /// exact generation visible, and it does not need the table again.
+    #[cfg(feature = "alloc")]
+    pub fn prepare_publication(
+        &mut self,
+        reservation: ReservationToken,
+        description: D,
+    ) -> Result<PreparedPublication, PreparePublicationError<D>> {
+        let fd = match self.validate_reservation(&reservation) {
+            Ok(fd) => fd,
+            Err(error) => {
+                return Err(PreparePublicationError {
+                    error,
+                    reservation,
+                    description,
+                });
+            }
+        };
+        let flags = match self.slots[fd] {
+            Slot::Reserved { flags, .. } => flags,
+            _ => {
+                return Err(PreparePublicationError {
+                    error: FdTableError::StaleToken,
+                    reservation,
+                    description,
+                });
+            }
+        };
+        let state = Arc::new(PublicationState::pending());
+        let publication = PreparedPublication {
+            table: self.id,
+            fd: reservation.fd,
+            generation: reservation.generation,
+            state: Arc::clone(&state),
+            active: true,
+        };
+        self.slots[fd] = Slot::Prepared {
+            generation: reservation.generation,
+            entry: DescriptorEntry::new(description, flags),
+            state,
+        };
+        Ok(publication)
+    }
+
+    /// Aborts and detaches the exact still-pending prepared publication.
+    ///
+    /// On a foreign, stale, or already committed token, the authority is
+    /// returned unchanged so the caller cannot accidentally lose ownership of
+    /// the real prepared slot.
+    #[cfg(feature = "alloc")]
+    pub fn cancel_prepared(
+        &mut self,
+        mut publication: PreparedPublication,
+    ) -> Result<DescriptorEntry<D>, CancelPreparedError> {
+        if publication.table != self.id || publication.fd.index() >= N {
+            return Err(CancelPreparedError {
+                error: FdTableError::StaleToken,
+                publication,
+            });
+        }
+        let fd = publication.fd.index();
+        let matches = matches!(
+            &self.slots[fd],
+            Slot::Prepared {
+                generation,
+                state,
+                ..
+            } if *generation == publication.generation
+                && Arc::ptr_eq(state, &publication.state)
+                && state.phase.load(Ordering::Acquire) == PUBLICATION_PENDING
+        );
+        if !matches {
+            return Err(CancelPreparedError {
+                error: FdTableError::StaleToken,
+                publication,
+            });
+        }
+
+        let previous = core::mem::replace(&mut self.slots[fd], Slot::Vacant);
+        match previous {
+            Slot::Prepared { entry, .. } => {
+                publication
+                    .state
+                    .phase
+                    .store(PUBLICATION_ABORTED, Ordering::Release);
+                publication.active = false;
+                Ok(entry)
+            }
+            other => {
+                self.slots[fd] = other;
+                Err(CancelPreparedError {
+                    error: FdTableError::StaleToken,
+                    publication,
+                })
+            }
+        }
+    }
+
     /// Looks up a visible descriptor by number.
     pub fn get(&self, fd: FdNumber) -> Result<&DescriptorEntry<D>, FdTableError> {
-        match self.slots.get(fd.index()) {
-            Some(Slot::Occupied { entry, .. }) => Ok(entry),
-            _ => Err(FdTableError::BadDescriptor),
-        }
+        self.slots
+            .get(fd.index())
+            .and_then(Slot::visible_entry)
+            .ok_or(FdTableError::BadDescriptor)
     }
 
     /// Mutably looks up descriptor-local state.
     pub fn get_mut(&mut self, fd: FdNumber) -> Result<&mut DescriptorEntry<D>, FdTableError> {
-        match self.slots.get_mut(fd.index()) {
-            Some(Slot::Occupied { entry, .. }) => Ok(entry),
-            _ => Err(FdTableError::BadDescriptor),
-        }
+        self.slots
+            .get_mut(fd.index())
+            .and_then(Slot::visible_entry_mut)
+            .ok_or(FdTableError::BadDescriptor)
     }
 
     /// Returns a generation token for the currently visible descriptor.
     pub fn token(&self, fd: FdNumber) -> Result<DescriptorToken, FdTableError> {
-        match self.slots.get(fd.index()) {
-            Some(Slot::Occupied { generation, .. }) => Ok(DescriptorToken {
-                table: self.id,
-                fd,
-                generation: *generation,
-            }),
-            _ => Err(FdTableError::BadDescriptor),
-        }
+        let generation = self
+            .slots
+            .get(fd.index())
+            .and_then(Slot::visible_generation)
+            .ok_or(FdTableError::BadDescriptor)?;
+        Ok(DescriptorToken {
+            table: self.id,
+            fd,
+            generation,
+        })
     }
 
     /// Revalidates a previously observed descriptor without returning a newer
@@ -348,10 +614,11 @@ impl<D, const N: usize> FdTable<D, N> {
         if token.table != self.id || token.fd.index() >= N {
             return Err(FdTableError::StaleToken);
         }
-        match &self.slots[token.fd.index()] {
-            Slot::Occupied { generation, entry } if *generation == token.generation => Ok(entry),
-            _ => Err(FdTableError::StaleToken),
+        let slot = &self.slots[token.fd.index()];
+        if slot.visible_generation() != Some(token.generation) {
+            return Err(FdTableError::StaleToken);
         }
+        slot.visible_entry().ok_or(FdTableError::StaleToken)
     }
 
     /// Removes a visible descriptor and returns it for lock-external cleanup.
@@ -360,9 +627,9 @@ impl<D, const N: usize> FdTable<D, N> {
             .slots
             .get_mut(fd.index())
             .ok_or(FdTableError::BadDescriptor)?;
-        match core::mem::replace(slot, Slot::Vacant) {
-            Slot::Occupied { entry, .. } => Ok(entry),
-            other => {
+        match core::mem::replace(slot, Slot::Vacant).into_visible_entry() {
+            Ok(entry) => Ok(entry),
+            Err(other) => {
                 *slot = other;
                 Err(FdTableError::BadDescriptor)
             }
@@ -393,7 +660,7 @@ impl<D, const N: usize> FdTable<D, N> {
         }
         let end = last.index().min(N.saturating_sub(1));
         for fd in first.index().min(N)..=end {
-            if let Slot::Occupied { entry, .. } = &mut self.slots[fd] {
+            if let Some(entry) = self.slots[fd].visible_entry_mut() {
                 entry.flags.set(DescriptorFlags::CLOSE_ON_EXEC, true);
             }
         }
@@ -431,7 +698,7 @@ impl<D: Clone, const N: usize> FdTable<D, N> {
         if target.index() >= N {
             return Err(FdTableError::BadDescriptor);
         }
-        if matches!(self.slots[target.index()], Slot::Reserved { .. }) {
+        if self.slots[target.index()].blocks_replacement() {
             return Err(FdTableError::Busy);
         }
         let description = self.get(source)?.description.clone();
@@ -441,10 +708,13 @@ impl<D: Clone, const N: usize> FdTable<D, N> {
             entry: DescriptorEntry::new(description, flags),
         };
         let previous = core::mem::replace(&mut self.slots[target.index()], replacement);
-        let removed = match previous {
-            Slot::Vacant => None,
-            Slot::Occupied { entry, .. } => Some(entry),
-            Slot::Reserved { .. } => return Err(FdTableError::Busy),
+        let removed = match previous.into_visible_entry() {
+            Ok(entry) => Some(entry),
+            Err(Slot::Vacant) => None,
+            Err(other) => {
+                self.slots[target.index()] = other;
+                return Err(FdTableError::Busy);
+            }
         };
         Ok((
             DescriptorToken {
@@ -461,7 +731,7 @@ impl<D: Clone, const N: usize> FdTable<D, N> {
     pub fn fork_copy(&self, new_id: FdTableId) -> Result<Self, FdTableError> {
         let mut copy = Self::try_new(new_id)?;
         for (fd, slot) in self.slots.iter().enumerate() {
-            if let Slot::Occupied { entry, .. } = slot {
+            if let Some(entry) = slot.visible_entry() {
                 let generation = copy.allocate_generation()?;
                 copy.slots[fd] = Slot::Occupied {
                     generation,
@@ -478,6 +748,33 @@ impl<D: Clone, const N: usize> FdTable<D, N> {
 pub struct CloseBatch<D> {
     entries: Vec<DescriptorEntry<D>>,
     limit: usize,
+}
+
+/// Full-capacity ownership prepared for one allocation-free close-on-exec
+/// transaction on an `N`-slot table.
+#[cfg(feature = "alloc")]
+#[must_use = "a prepared close-on-exec batch should be committed or dropped"]
+pub struct PreparedCloseOnExec<D, const N: usize> {
+    batch: CloseBatch<D>,
+}
+
+/// Descriptors detached by an infallible full-capacity close-on-exec commit.
+#[cfg(feature = "alloc")]
+pub struct CommittedCloseOnExec<D> {
+    batch: CloseBatch<D>,
+}
+
+#[cfg(feature = "alloc")]
+impl<D> CommittedCloseOnExec<D> {
+    /// Returns every detached descriptor in ascending table order.
+    pub fn entries(&self) -> &[DescriptorEntry<D>] {
+        self.batch.entries()
+    }
+
+    /// Consumes the transaction and returns detached descriptor ownership.
+    pub fn into_entries(self) -> Vec<DescriptorEntry<D>> {
+        self.batch.into_entries()
+    }
 }
 
 #[cfg(feature = "alloc")]
@@ -508,17 +805,47 @@ impl<D> CloseBatch<D> {
     }
 
     fn remaining(&self) -> usize {
-        self.limit.saturating_sub(self.entries.len())
+        self.limit - self.entries.len()
     }
 
     fn push(&mut self, entry: DescriptorEntry<D>) {
-        debug_assert!(self.entries.len() < self.limit);
         self.entries.push(entry);
     }
 }
 
 #[cfg(feature = "alloc")]
 impl<D, const N: usize> FdTable<D, N> {
+    /// Preallocates the complete descriptor ownership required by a later
+    /// close-on-exec commit, independent of how flags change before commit.
+    pub fn prepare_close_on_exec(&self) -> Result<PreparedCloseOnExec<D, N>, FdTableError> {
+        Ok(PreparedCloseOnExec {
+            batch: CloseBatch::try_with_capacity(N)?,
+        })
+    }
+
+    /// Detaches all descriptors currently marked close-on-exec using the
+    /// full-capacity ownership prepared earlier. This operation allocates
+    /// nothing and has no capacity failure.
+    pub fn commit_close_on_exec(
+        &mut self,
+        mut prepared: PreparedCloseOnExec<D, N>,
+    ) -> CommittedCloseOnExec<D> {
+        for fd in 0..N {
+            let should_remove = self.slots[fd]
+                .visible_entry()
+                .is_some_and(|entry| entry.flags.contains(DescriptorFlags::CLOSE_ON_EXEC));
+            if should_remove {
+                let previous = core::mem::replace(&mut self.slots[fd], Slot::Vacant);
+                if let Ok(entry) = previous.into_visible_entry() {
+                    prepared.batch.push(entry);
+                }
+            }
+        }
+        CommittedCloseOnExec {
+            batch: prepared.batch,
+        }
+    }
+
     fn count_matching(
         &self,
         mut predicate: impl FnMut(usize, &DescriptorEntry<D>) -> bool,
@@ -526,9 +853,9 @@ impl<D, const N: usize> FdTable<D, N> {
         self.slots
             .iter()
             .enumerate()
-            .filter(|(fd, slot)| match slot {
-                Slot::Occupied { entry, .. } => predicate(*fd, entry),
-                _ => false,
+            .filter(|(fd, slot)| {
+                slot.visible_entry()
+                    .is_some_and(|entry| predicate(*fd, entry))
             })
             .count()
     }
@@ -543,13 +870,12 @@ impl<D, const N: usize> FdTable<D, N> {
             return Err(FdTableError::InsufficientCloseStorage);
         }
         for fd in 0..N {
-            let should_remove = match &self.slots[fd] {
-                Slot::Occupied { entry, .. } => predicate(fd, entry),
-                _ => false,
-            };
+            let should_remove = self.slots[fd]
+                .visible_entry()
+                .is_some_and(|entry| predicate(fd, entry));
             if should_remove {
                 let previous = core::mem::replace(&mut self.slots[fd], Slot::Vacant);
-                if let Slot::Occupied { entry, .. } = previous {
+                if let Ok(entry) = previous.into_visible_entry() {
                     batch.push(entry);
                 }
             }
@@ -604,6 +930,91 @@ mod tests {
         );
         let token = table.publish(reservation, Arc::new(7)).unwrap();
         assert_eq!(**table.get_token(token).unwrap().description(), 7);
+    }
+
+    #[test]
+    fn prepared_publication_is_invisible_until_infallible_commit() {
+        let mut table = FdTable::<Arc<u32>, 2>::try_new(table_id(1)).unwrap();
+        let reservation = table.reserve(0, 2, DescriptorFlags::CLOSE_ON_EXEC).unwrap();
+        let publication = table.prepare_publication(reservation, Arc::new(7)).unwrap();
+        assert_eq!(publication.fd(), FdNumber::new(0));
+        assert_eq!(table.len(), 0);
+        assert_eq!(
+            table.get(FdNumber::new(0)),
+            Err(FdTableError::BadDescriptor)
+        );
+
+        let token = publication.commit();
+        let entry = table.get_token(token).unwrap();
+        assert_eq!(**entry.description(), 7);
+        assert_eq!(entry.flags(), DescriptorFlags::CLOSE_ON_EXEC);
+    }
+
+    #[test]
+    fn prepared_cancellation_returns_entry_and_exact_slot() {
+        let mut table = FdTable::<Arc<u32>, 1>::try_new(table_id(1)).unwrap();
+        let reservation = table.reserve(0, 1, DescriptorFlags::EMPTY).unwrap();
+        let publication = table.prepare_publication(reservation, Arc::new(7)).unwrap();
+        let entry = table.cancel_prepared(publication).unwrap();
+        assert_eq!(**entry.description(), 7);
+
+        let reused = table.reserve(0, 1, DescriptorFlags::EMPTY).unwrap();
+        assert_eq!(reused.fd(), FdNumber::new(0));
+        let reused = table.publish(reused, Arc::new(9)).unwrap();
+        assert_eq!(**table.get_token(reused).unwrap().description(), 9);
+    }
+
+    #[test]
+    fn foreign_prepare_and_cancel_preserve_exact_authority() {
+        let mut one = FdTable::<Arc<u32>, 1>::try_new(table_id(1)).unwrap();
+        let mut two = FdTable::<Arc<u32>, 1>::try_new(table_id(2)).unwrap();
+        let reservation = one.reserve(0, 1, DescriptorFlags::EMPTY).unwrap();
+        let description = Arc::new(7);
+        let error = two
+            .prepare_publication(reservation, description.clone())
+            .unwrap_err();
+        assert_eq!(error.error, FdTableError::StaleToken);
+        assert!(Arc::ptr_eq(&error.description, &description));
+
+        let publication = one
+            .prepare_publication(error.reservation, error.description)
+            .unwrap();
+        let error = two.cancel_prepared(publication).unwrap_err();
+        assert_eq!(error.error, FdTableError::StaleToken);
+        let entry = one.cancel_prepared(error.publication).unwrap();
+        assert!(Arc::ptr_eq(entry.description(), &description));
+    }
+
+    #[test]
+    fn prepared_slot_cannot_be_stolen_by_dup_replace() {
+        let mut table = FdTable::<Arc<u32>, 2>::try_new(table_id(1)).unwrap();
+        let source = table.reserve(0, 1, DescriptorFlags::EMPTY).unwrap();
+        let source = table.publish(source, Arc::new(1)).unwrap();
+        let target = table.reserve(1, 2, DescriptorFlags::CLOSE_ON_EXEC).unwrap();
+        let publication = table.prepare_publication(target, Arc::new(2)).unwrap();
+
+        assert_eq!(
+            table.duplicate_replace(source.fd(), publication.fd(), DescriptorFlags::EMPTY),
+            Err(FdTableError::Busy)
+        );
+        let target = publication.commit();
+        assert_eq!(**table.get_token(target).unwrap().description(), 2);
+    }
+
+    #[test]
+    fn committed_prepared_entries_follow_close_exec_and_fork_rules() {
+        let mut table = FdTable::<Arc<u32>, 2>::try_new(table_id(1)).unwrap();
+        let reservation = table.reserve(0, 2, DescriptorFlags::CLOSE_ON_EXEC).unwrap();
+        let publication = table.prepare_publication(reservation, Arc::new(7)).unwrap();
+        let token = publication.commit();
+
+        let fork = table.fork_copy(table_id(2)).unwrap();
+        assert_eq!(**fork.get(token.fd()).unwrap().description(), 7);
+
+        let mut batch = CloseBatch::try_with_capacity(1).unwrap();
+        table.close_on_exec(&mut batch).unwrap();
+        assert!(table.is_empty());
+        assert_eq!(**batch.entries()[0].description(), 7);
     }
 
     #[test]
@@ -703,6 +1114,27 @@ mod tests {
         let mut exact = CloseBatch::try_with_capacity(2).unwrap();
         table.close_on_exec(&mut exact).unwrap();
         assert_eq!(exact.entries().len(), 2);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn full_cloexec_preparation_covers_flags_and_entries_added_before_commit() {
+        let mut table = FdTable::<Arc<u32>, 3>::try_new(table_id(1)).unwrap();
+        let keep = table.reserve(0, 1, DescriptorFlags::EMPTY).unwrap();
+        table.publish(keep, Arc::new(1)).unwrap();
+        let prepared = table.prepare_close_on_exec().unwrap();
+
+        table.set_close_on_exec(FdNumber::new(0), true).unwrap();
+        let later = table.reserve(1, 3, DescriptorFlags::CLOSE_ON_EXEC).unwrap();
+        table.publish(later, Arc::new(2)).unwrap();
+
+        let committed = table.commit_close_on_exec(prepared);
+        let values = committed
+            .entries()
+            .iter()
+            .map(|entry| **entry.description())
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(values, alloc::vec![1, 2]);
         assert!(table.is_empty());
     }
 

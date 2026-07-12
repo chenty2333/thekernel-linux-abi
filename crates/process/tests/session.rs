@@ -13,6 +13,11 @@ fn session_groups_are_registry_scoped_and_deduplicated() {
     let _other_init = init(&other_domain);
     let session = init_process.group().session();
     let child = child(&process_domain, &init_process, 2);
+    process_domain
+        .prepare_thread(&child, 2)
+        .unwrap()
+        .commit()
+        .unwrap();
     let child_group = process_domain.try_create_group(&child).unwrap().unwrap();
 
     let groups = session
@@ -24,6 +29,7 @@ fn session_groups_are_registry_scoped_and_deduplicated() {
         session.try_process_groups(other_domain.registry()).err(),
         Some(ProcessError::WrongDomain)
     );
+    assert!(child.remove_thread(2));
     exit_and_reap(&process_domain, &child);
 }
 
