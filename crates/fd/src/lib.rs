@@ -42,8 +42,8 @@ pub use epoll::{
 pub use graph::{EpollGraph, EpollGraphLimits, GraphEdgeToken, GraphError, GraphNodeToken};
 #[cfg(feature = "alloc")]
 pub use subscription::{
-    AggregateError, ArmError, CancelState, PrepareSubscriptionError, PreparedSubscription,
-    RetainedRegistration, Subscription, WatchAccount, WatchChargeError,
+    AggregateError, ArmError, CancelState, CommitSubscriptionError, PrepareSubscriptionError,
+    PreparedSubscription, RetainedRegistration, Subscription, WatchAccount, WatchChargeError,
 };
 #[cfg(feature = "alloc")]
 pub use table::CloseBatch;
