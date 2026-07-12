@@ -4,10 +4,12 @@
 owned by TheKernel. It is deliberately separate from generic ArceOS
 mechanisms and from TheKernel's syscall and evaluator layers.
 
-The first release candidate contains one leaf package:
+The release candidates currently contain two independent leaf packages:
 
 - `thekernel-linux-usercopy` 0.1.0: explicit-context, bounded, fallible access
   to a caller-provided userspace memory implementation.
+- `thekernel-linux-process` 0.1.0: explicit-domain, bounded process lifecycle
+  state with a caller-defined zombie payload.
 
 The workspace name is not a facade package. Credential, VFS, FD/readiness,
 and MM crates will be added only after their Linux-visible contracts pass the
@@ -16,8 +18,11 @@ this repository.
 
 ## Development
 
-The repository pins the same nightly used by its initial TheKernel consumer,
-while the usercopy crate is also checked against stable Rust 1.85 or newer.
+The repository pins the same nightly used by its initial TheKernel consumer.
+The usercopy crate is additionally checked against stable Rust 1.85 or newer.
+The process crate is explicitly nightly-only because preserving fallible
+standard `Arc` allocation currently requires `allocator_api`; it does not
+inherit or claim a stable `rust-version`.
 
 ```bash
 cargo test --workspace --all-features

@@ -1,0 +1,30 @@
+[package]
+name = "thekernel-linux-process"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+description = "Explicit-domain, bounded process lifecycle state for no_std Linux ABI kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "process"]
+categories = ["no-std", "os"]
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
+
+[features]
+default = []
+
+[dependencies]
+intrusive-collections.workspace = true
+kspin.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[package.metadata.thekernel]
+toolchain = "nightly-2025-05-20"
+nightly-features = ["allocator_api"]
+
+[lints]
+workspace = true

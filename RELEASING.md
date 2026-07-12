@@ -6,7 +6,8 @@ bump the minor version; compatible fixes bump the patch version.
 ## Checklist
 
 1. Confirm the release commit is clean and all provenance assets are present.
-2. Run `./scripts/ci.sh` with stable and the pinned TheKernel nightly.
+2. Run `./scripts/ci.sh` with stable for stable packages and with the pinned
+   TheKernel nightly for the complete workspace.
 3. Run `./scripts/test-package.sh`; inspect the unpacked package inventory.
 4. Build registry-only consumers and TheKernel consumers for RISC-V and
    LoongArch.

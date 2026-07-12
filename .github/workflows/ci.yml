@@ -20,7 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Minimum supported Rust tests
         run: |
-          cargo +1.85.0 test --workspace --all-features
+          cargo +1.85.0 test -p thekernel-linux-usercopy --all-features
           cargo +1.85.0 check -p thekernel-linux-usercopy --no-default-features --lib
 
   stable:
@@ -32,7 +32,7 @@ jobs:
           components: clippy,rustfmt
           targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
       - uses: Swatinem/rust-cache@v2
-      - name: Full release-candidate gate
+      - name: Stable-package release-candidate gate
         env:
           CARGO_TOOLCHAIN: stable
         run: ./scripts/ci.sh
@@ -44,10 +44,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2025-05-20
+          components: clippy,rustfmt
           targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
       - uses: Swatinem/rust-cache@v2
-      - name: Pinned consumer-toolchain tests
-        run: |
-          cargo +nightly-2025-05-20 test --workspace --all-features
-          cargo +nightly-2025-05-20 check -p thekernel-linux-usercopy --no-default-features --target riscv64gc-unknown-none-elf
-          cargo +nightly-2025-05-20 check -p thekernel-linux-usercopy --features alloc --target loongarch64-unknown-none
+      - name: Full nightly release-candidate gate
+        env:
+          CARGO_TOOLCHAIN: nightly-2025-05-20
+        run: ./scripts/ci.sh

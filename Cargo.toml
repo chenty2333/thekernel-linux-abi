@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/usercopy"]
+members = ["crates/process", "crates/usercopy"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,8 @@ homepage = "https://github.com/chenty2333/thekernel-linux-abi"
 
 [workspace.dependencies]
 bytemuck = { version = "1.24", default-features = false }
+intrusive-collections = "0.9"
+kspin = "0.1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
