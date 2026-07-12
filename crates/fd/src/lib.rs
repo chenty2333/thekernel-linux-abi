@@ -24,7 +24,7 @@ mod graph;
 #[cfg(feature = "alloc")]
 mod subscription;
 
-pub use ofd::{OfdOffsetError, OpenFileDescriptionState};
+pub use ofd::{ExternalOffset, OfdOffsetError, OpenFileDescriptionState};
 pub use table::{
     DescriptorEntry, DescriptorToken, FdTable, FdTableError, PublishError, ReservationToken,
 };

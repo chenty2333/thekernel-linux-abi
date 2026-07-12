@@ -7,8 +7,10 @@
 - Keep alloc-enabled kernel-sized FD tables heap-backed and fallibly
   preallocated, including fork copies, so construction never requires an
   `O(capacity)` stack temporary; expose ordered visible-entry iteration.
-- Separate descriptor-local state from shared OFD offset, status, and async
-  owner state.
+- Separate descriptor-local state from shared OFD identity, status, async
+  owner, and optional crate-owned offset state; add a zero-sized
+  `ExternalOffset` migration mode so an existing VFS cursor remains the single
+  authority instead of being mirrored.
 - Add finite watch accounting and fallible two-phase aggregate source
   registration with exact cancellation rollback.
 - Add bounded epoll LT/ET/ONESHOT delivery, copyout-fault replay, concurrent

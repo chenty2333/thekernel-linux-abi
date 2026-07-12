@@ -14,7 +14,9 @@ Version 0.1.0 provides:
 - generation-tagged reservation/publication and ABA-safe close operations;
 - transactional close-range and close-on-exec batches whose storage is
   admitted before table mutation;
-- explicit shared OFD offset/status/async-owner state;
+- explicit shared OFD identity/status/async-owner state, with either a
+  crate-owned cursor or a zero-sized `ExternalOffset` migration marker for a
+  VFS that already owns the single authoritative cursor;
 - finite per-owner watch accounting and two-phase aggregate source arming;
 - retained registration update/cancel ownership with partial-arm rollback;
 - a fixed-capacity epoll interest/ready core with LT, ET, ONESHOT, coalescing,
