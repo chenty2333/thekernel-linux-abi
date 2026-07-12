@@ -1,0 +1,8 @@
+[toolchain]
+profile = "minimal"
+channel = "nightly-2025-05-20"
+components = ["clippy", "rustfmt"]
+targets = [
+    "riscv64gc-unknown-none-elf",
+    "loongarch64-unknown-none",
+]

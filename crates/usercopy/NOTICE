@@ -1,0 +1,5 @@
+This package contains a modified migration of StarryOS `starry-vm 0.3.0`,
+authored by 朝倉水希 and Mivik and distributed under Apache-2.0.
+
+TheKernel modifications and the exact immutable source identity are described
+in VENDOR.md and PATCHES.md.

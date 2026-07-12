@@ -1,0 +1,30 @@
+[package]
+name = "thekernel-linux-usercopy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Explicit-context, bounded, fallible user-memory access for no_std Linux ABI kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "usercopy"]
+categories = ["no-std", "os"]
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
+
+[features]
+default = []
+alloc = []
+
+[dependencies]
+bytemuck.workspace = true
+
+[dev-dependencies]
+bytemuck = { workspace = true, features = ["derive"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
