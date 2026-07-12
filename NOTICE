@@ -1,0 +1,7 @@
+TheKernel Linux ABI
+Copyright 2026 TheKernel contributors
+
+The usercopy crate is derived from the StarryOS `starry-vm` crate authored by
+朝倉水希 and Mivik. Exact source identity, archive checksum, authorship, and
+local patch lineage are recorded in `crates/usercopy/VENDOR.md` and
+`crates/usercopy/PATCHES.md`.
