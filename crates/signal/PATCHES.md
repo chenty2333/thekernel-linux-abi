@@ -45,5 +45,11 @@ This ledger records changes relative to `starry-signal 0.3.0` identified in
 - Pin the maintained `axcpu` line and the compatible x86_64 support crate used
   by the declared nightly so fresh and unpacked package resolution cannot
   silently select an incompatible API.
+- Accept unaligned Linux `rt_sigaction` and signal-frame user addresses through
+  the explicit usercopy context.
+- Give every queue account and process thread registry an immutable finite
+  ceiling, reject `usize::MAX`, and return typed capacity/configuration errors.
+- Reject bare-metal builds without `multitask` so usercopy, allocation, and
+  immutable-registry destruction never run under `SpinNoIrq`.
 - Declare the package nightly-only: `Arc::try_new` preserves real OOM errors;
   allocator pre-reservation is not treated as a substitute.

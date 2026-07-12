@@ -96,6 +96,30 @@ fn registration_identity_is_explicit_unique_and_reusable_after_cancel() {
 }
 
 #[test]
+fn thread_registry_limit_is_finite_refunded_and_configurable() {
+    use thekernel_linux_signal::api::{SignalManagerConfigError, ThreadRegistrationError};
+
+    assert!(matches!(
+        ProcessSignalManager::try_with_thread_limit(SignalActions::default(), 0, usize::MAX),
+        Err(SignalManagerConfigError::UnboundedThreadRegistry)
+    ));
+    let process = Arc::new(
+        ProcessSignalManager::try_with_thread_limit(SignalActions::default(), 0, 1).unwrap(),
+    );
+    assert_eq!(process.thread_limit(), 1);
+    let first = ThreadSignalManager::try_new(process.clone()).unwrap();
+    first.try_register(1).unwrap().commit().unwrap();
+    let second = ThreadSignalManager::try_new(process.clone()).unwrap();
+    assert!(matches!(
+        second.try_register(2),
+        Err(ThreadRegistrationError::Capacity)
+    ));
+
+    assert!(first.cancel_registration());
+    second.try_register(2).unwrap().commit().unwrap();
+}
+
+#[test]
 fn cancelled_admission_token_cannot_resurrect_a_stale_endpoint() {
     use thekernel_linux_signal::api::ThreadRegistrationError;
 

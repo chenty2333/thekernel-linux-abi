@@ -7,10 +7,13 @@ transactional signal restore validation.
 The caller owns every `ProcessSignalManager`, queue account, and thread
 endpoint. There is no crate-global signal domain or implicit current process.
 Thread IDs are unique within one process registry; registration is
-rollback-safe, and explicit cancellation stops later publication while
-draining and refunding thread-private queued records. Cancellation also
-quiesces a delivery that already started, so handler context and mask updates
-cannot complete after endpoint teardown returns.
+rollback-safe and bounded by an immutable process-local endpoint limit. The
+default is 65,536; `try_with_thread_limit()` selects a lower or other finite
+limit, while `usize::MAX` is rejected as effective infinity. Explicit
+cancellation stops later publication while draining and refunding
+thread-private queued records. Cancellation also quiesces a delivery that
+already started, so handler context and mask updates cannot complete after
+endpoint teardown returns.
 
 Registration is a two-phase operation. `try_register(tid)` returns an
 admission token; dropping that token rolls the admission back, while
@@ -22,7 +25,13 @@ thread teardown before releasing the endpoint.
 Every userspace action/frame copy receives an explicit
 `UserMemoryContext`; the crate never obtains the current task or address space.
 Its only TheKernel Linux ABI workspace dependency is
-`thekernel-linux-usercopy`.
+`thekernel-linux-usercopy`. Action and frame copies accept Linux-compatible
+unaligned userspace addresses.
+
+Each `SignalQueueAccount` requires an explicit finite hard limit and rejects
+`usize::MAX`. RLIMIT may further lower per-user admission, while a separate
+finite global account prevents an infinity-valued RLIMIT from becoming
+unbounded allocation.
 
 All supported 64-bit signal-frame alignment holes are represented by explicit
 zeroed fields before an object is written to userspace. `SignalInfo` keeps its
@@ -49,8 +58,11 @@ RISC-V 64 and LoongArch64. The inherited AArch64 frame module remains
 source-only on this release line because the pinned `axcpu` and nightly pair
 does not build that target.
 
-Enable `multitask` in a kernel so action/registry publication uses the
-sleepable `axsync::Mutex`. `kspin/smp` remains enabled in every build,
-including standalone and unpacked-package concurrency tests.
+Bare-metal consumers must enable `multitask`, so delivery quiescence and
+action/registry publication use the sleepable `axsync::Mutex`. A bare-metal
+no-feature build is rejected at compile time instead of holding `SpinNoIrq`
+across usercopy or fallible allocation. Hosted standalone tests retain a spin
+fallback where no kernel IRQ state exists. `kspin/smp` remains enabled in every
+build, including unpacked-package concurrency tests.
 
 See `VENDOR.md` and `PATCHES.md` for source identity and semantic changes.

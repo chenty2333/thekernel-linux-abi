@@ -217,6 +217,17 @@ pub enum SignalActionUpdateError {
     GenerationExhausted,
 }
 
+/// Default finite process-local thread endpoint ceiling.
+pub const SIGNAL_THREAD_REGISTRY_LIMIT: usize = 65_536;
+
+/// Invalid process-signal-manager resource configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignalManagerConfigError {
+    /// `usize::MAX` was rejected rather than treated as an unbounded registry.
+    UnboundedThreadRegistry,
+}
+
 impl From<AllocError> for SignalActionUpdateError {
     fn from(_: AllocError) -> Self {
         Self::NoMemory
@@ -243,6 +254,8 @@ pub struct ProcessSignalManager {
     /// SpinNoIrq guard. Hosted tests retain the spin fallback.
     pub(crate) action_update: Mutex<()>,
 
+    thread_limit: usize,
+
     pub(crate) possibly_has_signal: AtomicBool,
 }
 
@@ -257,16 +270,47 @@ impl ProcessSignalManager {
         }
     }
 
-    /// Creates a new process signal manager.
+    /// Creates a process signal manager with the default finite thread limit.
     pub fn new(actions: SignalActions, default_restorer: usize) -> Self {
+        Self::with_validated_thread_limit(actions, default_restorer, SIGNAL_THREAD_REGISTRY_LIMIT)
+    }
+
+    /// Creates a process signal manager with a caller-selected finite thread
+    /// endpoint limit.
+    pub fn try_with_thread_limit(
+        actions: SignalActions,
+        default_restorer: usize,
+        thread_limit: usize,
+    ) -> Result<Self, SignalManagerConfigError> {
+        if thread_limit == usize::MAX {
+            return Err(SignalManagerConfigError::UnboundedThreadRegistry);
+        }
+        Ok(Self::with_validated_thread_limit(
+            actions,
+            default_restorer,
+            thread_limit,
+        ))
+    }
+
+    fn with_validated_thread_limit(
+        actions: SignalActions,
+        default_restorer: usize,
+        thread_limit: usize,
+    ) -> Self {
         Self {
             pending: SpinNoIrq::new(PendingSignals::default()),
             actions: SpinNoIrq::new(actions),
             default_restorer,
             children: SpinNoIrq::new(None),
             action_update: Mutex::new(()),
+            thread_limit,
             possibly_has_signal: AtomicBool::new(false),
         }
+    }
+
+    /// Returns the immutable process-local endpoint ceiling.
+    pub const fn thread_limit(&self) -> usize {
+        self.thread_limit
     }
 
     pub(crate) fn children_registry_snapshot(&self) -> Option<Arc<ThreadRegistry>> {

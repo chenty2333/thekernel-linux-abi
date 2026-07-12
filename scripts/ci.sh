@@ -49,7 +49,6 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
     run_cargo check -p thekernel-linux-fd --features alloc --target "$target"
     if [ "$stable_only" = 0 ]; then
         run_cargo check -p thekernel-linux-process --no-default-features --target "$target"
-        run_cargo check -p thekernel-linux-signal --no-default-features --target "$target"
         run_cargo check -p thekernel-linux-signal --features multitask --target "$target"
     fi
 done

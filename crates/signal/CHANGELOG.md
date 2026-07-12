@@ -17,5 +17,11 @@
   stack restoration validated, diagnostic, and part of the infallible
   sigreturn commit. `SS_AUTODISARM` remains honestly unsupported.
 - Preserve transactional sigreturn validation and architecture state filtering.
+- Accept unaligned Linux signal ABI pointers through explicit byte-address
+  usercopy.
+- Add finite queue-account and process-thread-registry configuration with
+  typed rejection of effective infinity and capacity exhaustion.
+- Require the sleepable `multitask` synchronization feature on bare-metal
+  targets instead of running usercopy/allocation under an IRQ-off spin guard.
 - Test real SMP publication, queue accounting, frame placement, and restore
   behavior on the pinned nightly toolchain.

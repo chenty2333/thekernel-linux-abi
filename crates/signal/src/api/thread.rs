@@ -38,6 +38,8 @@ pub enum ThreadRegistrationError {
     AlreadyRegistered,
     /// Another live endpoint in the process already owns this thread ID.
     TidInUse,
+    /// The process-local endpoint registry reached its explicit hard limit.
+    Capacity,
     /// The admission was cancelled before it could be committed.
     Cancelled,
 }
@@ -244,14 +246,26 @@ impl ThreadSignalManager {
         self: &Arc<Self>,
         tid: u32,
     ) -> Result<ThreadSignalRegistration, ThreadRegistrationError> {
-        let entry = RegisteredThread::try_new(tid, self)?;
         let update = self.proc.action_update.lock();
         if self.registration.lock().is_some() {
             return Err(ThreadRegistrationError::AlreadyRegistered);
         }
         let registry = self.proc.children_registry_snapshot();
-        let len = registry.as_deref().map_or(0, Vec::len);
-        let capacity = len
+        let mut live = 0usize;
+        if let Some(registry) = registry.as_deref() {
+            for registered in registry {
+                if registered.is_live() {
+                    if registered.claims_tid(tid) {
+                        return Err(ThreadRegistrationError::TidInUse);
+                    }
+                    live += 1;
+                }
+            }
+        }
+        if live >= self.proc.thread_limit() {
+            return Err(ThreadRegistrationError::Capacity);
+        }
+        let capacity = live
             .checked_add(1)
             .ok_or(ThreadRegistrationError::NoMemory)?;
         let mut replacement = Vec::new();
@@ -261,13 +275,11 @@ impl ThreadSignalManager {
         if let Some(registry) = registry.as_deref() {
             for registered in registry {
                 if registered.is_live() {
-                    if registered.claims_tid(tid) {
-                        return Err(ThreadRegistrationError::TidInUse);
-                    }
                     replacement.push(registered.clone());
                 }
             }
         }
+        let entry = RegisteredThread::try_new(tid, self)?;
         replacement.push(entry.clone());
         let replacement =
             Arc::try_new(replacement).map_err(|_| ThreadRegistrationError::NoMemory)?;

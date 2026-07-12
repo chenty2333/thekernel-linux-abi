@@ -114,7 +114,7 @@ fn explicit_null_restorer_is_not_replaced_by_the_default() {
 fn raw_action_round_trip_uses_one_explicit_memory_context() {
     let mut provider = memory_provider();
     let mut memory = UserMemoryContext::new(&mut provider);
-    let ptr = (initial_sp() - core::mem::size_of::<RawSignalAction>()) as *mut RawSignalAction;
+    let ptr = (initial_sp() - core::mem::size_of::<RawSignalAction>() - 1) as *mut RawSignalAction;
     let raw = RawSignalAction {
         handler: 0x1234_5678,
         flags: SignalActionFlags::RESTART.bits(),
@@ -132,9 +132,4 @@ fn raw_action_round_trip_uses_one_explicit_memory_context() {
     assert_eq!(copied.handler, raw.handler);
     assert_eq!(copied.flags, raw.flags);
     assert!(copied.mask.has(Signo::SIGUSR1));
-
-    assert!(
-        RawSignalAction::read_from_user(&mut memory, (ptr as usize + 1) as *const RawSignalAction)
-            .is_err()
-    );
 }

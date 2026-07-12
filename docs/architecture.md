@@ -37,6 +37,11 @@ registration, and teardown. Endpoint cancellation quiesces a complete delivery
 before returning; no usercopy or handler-state publication may outlive the
 thread endpoint.
 
+Queue accounts and each process-local endpoint registry have immutable finite
+limits; `usize::MAX` is never a policy value. Bare-metal signal consumers use a
+sleepable lifecycle mutex, and unsupported no-`multitask` builds fail at
+compile time rather than taking an IRQ-off lock across usercopy or allocation.
+
 One-shot dispositions and signal return are transactions rather than syscall
 side effects. `SA_RESETHAND` claims are generation checked, and `uc_stack`
 restore separates crate-owned structural validation from caller-owned address,

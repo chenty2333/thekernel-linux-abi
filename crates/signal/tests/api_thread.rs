@@ -653,13 +653,13 @@ fn restore_sanitizes_x86_privileged_flags_and_rejects_bad_cs() {
 }
 
 #[test]
-fn signal_frame_copy_rejects_unmapped_and_unaligned_addresses() {
+fn signal_frame_copy_accepts_unaligned_but_rejects_unmapped_or_partial_reads() {
     let mut provider = memory_provider();
     let mut memory = UserMemoryContext::new(&mut provider);
     assert!(SignalFrame::read_from_user(&mut memory, std::ptr::dangling::<SignalFrame>()).is_err());
 
     let unaligned = initial_sp() - 1;
-    assert!(SignalFrame::read_from_user(&mut memory, unaligned as *const SignalFrame).is_err());
+    assert!(SignalFrame::read_from_user(&mut memory, unaligned as *const SignalFrame).is_ok());
 
     let mut partial = PartialReadFailure;
     let mut partial_memory = UserMemoryContext::new(&mut partial);

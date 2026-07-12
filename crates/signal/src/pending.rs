@@ -21,12 +21,21 @@ pub struct SignalQueueAccount {
 }
 
 impl SignalQueueAccount {
-    /// Fallibly creates a shared queue account.
-    pub fn try_new(hard_limit: usize) -> Result<Arc<Self>, AllocError> {
+    /// Fallibly creates a shared queue account with an explicit finite limit.
+    pub fn try_new(hard_limit: usize) -> Result<Arc<Self>, SignalQueueAccountError> {
+        if hard_limit == usize::MAX {
+            return Err(SignalQueueAccountError::Unbounded);
+        }
         Arc::try_new(Self {
             queued: AtomicUsize::new(0),
             hard_limit,
         })
+        .map_err(|_| SignalQueueAccountError::NoMemory)
+    }
+
+    /// Returns the immutable hard ceiling for this account.
+    pub const fn hard_limit(&self) -> usize {
+        self.hard_limit
     }
 
     /// Returns the number of records currently charged to this account.
@@ -49,6 +58,16 @@ impl SignalQueueAccount {
             account: self.clone(),
         })
     }
+}
+
+/// Failure while constructing a bounded signal queue account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignalQueueAccountError {
+    /// `usize::MAX` was rejected rather than treated as an effective infinity.
+    Unbounded,
+    /// Allocating the shared account owner failed.
+    NoMemory,
 }
 
 struct SingleSignalQueueCharge {
@@ -482,6 +501,16 @@ mod tests {
 
     fn all_signals() -> SignalSet {
         !SignalSet::default()
+    }
+
+    #[test]
+    fn queue_account_requires_an_explicit_finite_hard_limit() {
+        assert!(matches!(
+            SignalQueueAccount::try_new(usize::MAX),
+            Err(SignalQueueAccountError::Unbounded)
+        ));
+        let account = SignalQueueAccount::try_new(7).unwrap();
+        assert_eq!(account.hard_limit(), 7);
     }
 
     #[test]
