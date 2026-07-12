@@ -108,6 +108,24 @@ pub struct DeliveryToken {
     events: ReadyMask,
 }
 
+/// Stable candidate returned before an adapter prepares userspace event data.
+///
+/// Preparing this token never clones caller state or mutates a valid ready
+/// entry. The adapter may release its IRQ-safe core lock, prepare an owned
+/// event payload, then call [`EpollCore::commit_delivery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeliveryPreparation {
+    interest: EpollToken,
+}
+
+impl DeliveryPreparation {
+    /// Returns the exact interest generation that must still be ready at
+    /// commit.
+    pub const fn interest(self) -> EpollToken {
+        self.interest
+    }
+}
+
 /// Ready event snapshot returned without retaining an epoll-core borrow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyEvent<U> {
@@ -186,6 +204,42 @@ pub struct EpollPublishError<U, S> {
     pub interest: EpollInterest<U, S>,
 }
 
+/// Failed delivery commit which returns the adapter-prepared payload.
+pub struct DeliveryCommitError<U> {
+    /// Typed epoll-core error.
+    pub error: EpollError,
+    /// Payload that was never published into a ready event.
+    pub user_data: U,
+}
+
+impl<U> core::fmt::Debug for DeliveryCommitError<U> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("DeliveryCommitError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Generation-tagged owner of one incremental defensive rescan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RescanToken {
+    epoll: EpollId,
+    generation: u64,
+}
+
+impl RescanToken {
+    /// Returns the owning epoll instance.
+    pub const fn epoll(self) -> EpollId {
+        self.epoll
+    }
+
+    /// Returns the recovery generation.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 impl<U, S> core::fmt::Debug for EpollPublishError<U, S> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -209,6 +263,13 @@ struct ReadyQueue {
     items: Vec<EpollToken>,
     head: usize,
     len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RescanState {
+    generation: u64,
+    cursor: usize,
+    remaining: usize,
 }
 
 impl ReadyQueue {
@@ -282,8 +343,8 @@ pub struct EpollCore<U, S> {
     ready: ReadyQueue,
     next_generation: u64,
     next_delivery: u64,
-    rescan_required: bool,
-    rescan_cursor: usize,
+    next_rescan: u64,
+    rescan: Option<RescanState>,
 }
 
 impl<U, S> EpollCore<U, S> {
@@ -309,8 +370,8 @@ impl<U, S> EpollCore<U, S> {
             ready,
             next_generation: 1,
             next_delivery: 1,
-            rescan_required: false,
-            rescan_cursor: 0,
+            next_rescan: 1,
+            rescan: None,
         })
     }
 
@@ -337,7 +398,16 @@ impl<U, S> EpollCore<U, S> {
     /// Returns whether an unexpected ready-queue overflow requested a bounded
     /// adapter-driven rescan.
     pub const fn needs_rescan(&self) -> bool {
-        self.rescan_required
+        self.rescan.is_some()
+    }
+
+    /// Returns the current recovery token, if an invariant failure requested
+    /// an incremental rescan.
+    pub fn rescan_token(&self) -> Option<RescanToken> {
+        self.rescan.map(|state| RescanToken {
+            epoll: self.id,
+            generation: state.generation,
+        })
     }
 
     fn allocate_generation(&mut self) -> Result<u64, EpollError> {
@@ -354,6 +424,19 @@ impl<U, S> EpollCore<U, S> {
             .checked_add(1)
             .ok_or(EpollError::GenerationExhausted)?;
         Ok(serial)
+    }
+
+    fn start_rescan(&mut self) -> Result<(), EpollError> {
+        let generation = self.next_rescan;
+        self.next_rescan = generation
+            .checked_add(1)
+            .ok_or(EpollError::GenerationExhausted)?;
+        self.rescan = Some(RescanState {
+            generation,
+            cursor: 0,
+            remaining: self.entries.len(),
+        });
+        Ok(())
     }
 
     fn validate_mode(mode: InterestMode) -> Result<(), EpollError> {
@@ -523,46 +606,96 @@ impl<U, S> EpollCore<U, S> {
             return Ok(NotifyOutcome::Coalesced);
         }
         if let Err(error) = self.ready.push(token) {
-            self.rescan_required = true;
+            self.start_rescan()?;
             return Err(error);
         }
         self.entry_mut(token)?.queued = true;
         Ok(NotifyOutcome::Enqueued)
     }
 
-    /// Starts one copyout transaction, skipping stale queue records defensively.
-    pub fn begin_delivery(&mut self) -> Result<Option<ReadyEvent<U>>, EpollError>
-    where
-        U: Clone,
-    {
+    /// Returns one exact ready candidate without cloning caller state.
+    ///
+    /// Stale queue records are removed defensively. A valid candidate remains
+    /// queued until [`commit_delivery`](Self::commit_delivery) revalidates it,
+    /// so an adapter can prepare arbitrary owned user data outside its
+    /// IRQ-safe core lock.
+    pub fn prepare_delivery(&mut self) -> Result<Option<DeliveryPreparation>, EpollError> {
         while let Some(token) = self.ready.peek() {
             let valid = self.entry(token).is_ok_and(|entry| entry.queued);
             if !valid {
                 self.ready.pop();
                 continue;
             }
-            let serial = self.allocate_delivery()?;
-            self.ready.pop();
-            let entry = self.entry_mut(token)?;
-            entry.queued = false;
-            entry.in_delivery = Some(serial);
-            let events = entry.ready;
-            entry.ready = ReadyMask::EMPTY;
-            return Ok(Some(ReadyEvent {
-                delivery: DeliveryToken {
-                    interest: token,
-                    serial,
-                    events,
-                },
-                events,
-                user_data: entry.interest.user_data.clone(),
-            }));
+            return Ok(Some(DeliveryPreparation { interest: token }));
         }
-        if self.rescan_required {
+        if self.rescan.is_some() {
             Err(EpollError::RescanRequired)
         } else {
             Ok(None)
         }
+    }
+
+    /// Commits a prepared candidate and moves caller-prepared event data into
+    /// the ready snapshot.
+    ///
+    /// No `Clone`, callback, allocation, or destructor runs in the core. A
+    /// stale candidate returns `user_data` unchanged for lock-external cleanup.
+    pub fn commit_delivery<V>(
+        &mut self,
+        preparation: DeliveryPreparation,
+        user_data: V,
+    ) -> Result<ReadyEvent<V>, DeliveryCommitError<V>> {
+        let token = preparation.interest;
+        let valid =
+            self.ready.peek() == Some(token) && self.entry(token).is_ok_and(|entry| entry.queued);
+        if !valid {
+            return Err(DeliveryCommitError {
+                error: EpollError::StaleToken,
+                user_data,
+            });
+        }
+        let serial = match self.allocate_delivery() {
+            Ok(serial) => serial,
+            Err(error) => return Err(DeliveryCommitError { error, user_data }),
+        };
+        self.ready.pop();
+        let entry = match self.entry_mut(token) {
+            Ok(entry) => entry,
+            Err(error) => return Err(DeliveryCommitError { error, user_data }),
+        };
+        entry.queued = false;
+        entry.in_delivery = Some(serial);
+        let events = entry.ready;
+        entry.ready = ReadyMask::EMPTY;
+        Ok(ReadyEvent {
+            delivery: DeliveryToken {
+                interest: token,
+                serial,
+                events,
+            },
+            events,
+            user_data,
+        })
+    }
+
+    /// Convenience delivery for bitwise-copyable event data.
+    ///
+    /// Kernels with owned or fallible event payloads should use
+    /// [`prepare_delivery`](Self::prepare_delivery) and
+    /// [`commit_delivery`](Self::commit_delivery) explicitly.
+    pub fn begin_delivery(&mut self) -> Result<Option<ReadyEvent<U>>, EpollError>
+    where
+        U: Copy,
+    {
+        let Some(preparation) = self.prepare_delivery()? else {
+            return Ok(None);
+        };
+        let user_data = self
+            .entry(preparation.interest)
+            .map(|entry| entry.interest.user_data)?;
+        self.commit_delivery(preparation, user_data)
+            .map(Some)
+            .map_err(|error| error.error)
     }
 
     /// Completes copyout, preserving faulted events and wakeups racing copy.
@@ -597,7 +730,7 @@ impl<U, S> EpollCore<U, S> {
         };
         if should_enqueue {
             if let Err(error) = self.ready.push(token) {
-                self.rescan_required = true;
+                self.start_rescan()?;
                 return Err(error);
             }
             self.entry_mut(token)?.queued = true;
@@ -610,59 +743,65 @@ impl<U, S> EpollCore<U, S> {
     /// Normal operation admits one ready item per interest, so this is a
     /// defensive recovery seam rather than a periodic scan path. A zero budget
     /// performs no work and never clears a pending request.
-    pub fn rescan_ready(&mut self, max_entries: usize) -> Result<RescanProgress, EpollError> {
-        if !self.rescan_required {
+    pub fn rescan_ready(
+        &mut self,
+        token: RescanToken,
+        max_entries: usize,
+    ) -> Result<RescanProgress, EpollError> {
+        let Some(mut state) = self.rescan else {
+            return Err(EpollError::StaleToken);
+        };
+        if token.epoll != self.id || token.generation != state.generation {
+            return Err(EpollError::StaleToken);
+        }
+        if self.entries.is_empty() || state.remaining == 0 {
+            self.rescan = None;
             return Ok(RescanProgress {
                 scanned: 0,
                 enqueued: 0,
                 complete: true,
             });
         }
-        if self.entries.is_empty() || max_entries == 0 {
-            let complete = self.entries.is_empty();
-            if complete {
-                self.rescan_required = false;
-            }
+        if max_entries == 0 {
             return Ok(RescanProgress {
                 scanned: 0,
                 enqueued: 0,
-                complete,
+                complete: false,
             });
         }
 
-        let target = max_entries.min(self.entries.len());
+        let target = max_entries.min(state.remaining);
         let mut scanned = 0usize;
         let mut enqueued = 0usize;
         while scanned < target {
-            let slot = self.rescan_cursor;
-            self.rescan_cursor = (self.rescan_cursor + 1) % self.entries.len();
-            scanned += 1;
+            let slot = state.cursor;
+            let ready_token = self.entries[slot].as_ref().and_then(|entry| {
+                (entry.enabled
+                    && !entry.ready.is_empty()
+                    && !entry.queued
+                    && entry.in_delivery.is_none())
+                .then_some(EpollToken {
+                    epoll: self.id,
+                    slot,
+                    generation: entry.generation,
+                })
+            });
+            if let Some(ready_token) = ready_token {
+                if let Err(error) = self.ready.push(ready_token) {
+                    self.rescan = Some(state);
+                    return Err(error);
+                }
+                self.entry_mut(ready_token)?.queued = true;
+                enqueued += 1;
+            }
 
-            let Some(entry) = self.entries[slot].as_ref() else {
-                continue;
-            };
-            if !entry.enabled
-                || entry.ready.is_empty()
-                || entry.queued
-                || entry.in_delivery.is_some()
-            {
-                continue;
-            }
-            let token = EpollToken {
-                epoll: self.id,
-                slot,
-                generation: entry.generation,
-            };
-            if let Err(error) = self.ready.push(token) {
-                self.rescan_required = true;
-                return Err(error);
-            }
-            self.entry_mut(token)?.queued = true;
-            enqueued += 1;
+            state.cursor = (state.cursor + 1) % self.entries.len();
+            state.remaining -= 1;
+            scanned += 1;
         }
 
-        let complete = scanned == self.entries.len();
-        self.rescan_required = !complete;
+        let complete = state.remaining == 0;
+        self.rescan = if complete { None } else { Some(state) };
         Ok(RescanProgress {
             scanned,
             enqueued,
@@ -685,6 +824,9 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct OwnedPayload(u64);
 
     fn id(raw: u64) -> EpollId {
         EpollId::new(raw).unwrap()
@@ -971,6 +1113,92 @@ mod tests {
     }
 
     #[test]
+    fn externally_prepared_non_clone_payload_commits_without_core_cloning() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let key = EpollKey {
+            ofd: ofd(1),
+            fd: FdNumber::new(3),
+        };
+        let mut core = EpollCore::try_new(id(1), 1).unwrap();
+        let token = core
+            .add(interest(key, InterestMode::default(), &drops))
+            .unwrap();
+        core.notify(token, ReadyMask::IN).unwrap();
+
+        let preparation = core.prepare_delivery().unwrap().unwrap();
+        assert_eq!(preparation.interest(), token);
+        let event = core.commit_delivery(preparation, OwnedPayload(7)).unwrap();
+
+        assert_eq!(event.events, ReadyMask::IN);
+        assert_eq!(event.user_data, OwnedPayload(7));
+    }
+
+    #[test]
+    fn stale_preparations_return_unpublished_payload_ownership() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let key = EpollKey {
+            ofd: ofd(1),
+            fd: FdNumber::new(3),
+        };
+
+        let mut removed = EpollCore::try_new(id(1), 1).unwrap();
+        let removed_token = removed
+            .add(interest(key, InterestMode::default(), &drops))
+            .unwrap();
+        removed.notify(removed_token, ReadyMask::IN).unwrap();
+        let removed_preparation = removed.prepare_delivery().unwrap().unwrap();
+        drop(removed.remove(removed_token).unwrap());
+        let error = removed
+            .commit_delivery(removed_preparation, OwnedPayload(11))
+            .unwrap_err();
+        assert_eq!(error.error, EpollError::StaleToken);
+        assert_eq!(error.user_data, OwnedPayload(11));
+
+        let mut modified = EpollCore::try_new(id(2), 1).unwrap();
+        let modified_token = modified
+            .add(interest(key, InterestMode::default(), &drops))
+            .unwrap();
+        modified.notify(modified_token, ReadyMask::IN).unwrap();
+        let modified_preparation = modified.prepare_delivery().unwrap().unwrap();
+        let (_, old) = modified
+            .modify(
+                modified_token,
+                interest(key, InterestMode::default(), &drops),
+            )
+            .unwrap();
+        drop(old);
+        let error = modified
+            .commit_delivery(modified_preparation, OwnedPayload(13))
+            .unwrap_err();
+        assert_eq!(error.error, EpollError::StaleToken);
+        assert_eq!(error.user_data, OwnedPayload(13));
+    }
+
+    #[test]
+    fn delivery_exhaustion_returns_payload_and_preserves_queue_item() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let key = EpollKey {
+            ofd: ofd(1),
+            fd: FdNumber::new(3),
+        };
+        let mut core = EpollCore::try_new(id(1), 1).unwrap();
+        let token = core
+            .add(interest(key, InterestMode::default(), &drops))
+            .unwrap();
+        core.notify(token, ReadyMask::IN).unwrap();
+        let preparation = core.prepare_delivery().unwrap().unwrap();
+        core.next_delivery = u64::MAX;
+
+        let error = core
+            .commit_delivery(preparation, OwnedPayload(17))
+            .unwrap_err();
+        assert_eq!(error.error, EpollError::GenerationExhausted);
+        assert_eq!(error.user_data, OwnedPayload(17));
+        assert_eq!(core.ready.len, 1);
+        assert!(core.entry(token).unwrap().queued);
+    }
+
+    #[test]
     fn unexpected_queue_overflow_requests_only_an_explicit_bounded_rescan() {
         let drops = Arc::new(AtomicUsize::new(0));
         let key = EpollKey {
@@ -994,8 +1222,9 @@ mod tests {
         );
         assert!(core.needs_rescan());
         assert_eq!(core.begin_delivery(), Err(EpollError::RescanRequired));
+        let rescan = core.rescan_token().unwrap();
         assert_eq!(
-            core.rescan_ready(0).unwrap(),
+            core.rescan_ready(rescan, 0).unwrap(),
             RescanProgress {
                 scanned: 0,
                 enqueued: 0,
@@ -1003,7 +1232,7 @@ mod tests {
             }
         );
         assert_eq!(
-            core.rescan_ready(1).unwrap(),
+            core.rescan_ready(rescan, 1).unwrap(),
             RescanProgress {
                 scanned: 1,
                 enqueued: 1,
@@ -1013,6 +1242,186 @@ mod tests {
         assert_eq!(
             core.begin_delivery().unwrap().unwrap().events,
             ReadyMask::IN
+        );
+    }
+
+    #[test]
+    fn bounded_rescan_persists_progress_until_every_slot_is_examined() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = EpollCore::try_new(id(1), 3).unwrap();
+        let tokens = [
+            core.add(interest(
+                EpollKey {
+                    ofd: ofd(1),
+                    fd: FdNumber::new(3),
+                },
+                InterestMode::default(),
+                &drops,
+            ))
+            .unwrap(),
+            core.add(interest(
+                EpollKey {
+                    ofd: ofd(2),
+                    fd: FdNumber::new(4),
+                },
+                InterestMode::default(),
+                &drops,
+            ))
+            .unwrap(),
+            core.add(interest(
+                EpollKey {
+                    ofd: ofd(3),
+                    fd: FdNumber::new(5),
+                },
+                InterestMode::default(),
+                &drops,
+            ))
+            .unwrap(),
+        ];
+        let stale = EpollToken {
+            epoll: id(99),
+            slot: 0,
+            generation: 1,
+        };
+        for _ in 0..3 {
+            core.ready.push(stale).unwrap();
+        }
+        for token in tokens {
+            assert_eq!(
+                core.notify(token, ReadyMask::IN),
+                Err(EpollError::ReadyQueueFull)
+            );
+        }
+        assert_eq!(core.prepare_delivery(), Err(EpollError::RescanRequired));
+        let rescan = core.rescan_token().unwrap();
+
+        assert_eq!(
+            core.rescan_ready(rescan, 1).unwrap(),
+            RescanProgress {
+                scanned: 1,
+                enqueued: 1,
+                complete: false,
+            }
+        );
+        assert_eq!(
+            core.rescan_ready(rescan, 1).unwrap(),
+            RescanProgress {
+                scanned: 1,
+                enqueued: 1,
+                complete: false,
+            }
+        );
+        assert_eq!(
+            core.rescan_ready(rescan, 1).unwrap(),
+            RescanProgress {
+                scanned: 1,
+                enqueued: 1,
+                complete: true,
+            }
+        );
+        assert!(!core.needs_rescan());
+        assert_eq!(core.ready.len, 3);
+    }
+
+    #[test]
+    fn rescan_zero_budget_does_not_advance_and_queue_full_retries_same_slot() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let key = EpollKey {
+            ofd: ofd(1),
+            fd: FdNumber::new(3),
+        };
+        let mut core = EpollCore::try_new(id(1), 1).unwrap();
+        let token = core
+            .add(interest(key, InterestMode::default(), &drops))
+            .unwrap();
+        let stale = EpollToken {
+            epoll: id(99),
+            slot: 0,
+            generation: 1,
+        };
+        core.ready.push(stale).unwrap();
+        assert_eq!(
+            core.notify(token, ReadyMask::IN),
+            Err(EpollError::ReadyQueueFull)
+        );
+        let rescan = core.rescan_token().unwrap();
+
+        assert_eq!(
+            core.rescan_ready(rescan, 0).unwrap(),
+            RescanProgress {
+                scanned: 0,
+                enqueued: 0,
+                complete: false,
+            }
+        );
+        assert_eq!(
+            core.rescan_ready(rescan, 1),
+            Err(EpollError::ReadyQueueFull)
+        );
+        assert_eq!(core.prepare_delivery(), Err(EpollError::RescanRequired));
+        assert_eq!(
+            core.rescan_ready(rescan, 1).unwrap(),
+            RescanProgress {
+                scanned: 1,
+                enqueued: 1,
+                complete: true,
+            }
+        );
+    }
+
+    #[test]
+    fn new_overflow_restarts_rescan_and_stales_the_old_token() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut core = EpollCore::try_new(id(1), 2).unwrap();
+        let first = core
+            .add(interest(
+                EpollKey {
+                    ofd: ofd(1),
+                    fd: FdNumber::new(3),
+                },
+                InterestMode::default(),
+                &drops,
+            ))
+            .unwrap();
+        let second = core
+            .add(interest(
+                EpollKey {
+                    ofd: ofd(2),
+                    fd: FdNumber::new(4),
+                },
+                InterestMode::default(),
+                &drops,
+            ))
+            .unwrap();
+        let stale = EpollToken {
+            epoll: id(99),
+            slot: 0,
+            generation: 1,
+        };
+        core.ready.push(stale).unwrap();
+        core.ready.push(stale).unwrap();
+
+        assert_eq!(
+            core.notify(first, ReadyMask::IN),
+            Err(EpollError::ReadyQueueFull)
+        );
+        let old = core.rescan_token().unwrap();
+        assert_eq!(
+            core.notify(second, ReadyMask::IN),
+            Err(EpollError::ReadyQueueFull)
+        );
+        let current = core.rescan_token().unwrap();
+        assert_ne!(old, current);
+        assert_eq!(core.rescan_ready(old, 1), Err(EpollError::StaleToken));
+
+        assert_eq!(core.prepare_delivery(), Err(EpollError::RescanRequired));
+        assert_eq!(
+            core.rescan_ready(current, 2).unwrap(),
+            RescanProgress {
+                scanned: 2,
+                enqueued: 2,
+                complete: true,
+            }
         );
     }
 

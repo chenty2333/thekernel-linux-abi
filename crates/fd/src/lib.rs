@@ -35,8 +35,9 @@ pub use types::{
 
 #[cfg(feature = "alloc")]
 pub use epoll::{
-    DeliveryOutcome, DeliveryToken, EpollCore, EpollError, EpollInterest, EpollKey,
-    EpollPublishError, EpollToken, NotifyOutcome, ReadyEvent, RescanProgress,
+    DeliveryCommitError, DeliveryOutcome, DeliveryPreparation, DeliveryToken, EpollCore,
+    EpollError, EpollInterest, EpollKey, EpollPublishError, EpollToken, NotifyOutcome, ReadyEvent,
+    RescanProgress, RescanToken,
 };
 #[cfg(feature = "alloc")]
 pub use graph::{EpollGraph, EpollGraphLimits, GraphEdgeToken, GraphError, GraphNodeToken};

@@ -24,6 +24,12 @@
 - Carry delivered readiness in the opaque delivery token so a userspace
   copyout fault can restore the exact event plus concurrent wakeups.
 - Keep a ready item queued when delivery generation allocation fails.
+- Replace arbitrary in-lock user-data cloning with delivery
+  prepare/lock-external-payload/commit; stale commits and serial exhaustion
+  return the never-published payload to the adapter.
+- Persist bounded rescan cursor and remaining-work state across calls, tag
+  recovery generations, retry a queue-full slot without consuming it, and
+  restart recovery when a new overflow invalidates the old scan.
 - Add generation-tagged finite graph storage, unique reverse-parent accounting,
   cycle/depth checks, and a bounded graph-walk budget.
 - Reject `EPOLLEXCLUSIVE` until cross-instance source selection exists.

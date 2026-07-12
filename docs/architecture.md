@@ -60,3 +60,11 @@ check-arm-check around source installation. Timeout, signal interruption,
 close, `DEL`, `MOD`, copyout failure, and partial arm failure all terminate in
 an explicit cancel, replay, or rollback path; no periodic scan or hidden
 busy-poll fallback is part of the contract.
+
+Epoll delivery selects a generation-tagged candidate while the core lock is
+held, prepares owned or fallible output after releasing that lock, and commits
+only after revalidation. The core does not call arbitrary `Clone`, allocation,
+callback, or destruction code. Defensive ready recovery is likewise explicit:
+generation-tagged rescan tokens carry persistent bounded progress, a full
+queue leaves the current slot retryable, and a newer overflow invalidates an
+older recovery worker.

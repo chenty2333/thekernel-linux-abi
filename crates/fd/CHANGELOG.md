@@ -10,6 +10,11 @@
   registration with exact cancellation rollback.
 - Add bounded epoll LT/ET/ONESHOT delivery, copyout-fault replay, concurrent
   wake coalescing, explicit rescan recovery, and stale-token rejection.
+- Keep arbitrary payload preparation outside IRQ-safe epoll locks with a
+  generation-checked delivery prepare/commit transaction that returns
+  unpublished ownership on every failure.
+- Make defensive epoll recovery incremental and convergent with persistent,
+  generation-tagged rescan state and an explicit per-call work budget.
 - Add bounded epoll graph cycle, nesting, reverse-parent, capacity, and walk
   validation.
 - Reject unsupported exclusive wake selection honestly.

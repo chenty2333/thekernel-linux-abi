@@ -16,7 +16,8 @@ Version 0.1.0 provides:
 - finite per-owner watch accounting and two-phase aggregate source arming;
 - retained registration update/cancel ownership with partial-arm rollback;
 - a fixed-capacity epoll interest/ready core with LT, ET, ONESHOT, coalescing,
-  copyout-fault replay, post-copy recheck, and stale-generation rejection;
+  lock-external payload preparation, copyout-fault replay, post-copy recheck,
+  and stale-generation rejection;
 - finite epoll graph, reverse-parent, nesting, cycle, and walk-budget checks;
   and
 - an explicit bounded-rescan seam for an unexpected ready-queue invariant
@@ -37,6 +38,15 @@ and file destruction occur outside short IRQ-safe locks. `EpollGraph` and
 `EpollCore` publication must be one adapter transaction; if the second
 publication fails, the first is rolled back before releasing the graph lock.
 
+Delivery is also an explicit prepare/commit transaction. The IRQ-safe core
+selects only a generation-tagged `DeliveryPreparation`; the adapter releases
+its core lock, prepares any owned or fallible event payload, and then commits.
+Commit revalidates both the interest generation and queue position. A racing
+`DEL`, `MOD`, or delivery returns the unpublished payload unchanged, while
+serial exhaustion leaves the ready item queued. The convenience
+`begin_delivery()` path is intentionally limited to `Copy` user data, so the
+core never invokes an arbitrary clone, allocator, callback, or destructor.
+
 `EPOLLEXCLUSIVE` is rejected in 0.1.0. A single-instance core cannot honestly
 implement cross-epoll exclusive selection; it will only be admitted after the
 source layer supplies that mechanism. io_uring is likewise not claimed, though
@@ -53,9 +63,12 @@ serial exhaustion leaves the ready item queued.
 
 Normal ready publication admits one queue item per interest at construction.
 If that invariant is nevertheless violated, the event remains in entry state,
-`needs_rescan()` becomes true, and the adapter must call `rescan_ready()` with
-an explicit work budget. The crate never falls back to an unbounded scan or
-busy loop.
+`needs_rescan()` becomes true, and the adapter obtains a generation-tagged
+`RescanToken` before calling `rescan_ready()` with an explicit work budget.
+Cursor and remaining-work state persist across calls; a full queue does not
+consume the blocked slot, and a later overflow starts a new generation so old
+recovery workers fail stale. The crate never falls back to an unbounded scan
+or busy loop.
 
 ## Stability
 
