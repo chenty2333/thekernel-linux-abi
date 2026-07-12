@@ -5,6 +5,11 @@ caller-supplied userspace memory implementation. It is `no_std`, contains no
 current-task or address-space global, and never dereferences a userspace
 pointer itself.
 
+Typed helpers accept unaligned userspace addresses, matching Linux byte-copy
+semantics. Rust alignment applies only to kernel-owned typed storage; address
+overflow and provider faults remain explicit errors, and a failed provider
+read never exposes partially initialized typed values.
+
 The Rust library name is `thekernel_linux_usercopy`. An existing consumer may
 temporarily preserve `use starry_vm::...` with a Cargo dependency alias:
 

@@ -48,9 +48,6 @@ impl<M: UserMemory + ?Sized> UserMemoryContext<'_, M> {
             return Err(UserCopyError::BadAddress);
         }
         let start = ptr as usize;
-        if start % core::mem::align_of::<T>() != 0 {
-            return Err(UserCopyError::BadAddress);
-        }
         let max_elements = MAX_NUL_SEARCH_BYTES / size;
         if max_elements == 0 {
             return Err(UserCopyError::TooLong);

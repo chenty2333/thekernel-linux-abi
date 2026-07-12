@@ -21,6 +21,9 @@ archive identified in `VENDOR.md`.
 - Use a crate-owned error type so errno mapping remains kernel adapter policy.
 - Require `bytemuck::NoUninit` for safe typed writes; retain an unsafe typed
   write for adapters that can prove padding initialization.
+- Treat typed userspace pointers as byte addresses rather than imposing Rust
+  alignment on Linux ABI inputs; retain checked range overflow and the
+  provider's all-or-error initialization contract.
 - Keep owned allocation behind an additive `alloc` feature with no default
   features.
 - Add an explicitly unsafe bounded NUL loader for raw pointer arrays whose

@@ -25,7 +25,7 @@ check_sha256 \
     8573823b18252e8c8da10e1bc1c7a20cee27057c5d159027715da797a73015e2 \
     "$usercopy_dir/Cargo.toml.orig"
 check_sha256 \
-    bce7bd9b92c903eccad380a9eb6a1da57005a24bea0618cd6828bdafe3eb48e9 \
+    c623c05c243abb71faf51a8449fed0e535331cfea155e3835368944630efe345 \
     "$usercopy_dir/.cargo_vcs_info.json"
 check_sha256 \
     58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd \

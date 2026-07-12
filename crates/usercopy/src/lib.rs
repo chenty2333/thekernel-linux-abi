@@ -18,7 +18,7 @@ use bytemuck::NoUninit;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
 pub enum UserCopyError {
-    /// The address is invalid, misaligned, outside userspace, or overflows.
+    /// The address is invalid, outside userspace, or overflows.
     BadAddress,
     /// The requested access is not permitted by the selected address space.
     AccessDenied,
@@ -118,12 +118,16 @@ impl<'a, M: UserMemory + ?Sized> UserMemoryContext<'a, M> {
     }
 
     /// Reads a typed slice without assuming that its bit patterns are valid.
+    ///
+    /// The userspace address need not satisfy `T`'s Rust alignment. Linux
+    /// usercopy treats it as a byte address; only the kernel-owned destination
+    /// is dereferenced as `T` after the provider initialized every byte.
     pub fn read_slice<T>(&mut self, ptr: *const T, dst: &mut [MaybeUninit<T>]) -> VmResult {
         let byte_len = core::mem::size_of_val(dst);
         if byte_len == 0 {
             return Ok(());
         }
-        let start = checked_aligned_address(ptr)?;
+        let start = ptr as usize;
         // SAFETY: `MaybeUninit<T>` may hold any byte pattern. The byte slice
         // covers exactly the same initialized-or-uninitialized storage.
         let bytes = unsafe {
@@ -151,7 +155,10 @@ impl<'a, M: UserMemory + ?Sized> UserMemoryContext<'a, M> {
         if byte_len == 0 {
             return Ok(());
         }
-        let start = checked_aligned_address(ptr.cast_const())?;
+        // The pointer is an opaque Linux userspace byte address. The source
+        // slice is kernel-owned and aligned; this function never dereferences
+        // `ptr` as `T`.
+        let start = ptr as usize;
         // SAFETY: the caller guarantees that all bytes, including padding,
         // are initialized; the resulting slice has the exact object extent.
         let bytes = unsafe { slice::from_raw_parts(src.as_ptr().cast::<u8>(), byte_len) };
@@ -161,14 +168,6 @@ impl<'a, M: UserMemory + ?Sized> UserMemoryContext<'a, M> {
 
 fn checked_end(start: usize, len: usize) -> VmResult<usize> {
     start.checked_add(len).ok_or(UserCopyError::BadAddress)
-}
-
-fn checked_aligned_address<T>(ptr: *const T) -> VmResult<usize> {
-    let address = ptr as usize;
-    if address % core::mem::align_of::<T>() != 0 {
-        return Err(UserCopyError::BadAddress);
-    }
-    Ok(address)
 }
 
 /// Reads a typed slice using an explicit operation context.
@@ -222,17 +221,5 @@ mod tests {
     fn checked_range_rejects_overflow_but_allows_empty_top_address() {
         assert_eq!(checked_end(usize::MAX, 1), Err(UserCopyError::BadAddress));
         assert_eq!(checked_end(usize::MAX, 0), Ok(usize::MAX));
-    }
-
-    #[test]
-    fn typed_alignment_is_checked_before_provider_access() {
-        assert_eq!(
-            checked_aligned_address((0x1001usize) as *const u64),
-            Err(UserCopyError::BadAddress)
-        );
-        assert_eq!(
-            checked_aligned_address((0x1008usize) as *const u64),
-            Ok(0x1008)
-        );
     }
 }

@@ -102,6 +102,20 @@ fn typed_slice_and_pointer_round_trip_use_one_explicit_context() {
 }
 
 #[test]
+fn typed_usercopy_accepts_linux_unaligned_user_addresses() {
+    let mut provider = TestMemory::new(0x8000);
+    let mut memory = UserMemoryContext::new(&mut provider);
+    let value = Pair {
+        first: 0x1122_3344_5566_7788,
+        second: 0x99aa_bbcc_ddee_ff00,
+    };
+    let ptr = 0x2001usize as *mut Pair;
+
+    ptr.vm_write(&mut memory, value).unwrap();
+    assert_eq!(ptr.vm_read(&mut memory), Ok(value));
+}
+
+#[test]
 fn independent_contexts_never_share_an_implicit_provider() {
     let mut first = TestMemory::new(0x4000);
     let mut second = TestMemory::new(0x4000);
@@ -136,10 +150,6 @@ fn provider_errors_and_address_checks_remain_distinct() {
     assert_eq!(
         memory.write_bytes(0x100, &[1]),
         Err(UserCopyError::AccessDenied)
-    );
-    assert_eq!(
-        memory.read_slice(0x1001usize as *const u64, &mut [MaybeUninit::uninit()]),
-        Err(UserCopyError::BadAddress)
     );
     assert_eq!(
         memory.read_bytes(usize::MAX, &mut [MaybeUninit::uninit(); 2]),
@@ -185,7 +195,7 @@ fn nul_load_stops_at_zero_and_enforces_the_byte_bound() {
 
 #[test]
 fn unsafe_nul_loader_supports_raw_pointer_arrays_without_pointer_pod() {
-    let base = 0x2000usize;
+    let base = 0x2001usize;
     let mut provider = TestMemory::new(0x8000);
     let raw = [0x4000usize, 0x5000usize, 0usize];
     provider.bytes[base..base + core::mem::size_of_val(&raw)]

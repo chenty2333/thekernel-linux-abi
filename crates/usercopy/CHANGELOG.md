@@ -10,3 +10,5 @@
 - Preserve checked address arithmetic, a 128 KiB NUL-search bound, and
   fallible owned allocation.
 - Separate usercopy errors from TheKernel's errno adapter.
+- Accept Linux-compatible unaligned typed userspace addresses without
+  weakening checked range overflow or partial-fault initialization rules.

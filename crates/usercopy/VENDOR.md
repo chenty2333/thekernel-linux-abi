@@ -11,8 +11,12 @@
 - Authors: 朝倉水希 `<asakuramizu111@gmail.com>` and Mivik
   `<mivikq@gmail.com>`
 - License: Apache-2.0
-- Original manifest: `Cargo.toml.orig`
-- Original Cargo source record: `.cargo_vcs_info.json`
+- Original manifest: `Cargo.toml.orig`, SHA-256
+  `8573823b18252e8c8da10e1bc1c7a20cee27057c5d159027715da797a73015e2`
+- Original Cargo source record: `.cargo_vcs_info.json`, SHA-256
+  `c623c05c243abb71faf51a8449fed0e535331cfea155e3835368944630efe345`
+- Original license file: `LICENSE`, SHA-256
+  `58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd`
 
 The archive checksum is the immutable comparison baseline. The package rename
 does not rewrite upstream identity or attribute TheKernel changes to StarryOS.
