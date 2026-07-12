@@ -153,7 +153,7 @@ pub struct Process<Z> {
     reaped: AtomicBool,
     tg: SpinNoIrq<ThreadGroup>,
     exit_signal: Option<u8>,
-    zombie_payload: SpinNoIrq<Option<Z>>,
+    zombie_payload: SpinNoIrq<Option<Arc<Z>>>,
     child_subreaper: AtomicBool,
     parent: SpinNoIrq<Weak<Process<Z>>>,
     group: SpinNoIrq<Arc<ProcessGroup<Z>>>,
@@ -805,7 +805,7 @@ impl<Z> ProcessDomain<Z> {
     pub fn exit(
         &self,
         process: &Arc<Process<Z>>,
-        payload: Z,
+        payload: Arc<Z>,
         mut inherited_zombie: impl FnMut(Arc<Process<Z>>),
     ) -> Result<ExitOutcome, ProcessError> {
         self.registry.ensure_published(process)?;
@@ -990,16 +990,14 @@ impl<Z> Process<Z> {
         self.exit_signal
     }
 
-    /// Copies the caller-defined zombie payload, if it has been published.
+    /// Retains the caller-defined zombie payload, if it has been published.
     ///
-    /// Requiring `Copy` keeps arbitrary clone or allocation code out of the
-    /// non-sleeping payload lock. Callers needing a larger object may choose a
-    /// small copyable handle as `Z` and own the object in their adapter layer.
-    pub fn zombie_payload(&self) -> Option<Z>
-    where
-        Z: Copy,
-    {
-        *self.zombie_payload.lock()
+    /// The exit path receives an already allocated [`Arc`], so publication is
+    /// fixed-cost and cannot fail while lifecycle locks are held. Retention
+    /// performs only an atomic reference-count increment under the payload
+    /// lock; payload destruction always happens after that guard is released.
+    pub fn zombie_payload(&self) -> Option<Arc<Z>> {
+        self.zombie_payload.lock().as_ref().map(Arc::clone)
     }
 
     /// Returns whether this process acts as a child subreaper.

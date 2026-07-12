@@ -58,14 +58,14 @@ fn typed_zombie_payload_is_once_only_and_survives_runtime_exit() {
     let domain = domain();
     let init = init(&domain);
     let child = child(&domain, &init, 2);
-    let payload = Zombie {
+    let payload = Arc::new(Zombie {
         wait_status: 9,
         uid: 1000,
         user_ns_cookie: 0xabc,
-    };
+    });
 
     assert_eq!(
-        domain.exit(&child, payload, drop),
+        domain.exit(&child, payload.clone(), drop),
         Ok(ExitOutcome::BecameZombie)
     );
     assert_eq!(
@@ -76,7 +76,8 @@ fn typed_zombie_payload_is_once_only_and_survives_runtime_exit() {
         domain.prepare_fork(&child, 3, None).err(),
         Some(ProcessError::NotLive)
     );
-    assert_eq!(child.zombie_payload(), Some(payload));
+    let retained = child.zombie_payload().unwrap();
+    assert!(Arc::ptr_eq(&retained, &payload));
     assert!(domain.reap(&child).unwrap());
     assert!(!domain.reap(&child).unwrap());
 }

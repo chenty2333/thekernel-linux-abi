@@ -10,7 +10,8 @@ crate-local change and provenance ledger.
 - Release `thekernel-linux-usercopy` 0.1.0 with explicit-context, bounded,
   Linux-compatible unaligned usercopy.
 - Release `thekernel-linux-process` 0.1.0 with explicit domain/registry
-  ownership, mandatory generic zombie snapshots, unique job-control identities,
+  ownership, mandatory `Arc`-retained generic zombie snapshots, unique
+  job-control identities,
   checked non-wrapping accounting, and SMP concurrency gates.
 - Release `thekernel-linux-signal` 0.1.0 as a nightly package with
   explicit-context usercopy, bounded pending queues, exact shared-account
