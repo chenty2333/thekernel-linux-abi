@@ -25,5 +25,9 @@
   targets instead of running usercopy/allocation under an IRQ-off spin guard.
 - Move immutable thread-registry snapshots to the sleepable kernel mutex and
   release registration `Arc` ownership only after IRQ-safe guards are gone.
+- Add typed prepare/publish/deferred process and thread send transactions so a
+  kernel can linearize final credential/LSM authorization with queue
+  publication without taking a sleepable registry lock, allocating, waking,
+  or destroying ownership under its outer security spin guard.
 - Test real SMP publication, queue accounting, frame placement, and restore
   behavior on the pinned nightly toolchain.

@@ -69,9 +69,18 @@ The immutable thread-registry pointer also uses that sleepable kernel mutex:
 strong snapshot acquisition never clones an `Arc` with interrupts disabled.
 Registration rollback and endpoint destruction first move any retained
 registry owner out of their short IRQ-safe slot, then release it after the
-guard is gone. Process-directed routing is therefore a sleepable task-context
-operation in 0.1.0; an interrupt-context sender must defer routing through its
-kernel adapter rather than smuggling allocation or destruction into a spin
-critical section.
+guard is gone.
+
+Credential/LSM-aware kernels use an explicit two-stage send. Process routing
+first calls `try_prepare_signal_send()` in sleepable context; this builds a
+bounded retained endpoint cohort. Thread-directed sends similarly retain one
+endpoint with `prepare_signal_send()`. The prepared token's `publish()` method
+then performs only lifecycle/disposition/pending fixed mutations and returns a
+`DeferredSignalPublication`. After releasing the outer credential/security
+spin guard, the kernel calls `finish()` to release coalesced queue ownership
+and endpoint `Arc`s before applying the returned wake decision. Cancellation
+is rechecked during publication, and a disappearing process wake candidate
+cannot lose the process-pending record. An interrupt-context sender must still
+defer the sleepable preparation half through its kernel adapter.
 
 See `VENDOR.md` and `PATCHES.md` for source identity and semantic changes.

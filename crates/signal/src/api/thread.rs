@@ -16,9 +16,10 @@ use kspin::SpinNoIrq as DeliveryMutex;
 
 use super::{ProcessSignalManager, RegisteredThread};
 use crate::{
-    DefaultSignalAction, DequeuedSignal, DetachedSignal, PendingSignals, PreparedSignal,
-    SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction, SignalSet,
-    SignalStack, SignalStackRestoreError, Signo,
+    DefaultSignalAction, DeferredSignalPublication, DequeuedSignal, DetachedSignal, PendingSignals,
+    PreparedSignal, PreparedSignalPublicationOutcome, SignalAction, SignalActionFlags,
+    SignalDisposition, SignalInfo, SignalOSAction, SignalSet, SignalStack, SignalStackRestoreError,
+    Signo,
     arch::{SignalContextError, UContext},
 };
 
@@ -27,6 +28,94 @@ use crate::{
 pub struct ThreadSignalSendOutcome {
     pub published: bool,
     pub wake: bool,
+}
+
+/// Retained thread endpoint prepared before a wider security spin
+/// transaction.
+///
+/// The token binds one signal number and one strong endpoint reference. Its
+/// publication half rechecks cancellation and disposition state without
+/// allocating or releasing endpoint ownership.
+#[must_use = "publish the prepared endpoint or discard it outside spin locks"]
+pub struct PreparedThreadSignalSend {
+    thread: Arc<ThreadSignalManager>,
+    signo: Signo,
+}
+
+/// Fixed thread-signal mutation plus ownership deferred beyond an outer
+/// security spin transaction.
+pub type DeferredThreadSignalPublication = DeferredSignalPublication<
+    PreparedSignalPublicationOutcome<ThreadSignalSendOutcome>,
+    PreparedThreadSignalSend,
+>;
+
+impl PreparedThreadSignalSend {
+    /// Returns the signal number bound to this transaction.
+    pub const fn signo(&self) -> Signo {
+        self.signo
+    }
+
+    /// Publishes an already allocated record under the endpoint lifecycle
+    /// lock and returns all destructible ownership in a deferred value.
+    pub fn publish(self, prepared: PreparedSignal) -> DeferredThreadSignalPublication {
+        if self.signo != prepared.signo() {
+            return DeferredSignalPublication::new(
+                PreparedSignalPublicationOutcome::SignoMismatch,
+                self,
+                Some(prepared),
+            );
+        }
+
+        let thread = &self.thread;
+        let lifecycle = thread.lifecycle.lock();
+        if !thread.accepting_signals.load(Ordering::Acquire) {
+            drop(lifecycle);
+            return DeferredSignalPublication::new(
+                PreparedSignalPublicationOutcome::Applied(ThreadSignalSendOutcome {
+                    published: false,
+                    wake: false,
+                }),
+                self,
+                Some(prepared),
+            );
+        }
+
+        let blocked = thread.signal_blocked(self.signo);
+        let outcome = {
+            let actions = thread.proc.actions.lock();
+            let ignored = ProcessSignalManager::action_ignored(&actions, self.signo);
+            if ignored && !blocked && !thread.signal_real_blocked(self.signo) {
+                Err(prepared)
+            } else {
+                let mut pending = thread.pending.lock();
+                Ok(pending.publish(prepared))
+            }
+        };
+        let (published, unused) = match outcome {
+            Ok(outcome) => outcome.into_parts(),
+            Err(prepared) => {
+                drop(lifecycle);
+                return DeferredSignalPublication::new(
+                    PreparedSignalPublicationOutcome::Applied(ThreadSignalSendOutcome {
+                        published: false,
+                        wake: false,
+                    }),
+                    self,
+                    Some(prepared),
+                );
+            }
+        };
+        thread.possibly_has_signal.store(true, Ordering::Release);
+        drop(lifecycle);
+        DeferredSignalPublication::new(
+            PreparedSignalPublicationOutcome::Applied(ThreadSignalSendOutcome {
+                published,
+                wake: !blocked,
+            }),
+            self,
+            unused,
+        )
+    }
 }
 
 /// Why a thread endpoint could not be registered with its process manager.
@@ -609,6 +698,15 @@ impl ThreadSignalManager {
             *stack = restored;
         }
         self.possibly_has_signal.store(true, Ordering::Release);
+    }
+
+    /// Retains this endpoint and binds a signal number before the caller
+    /// enters a wider security spin transaction.
+    pub fn prepare_signal_send(self: &Arc<Self>, signo: Signo) -> PreparedThreadSignalSend {
+        PreparedThreadSignalSend {
+            thread: Arc::clone(self),
+            signo,
+        }
     }
 
     /// Sends a signal, preparing any queue record outside spin locks.

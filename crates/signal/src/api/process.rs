@@ -16,9 +16,9 @@ use axsync::Mutex;
 use kspin::SpinNoIrq as Mutex;
 
 use crate::{
-    DefaultSignalAction, DequeuedSignal, DetachedSignal, PendingSignals, PreparedSignal,
-    SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalSet, Signo,
-    api::ThreadSignalManager,
+    DefaultSignalAction, DeferredSignalPublication, DequeuedSignal, DetachedSignal, PendingSignals,
+    PreparedSignal, PreparedSignalPublicationOutcome, SignalAction, SignalActionFlags,
+    SignalDisposition, SignalInfo, SignalSet, Signo, api::ThreadSignalManager,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -203,6 +203,127 @@ pub(crate) type ThreadRegistry = Vec<Arc<RegisteredThread>>;
 pub struct ProcessSignalSendOutcome {
     pub published: bool,
     pub wake_tid: Option<u32>,
+}
+
+struct PreparedRouteEntry {
+    tid: u32,
+    thread: Arc<ThreadSignalManager>,
+}
+
+/// Bounded process-directed routing state prepared before a wider security
+/// spin transaction.
+///
+/// Construction may take the process registry's sleepable mutex, allocate a
+/// finite vector, clone endpoint ownership, and destroy an old registry
+/// snapshot. [`publish`](Self::publish) only borrows these retained endpoints
+/// and mutates IRQ-safe signal state. The resulting deferred value retains
+/// this token until the caller explicitly finishes outside its outer lock.
+#[must_use = "publish the prepared route or discard it outside spin locks"]
+pub struct PreparedProcessSignalSend {
+    process: Arc<ProcessSignalManager>,
+    signo: Signo,
+    endpoints: Vec<PreparedRouteEntry>,
+}
+
+/// Fixed process-signal mutation plus ownership deferred beyond an outer
+/// security spin transaction.
+pub type DeferredProcessSignalPublication = DeferredSignalPublication<
+    PreparedSignalPublicationOutcome<ProcessSignalSendOutcome>,
+    PreparedProcessSignalSend,
+>;
+
+impl PreparedProcessSignalSend {
+    /// Returns the signal number bound to this transaction.
+    pub const fn signo(&self) -> Signo {
+        self.signo
+    }
+
+    fn blocked_by_any_thread(&self) -> bool {
+        self.endpoints.iter().any(|entry| {
+            entry.thread.is_registered()
+                && (entry.thread.signal_blocked(self.signo)
+                    || entry.thread.signal_real_blocked(self.signo))
+        })
+    }
+
+    fn wake_thread(&self) -> Option<u32> {
+        self.endpoints.iter().find_map(|entry| {
+            (entry.thread.is_registered() && !entry.thread.signal_blocked(self.signo))
+                .then_some(entry.tid)
+        })
+    }
+
+    /// Publishes an already allocated record using only fixed IRQ-safe state
+    /// mutations.
+    ///
+    /// Cancellation is rechecked against every retained endpoint. Endpoints
+    /// registered after preparation belong to a later routing generation; a
+    /// process-directed record remains pending if the retained wake candidate
+    /// disappears, so teardown cannot lose the signal.
+    pub fn publish(self, prepared: PreparedSignal) -> DeferredProcessSignalPublication {
+        if self.signo != prepared.signo() {
+            return DeferredSignalPublication::new(
+                PreparedSignalPublicationOutcome::SignoMismatch,
+                self,
+                Some(prepared),
+            );
+        }
+
+        let process = &self.process;
+        let blocked_by_any_thread = self.blocked_by_any_thread();
+        if process.signal_ignored(self.signo) && !blocked_by_any_thread {
+            return DeferredSignalPublication::new(
+                PreparedSignalPublicationOutcome::Applied(ProcessSignalSendOutcome {
+                    published: false,
+                    wake_tid: None,
+                }),
+                self,
+                Some(prepared),
+            );
+        }
+
+        let already_pending =
+            !self.signo.is_realtime() && process.pending.lock().set.has(self.signo);
+        let (published, unused) = if already_pending {
+            (false, Some(prepared))
+        } else {
+            let outcome = {
+                let actions = process.actions.lock();
+                if ProcessSignalManager::action_ignored(&actions, self.signo)
+                    && !blocked_by_any_thread
+                {
+                    Err(prepared)
+                } else {
+                    let mut pending = process.pending.lock();
+                    Ok(pending.publish(prepared))
+                }
+            };
+            match outcome {
+                Ok(outcome) => outcome.into_parts(),
+                Err(prepared) => {
+                    return DeferredSignalPublication::new(
+                        PreparedSignalPublicationOutcome::Applied(ProcessSignalSendOutcome {
+                            published: false,
+                            wake_tid: None,
+                        }),
+                        self,
+                        Some(prepared),
+                    );
+                }
+            }
+        };
+
+        process.possibly_has_signal.store(true, Ordering::Release);
+        let wake_tid = self.wake_thread();
+        DeferredSignalPublication::new(
+            PreparedSignalPublicationOutcome::Applied(ProcessSignalSendOutcome {
+                published,
+                wake_tid,
+            }),
+            self,
+            unused,
+        )
+    }
 }
 
 /// Why a process signal disposition could not be replaced atomically.
@@ -438,6 +559,36 @@ impl ProcessSignalManager {
         });
         drop(registry);
         result
+    }
+
+    /// Prepares a bounded process-directed send in sleepable context.
+    ///
+    /// This is the fallible half of the authorization/publication protocol.
+    /// The returned token owns every endpoint reference and the process
+    /// manager reference that must survive the fixed publication half.
+    pub fn try_prepare_signal_send(
+        self: &Arc<Self>,
+        signo: Signo,
+    ) -> Result<PreparedProcessSignalSend, AllocError> {
+        let registry = self.children_registry_snapshot();
+        let capacity = registry.as_deref().map_or(0, Vec::len);
+        let mut endpoints = Vec::new();
+        endpoints
+            .try_reserve_exact(capacity)
+            .map_err(|_| AllocError)?;
+        if let Some(registry) = registry.as_deref() {
+            for entry in registry {
+                if let Some((tid, thread)) = entry.upgrade() {
+                    endpoints.push(PreparedRouteEntry { tid, thread });
+                }
+            }
+        }
+        drop(registry);
+        Ok(PreparedProcessSignalSend {
+            process: Arc::clone(self),
+            signo,
+            endpoints,
+        })
     }
 
     /// Sends a signal, preparing any owned queue record outside spin locks.

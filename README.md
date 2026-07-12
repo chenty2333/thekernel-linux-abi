@@ -12,8 +12,9 @@ The 0.1.0 line contains five packages:
   state with a caller-defined, reference-owned immutable zombie payload.
 - `thekernel-linux-signal` 0.1.0: bounded process/thread pending queues,
   architecture signal frames, generation-safe one-shot actions, quiescent
-  teardown, and transactional context/mask/alternate-stack restore. Every
-  userspace action/frame copy receives an explicit usercopy context.
+  teardown, two-stage authorized publication, and transactional
+  context/mask/alternate-stack restore. Every userspace action/frame copy
+  receives an explicit usercopy context.
 - `thekernel-linux-vfs` 0.1.0: immutable path contexts, strict `openat2`
   scoping, bounded pathwalk policy, Linux DAC/create rules, and
   generation-revalidated mutation transactions.

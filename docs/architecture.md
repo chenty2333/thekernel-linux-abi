@@ -46,6 +46,13 @@ registration rollback moves strong ownership out of IRQ-safe slots before
 destruction. Process registry charges use checked admission and non-wrapping
 release, so duplicate cleanup cannot manufacture effective infinity.
 
+Final credential and security-hook checks may need to linearize with signal
+queue publication under a caller-owned spin guard. Process and thread sends
+therefore split sleepable/fallible route retention from fixed state mutation.
+The fixed half returns a deferred owner containing the retained endpoints and
+any ignored/coalesced queue record; wake selection and destruction occur only
+after the caller releases its outer guard.
+
 One-shot dispositions and signal return are transactions rather than syscall
 side effects. `SA_RESETHAND` claims are generation checked, and `uc_stack`
 restore separates crate-owned structural validation from caller-owned address,

@@ -17,8 +17,9 @@ crate-local change and provenance ledger.
   explicit-context usercopy, bounded pending queues, exact shared-account
   refunds, cancellation-safe two-phase thread registration and delivery
   quiescence, generation-safe one-shot actions, transactional
-  context/mask/alternate-stack restore, sleepable registry ownership, and
-  dual-architecture gates.
+  context/mask/alternate-stack restore, sleepable route preparation, fixed
+  authorized publication, deferred ownership release, and dual-architecture
+  gates.
 - Release `thekernel-linux-vfs` 0.1.0 with immutable path contexts, strict
   resolve policy, bounded traversal, Linux DAC/create rules, and rollback-safe
   mutation publication.

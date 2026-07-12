@@ -356,6 +356,67 @@ impl PublishOutcome {
         drop(self.unused);
         self.added
     }
+
+    pub(crate) fn into_parts(self) -> (bool, Option<PreparedSignal>) {
+        (self.added, self.unused)
+    }
+}
+
+/// A fixed signal-state mutation whose retained route and unused queue record
+/// must be released after the caller leaves any wider security spin lock.
+///
+/// Prepared process routes may own a bounded vector of endpoint `Arc`s, and an
+/// ignored or coalesced record may own queue accounting and heap storage. The
+/// publication phase moves both here instead of destroying either one while
+/// an outer IRQ-safe guard is held.
+#[must_use = "finish the deferred publication after releasing outer spin locks"]
+pub struct DeferredSignalPublication<O, R> {
+    outcome: O,
+    retained: R,
+    unused: Option<PreparedSignal>,
+}
+
+impl<O, R> DeferredSignalPublication<O, R> {
+    pub(crate) const fn new(outcome: O, retained: R, unused: Option<PreparedSignal>) -> Self {
+        Self {
+            outcome,
+            retained,
+            unused,
+        }
+    }
+
+    /// Releases the retained route and any unpublished record, then returns
+    /// the wake/publication result.
+    ///
+    /// Call this only after every caller-owned security spin guard has been
+    /// dropped.
+    pub fn finish(self) -> O {
+        let Self {
+            outcome,
+            retained,
+            unused,
+        } = self;
+        drop(unused);
+        drop(retained);
+        outcome
+    }
+
+    /// Separates every owned component for an adapter that needs explicit
+    /// destruction ordering or additional deferred work.
+    pub fn into_parts(self) -> (O, R, Option<PreparedSignal>) {
+        (self.outcome, self.retained, self.unused)
+    }
+}
+
+/// Fixed publication status after a prepared route is checked against its
+/// queue record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedSignalPublicationOutcome<O> {
+    /// The signal numbers matched and `O` describes the queue/wake result.
+    Applied(O),
+    /// The record did not match the signal number bound to the prepared route.
+    /// Nothing was published and the deferred owner retains the record.
+    SignoMismatch,
 }
 
 /// Structure to record pending signals.

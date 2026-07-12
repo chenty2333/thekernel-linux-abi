@@ -55,5 +55,11 @@ This ledger records changes relative to `starry-signal 0.3.0` identified in
   detach manager-held registration `Arc`s before dropping short IRQ-safe
   guards. No registry snapshot clone or final entry destruction runs with
   interrupts disabled.
+- Split credential-aware sends into a fallible sleepable preparation token, a
+  fixed publication step, and a deferred finish. Process tokens retain a
+  bounded endpoint cohort; thread tokens retain the exact endpoint. Both
+  recheck cancellation/disposition, return coalesced queue ownership, and keep
+  every endpoint `Arc` alive until the caller has left its outer security
+  transaction.
 - Declare the package nightly-only: `Arc::try_new` preserves real OOM errors;
   allocator pre-reservation is not treated as a substitute.
