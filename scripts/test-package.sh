@@ -17,6 +17,7 @@ if [ "$#" -eq 0 ]; then
         thekernel-linux-usercopy
         thekernel-linux-process
         thekernel-linux-signal
+        thekernel-linux-vfs
     )
 else
     packages=("$@")
@@ -60,6 +61,10 @@ for package in "${packages[@]}"; do
         thekernel-linux-signal)
             version=0.1.0
             crate_path=crates/signal
+            ;;
+        thekernel-linux-vfs)
+            version=0.1.0
+            crate_path=crates/vfs
             ;;
         *)
             printf 'unknown workspace package: %s\n' "$package" >&2

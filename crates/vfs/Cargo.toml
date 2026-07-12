@@ -1,0 +1,23 @@
+[package]
+name = "thekernel-linux-vfs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Explicit-context Linux path, DAC, and transactional VFS policy for no_std kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "vfs"]
+categories = ["no-std", "os"]
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

@@ -6,6 +6,7 @@ repo_root=$(cd -- "$script_dir/.." && pwd)
 usercopy_dir="$repo_root/crates/usercopy"
 process_dir="$repo_root/crates/process"
 signal_dir="$repo_root/crates/signal"
+vfs_dir="$repo_root/crates/vfs"
 
 check_sha256() {
     local expected=$1
@@ -64,5 +65,13 @@ grep -Fq 'f72adf2bff529986c36c6b3920332afbefd0f6f6178855347f1bac15f4304d37' \
     "$signal_dir/VENDOR.md"
 grep -Fq '0a39846c582895555816145f47f82ceb0c89aa62' "$signal_dir/VENDOR.md"
 grep -Fq 'dbbaea9ff0ee6c63bdfb9d9828d4a8d25ba8d0b1' "$signal_dir/VENDOR.md"
+
+check_sha256 \
+    cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 \
+    "$vfs_dir/LICENSE"
+grep -Fq 'dbbaea9ff0ee6c63bdfb9d9828d4a8d25ba8d0b1' "$vfs_dir/VENDOR.md"
+grep -Fq '44696aa3a489d2baf58efa61b37833f100072bee' "$vfs_dir/VENDOR.md"
+grep -Fq '62e22d7cfc1ca1c25bede6aaeca370c163a9a1ef' "$vfs_dir/VENDOR.md"
+grep -Fq '5f5619c' "$vfs_dir/VENDOR.md"
 
 printf 'provenance: PASS\n'

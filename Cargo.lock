@@ -923,6 +923,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-linux-vfs"
+version = "0.1.0"
+
+[[package]]
 name = "tock-registers"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

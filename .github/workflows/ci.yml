@@ -22,6 +22,8 @@ jobs:
         run: |
           cargo +1.85.0 test -p thekernel-linux-usercopy --all-features
           cargo +1.85.0 check -p thekernel-linux-usercopy --no-default-features --lib
+          cargo +1.85.0 test -p thekernel-linux-vfs --all-features
+          cargo +1.85.0 check -p thekernel-linux-vfs --no-default-features --lib
 
   stable:
     runs-on: ubuntu-latest
