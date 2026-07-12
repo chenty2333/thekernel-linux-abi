@@ -4,6 +4,59 @@ mod common;
 use common::{child, domain, exit_and_reap, init, zombie};
 
 #[test]
+fn concurrent_owned_zombie_publication_is_fully_initialized() {
+    struct OwnedZombie {
+        words: [u64; 8],
+        namespace: Arc<str>,
+    }
+
+    for round in 0..64_u32 {
+        let domain =
+            Arc::new(thekernel_linux_process::ProcessDomain::<OwnedZombie>::try_new().unwrap());
+        let init = domain.try_new_init(1, None).unwrap();
+        let admission = domain.prepare_fork(&init, 2, None).unwrap();
+        let child = admission.process().clone();
+        admission.commit();
+        let start = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let reader_child = child.clone();
+            let reader_start = start.clone();
+            let reader = scope.spawn(move || {
+                reader_start.wait();
+                for _ in 0..100_000 {
+                    if reader_child.is_zombie() {
+                        let payload = reader_child
+                            .zombie_payload()
+                            .expect("zombie release must publish its payload");
+                        assert_eq!(payload.words, [round as u64; 8]);
+                        assert_eq!(payload.namespace.as_ref(), "owned-user-ns");
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                panic!("bounded reader did not observe zombie publication");
+            });
+
+            start.wait();
+            assert_eq!(
+                domain.exit(
+                    &child,
+                    OwnedZombie {
+                        words: [round as u64; 8],
+                        namespace: Arc::from("owned-user-ns"),
+                    },
+                    drop,
+                ),
+                Ok(thekernel_linux_process::ExitOutcome::BecameZombie)
+            );
+            reader.join().unwrap();
+        });
+        assert!(domain.reap(&child).unwrap());
+    }
+}
+
+#[test]
 fn concurrent_fork_admission_exit_and_reap_preserve_registry_counts() {
     const WORKERS: usize = 16;
     let domain = Arc::new(domain());

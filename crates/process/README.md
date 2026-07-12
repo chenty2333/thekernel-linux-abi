@@ -9,6 +9,11 @@ The generic `Z` is an opaque, caller-defined durable zombie payload. This
 crate does not define Linux wait-status encoding, UID snapshots, CPU usage, or
 errno mapping. A Linux ABI adapter can define one payload containing exactly
 the state its `wait*`, procfs, accounting, and permission paths require.
+`Z` is initialized once in inline process storage before the zombie release
+publication, borrowed without a core lock, and destroyed with the final
+process owner. It need not be `Copy` or `Clone`; namespace/security ownership
+can therefore remain in the authoritative payload without an exit-time
+allocation or a second global payload registry.
 
 ## Toolchain
 
@@ -19,12 +24,14 @@ There is no `rust-version` claim for this package. See `PATCHES.md` for the
 stable-allocation alternatives considered and rejected.
 
 ```rust
+use std::sync::Arc;
 use thekernel_linux_process::{ExitOutcome, ProcessDomain};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct LinuxZombie {
     wait_status: i32,
     uid: u32,
+    user_namespace: Arc<str>,
 }
 
 let domain = ProcessDomain::<LinuxZombie>::try_new().unwrap();
@@ -41,10 +48,15 @@ assert_eq!(
         LinuxZombie {
             wait_status: 0,
             uid: 0,
+            user_namespace: Arc::from("initial-user-ns"),
         },
         drop,
     ),
     Ok(ExitOutcome::BecameZombie),
+);
+assert_eq!(
+    child.zombie_payload().unwrap().user_namespace.as_ref(),
+    "initial-user-ns",
 );
 assert!(domain.reap(&child).unwrap());
 ```
@@ -76,6 +88,12 @@ crate itself now linearizes process/thread publication with exit. Reserved
 thread tokens count as lifecycle ownership, stale process Arcs cannot add a
 thread after zombie/reap, and an initial-thread token cannot escape a rolled
 back process admission.
+
+The exit payload is stored inline and published once. Reading it returns an
+immutable borrow tied to the retained `Process`; an adapter may explicitly
+clone an owned namespace handle after that borrow is obtained, with no process
+core lock held. Reap removes registry authority but does not invalidate a
+payload while any caller still owns the process object.
 
 Domain capacity now bounds total reserved/live thread memberships across all
 processes, not merely each process in isolation. `kspin/smp` is mandatory even

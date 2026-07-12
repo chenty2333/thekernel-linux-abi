@@ -27,6 +27,11 @@ This ledger records semantic changes relative to the immutable
   now kernel-adapter policy.
 - Make duplicate process-exit transitions idempotent without overwriting the
   first durable payload.
+- Store the opaque payload once in inline process memory and expose only an
+  immutable borrowed view after release publication. Owned namespace/security
+  state can survive runtime teardown without exit-time allocation, a `Copy`
+  handle indirection, arbitrary clone/drop under a spin lock, or a second
+  payload registry.
 - Validate a live TID before changing the stored exit code; return a typed
   `ThreadExitOutcome`, and record the first group-exit code atomically.
 - Compare-and-replace child parent pointers during exit so a racing ancestor

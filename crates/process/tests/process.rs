@@ -76,9 +76,58 @@ fn typed_zombie_payload_is_once_only_and_survives_runtime_exit() {
         domain.prepare_fork(&child, 3, None).err(),
         Some(ProcessError::NotLive)
     );
-    assert_eq!(child.zombie_payload(), Some(payload));
+    assert_eq!(child.zombie_payload(), Some(&payload));
     assert!(domain.reap(&child).unwrap());
     assert!(!domain.reap(&child).unwrap());
+}
+
+#[test]
+fn owned_zombie_payload_is_inline_borrowed_and_dropped_with_the_process() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OwnedZombie {
+        namespace: Arc<str>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<thekernel_linux_process::Process<OwnedZombie>>();
+
+    impl Drop for OwnedZombie {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let domain = ProcessDomain::<OwnedZombie>::try_new().unwrap();
+    let init = domain.try_new_init(1, None).unwrap();
+    let admission = domain.prepare_fork(&init, 2, None).unwrap();
+    let child = admission.process().clone();
+    admission.commit();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let namespace: Arc<str> = Arc::from("user-ns-7");
+
+    assert_eq!(
+        domain.exit(
+            &child,
+            OwnedZombie {
+                namespace: namespace.clone(),
+                drops: drops.clone(),
+            },
+            drop,
+        ),
+        Ok(ExitOutcome::BecameZombie)
+    );
+    assert_eq!(
+        child.zombie_payload().map(|payload| &*payload.namespace),
+        Some("user-ns-7")
+    );
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+    assert!(domain.reap(&child).unwrap());
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    drop(child);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
 
 #[test]

@@ -4,7 +4,9 @@
 
 - Replace the crate-owned process registry and init singleton with an explicit
   `ProcessDomain` and `ProcessRegistry`.
-- Make durable zombie state a caller-defined generic payload.
+- Make durable zombie state a caller-defined generic payload, published once
+  in inline process storage and borrowed without requiring `Copy`/`Clone`, an
+  exit-time allocation, or a shadow payload registry.
 - Preserve bounded, fallible process/thread admission and rollback.
 - Preserve subreaper reparenting, session/group topology, and allocation-free
   PID/TID iteration.

@@ -3,8 +3,10 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    cell::UnsafeCell,
     fmt,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    mem::MaybeUninit,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use intrusive_collections::{Bound, KeyAdapter, RBTree, RBTreeAtomicLink, intrusive_adapter};
@@ -142,6 +144,74 @@ impl ThreadGroup {
     }
 }
 
+const ZOMBIE_PAYLOAD_EMPTY: u8 = 0;
+const ZOMBIE_PAYLOAD_WRITING: u8 = 1;
+const ZOMBIE_PAYLOAD_READY: u8 = 2;
+
+/// Inline once-published payload storage.
+///
+/// The process thread-group lock serializes normal publication, while the
+/// explicit state machine prevents an embedding bug from creating two writers.
+/// Readers only receive an immutable borrow after `Process::is_zombie` has
+/// acquired the release publication which follows the payload write.
+struct ZombiePayload<Z> {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<Z>>,
+}
+
+impl<Z> ZombiePayload<Z> {
+    const fn empty() -> Self {
+        Self {
+            state: AtomicU8::new(ZOMBIE_PAYLOAD_EMPTY),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn publish(&self, payload: Z) -> Result<(), Z> {
+        if self
+            .state
+            .compare_exchange(
+                ZOMBIE_PAYLOAD_EMPTY,
+                ZOMBIE_PAYLOAD_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(payload);
+        }
+        // SAFETY: this caller won the only transition out of EMPTY. The value
+        // remains immovable inside its Process allocation until final drop.
+        unsafe { (*self.value.get()).write(payload) };
+        self.state.store(ZOMBIE_PAYLOAD_READY, Ordering::Release);
+        Ok(())
+    }
+
+    fn get(&self) -> Option<&Z> {
+        if self.state.load(Ordering::Acquire) != ZOMBIE_PAYLOAD_READY {
+            return None;
+        }
+        // SAFETY: READY is published only after the unique writer initialized
+        // the value. No path mutates or extracts it before this storage drops.
+        Some(unsafe { (*self.value.get()).assume_init_ref() })
+    }
+}
+
+// SAFETY: a unique writer initializes Z before release publication and all
+// later access is immutable. The bounds are precisely those required to share
+// the retained payload between process readers.
+unsafe impl<Z: Send + Sync> Sync for ZombiePayload<Z> {}
+
+impl<Z> Drop for ZombiePayload<Z> {
+    fn drop(&mut self) {
+        if *self.state.get_mut() == ZOMBIE_PAYLOAD_READY {
+            // SAFETY: READY means the unique writer initialized the value, and
+            // exclusive drop guarantees no reader can still borrow this cell.
+            unsafe { self.value.get_mut().assume_init_drop() };
+        }
+    }
+}
+
 /// A process whose durable zombie state is supplied by the caller as `Z`.
 pub struct Process<Z> {
     registry_link: RBTreeAtomicLink,
@@ -153,7 +223,7 @@ pub struct Process<Z> {
     reaped: AtomicBool,
     tg: SpinNoIrq<ThreadGroup>,
     exit_signal: Option<u8>,
-    zombie_payload: SpinNoIrq<Option<Z>>,
+    zombie_payload: ZombiePayload<Z>,
     child_subreaper: AtomicBool,
     parent: SpinNoIrq<Weak<Process<Z>>>,
     group: SpinNoIrq<Arc<ProcessGroup<Z>>>,
@@ -823,15 +893,15 @@ impl<Z> ProcessDomain<Z> {
         if process.is_zombie.load(Ordering::Acquire) {
             return Ok(ExitOutcome::AlreadyZombie);
         }
-        let mut payload_slot = process.zombie_payload.lock();
-        if payload_slot.is_some() {
+        if let Err(unused) = process.zombie_payload.publish(payload) {
             // Preserve the first durable exit snapshot even if an embedding
-            // bug exposed an inconsistent publication state.
+            // bug exposed an inconsistent publication state. Release the
+            // losing owned payload only after the thread-group lock is gone.
+            drop(tg);
+            drop(unused);
             return Ok(ExitOutcome::AlreadyZombie);
         }
-        *payload_slot = Some(payload);
         process.is_zombie.store(true, Ordering::Release);
-        drop(payload_slot);
         drop(tg);
 
         let reaper_weak = Arc::downgrade(&reaper);
@@ -967,7 +1037,7 @@ impl<Z> Process<Z> {
             reaped: AtomicBool::new(false),
             tg: SpinNoIrq::new(ThreadGroup::new()),
             exit_signal,
-            zombie_payload: SpinNoIrq::new(None),
+            zombie_payload: ZombiePayload::empty(),
             child_subreaper: AtomicBool::new(false),
             parent: SpinNoIrq::new(parent.map(Arc::downgrade).unwrap_or_default()),
             group: SpinNoIrq::new(group),
@@ -990,16 +1060,19 @@ impl<Z> Process<Z> {
         self.exit_signal
     }
 
-    /// Copies the caller-defined zombie payload, if it has been published.
+    /// Borrows the caller-defined immutable zombie payload, if published.
     ///
-    /// Requiring `Copy` keeps arbitrary clone or allocation code out of the
-    /// non-sleeping payload lock. Callers needing a larger object may choose a
-    /// small copyable handle as `Z` and own the object in their adapter layer.
-    pub fn zombie_payload(&self) -> Option<Z>
-    where
-        Z: Copy,
-    {
-        *self.zombie_payload.lock()
+    /// The payload is initialized inline before the zombie release
+    /// publication, never moved or mutated afterwards, and destroyed with the
+    /// final process owner. This admits owned namespace/security state without
+    /// allocation at exit, a shadow payload registry, or arbitrary cloning and
+    /// destruction under a spin lock. Callers which need an owned snapshot may
+    /// explicitly clone fields after this method returns; no core lock is held.
+    pub fn zombie_payload(&self) -> Option<&Z> {
+        if !self.is_zombie.load(Ordering::Acquire) {
+            return None;
+        }
+        self.zombie_payload.get()
     }
 
     /// Returns whether this process acts as a child subreaper.
