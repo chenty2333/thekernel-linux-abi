@@ -23,5 +23,7 @@
   typed rejection of effective infinity and capacity exhaustion.
 - Require the sleepable `multitask` synchronization feature on bare-metal
   targets instead of running usercopy/allocation under an IRQ-off spin guard.
+- Move immutable thread-registry snapshots to the sleepable kernel mutex and
+  release registration `Arc` ownership only after IRQ-safe guards are gone.
 - Test real SMP publication, queue accounting, frame placement, and restore
   behavior on the pinned nightly toolchain.

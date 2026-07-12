@@ -48,10 +48,10 @@ fn convert() {
                 m.add(Signo::SIGRT32);
                 m
             },
-            disposition: disposition.clone(),
+            disposition,
             restorer: None,
         };
-        let raw = RawSignalAction::from(action.clone());
+        let raw = RawSignalAction::from(action);
         let action2 = SignalAction::from(raw);
 
         assert_eq!(action.flags.bits(), action2.flags.bits());

@@ -207,13 +207,20 @@ impl Drop for ThreadSignalRegistration {
     fn drop(&mut self) {
         if self.rollback {
             self.entry.deactivate();
-            let mut registration = self.thread.registration.lock();
-            if registration
-                .as_ref()
-                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
-            {
-                registration.take();
-            }
+            let removed = {
+                let mut registration = self.thread.registration.lock();
+                if registration
+                    .as_ref()
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+                {
+                    registration.take()
+                } else {
+                    None
+                }
+            };
+            // The final strong reference may deallocate the registry entry.
+            // Never release it while the IRQ-off registration guard is held.
+            drop(removed);
         }
     }
 }
@@ -284,7 +291,14 @@ impl ThreadSignalManager {
         let replacement =
             Arc::try_new(replacement).map_err(|_| ThreadRegistrationError::NoMemory)?;
 
-        *self.registration.lock() = Some(entry.clone());
+        let manager_entry = entry.clone();
+        {
+            let mut registration = self.registration.lock();
+            if registration.is_some() {
+                return Err(ThreadRegistrationError::AlreadyRegistered);
+            }
+            *registration = Some(manager_entry);
+        }
 
         let previous = {
             let mut children = self.proc.children.lock();
@@ -381,8 +395,8 @@ impl ThreadSignalManager {
             SignalDisposition::Handler(handler) => {
                 let layout = Layout::new::<SignalFrame>();
                 let interrupted_sp = uctx.sp();
-                let stack = self.stack.lock().clone();
-                let mut visible_stack = stack.clone();
+                let stack = *self.stack.lock();
+                let mut visible_stack = stack;
                 visible_stack.flags = stack.flags_at(interrupted_sp);
                 let already_on_altstack = stack.contains_sp(interrupted_sp);
                 let use_altstack = action.flags.contains(SignalActionFlags::ONSTACK)
@@ -568,7 +582,7 @@ impl ThreadSignalManager {
         blocked.remove(Signo::SIGKILL);
         blocked.remove(Signo::SIGSTOP);
 
-        let current_stack = self.stack.lock().clone();
+        let current_stack = *self.stack.lock();
         let candidate = frame.ucontext.stack.prepare_restore();
         let (stack, stack_error) = match candidate {
             Ok(candidate) => match validate_stack(&current_stack, current.sp(), &candidate) {
@@ -728,7 +742,7 @@ impl ThreadSignalManager {
 
     /// Gets the signal stack.
     pub fn stack(&self) -> SignalStack {
-        self.stack.lock().clone()
+        *self.stack.lock()
     }
 
     /// Sets the signal stack.
@@ -779,7 +793,8 @@ impl ThreadSignalManager {
 impl Drop for ThreadSignalManager {
     fn drop(&mut self) {
         self.accepting_signals.store(false, Ordering::Release);
-        if let Some(entry) = self.registration.lock().take() {
+        let registration = { self.registration.lock().take() };
+        if let Some(entry) = registration {
             entry.deactivate();
         }
     }

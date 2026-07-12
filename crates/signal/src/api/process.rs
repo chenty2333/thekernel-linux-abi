@@ -70,7 +70,7 @@ impl SignalActions {
         if self.reset_claim_is_current(index) {
             SignalAction::default()
         } else {
-            self.actions[index].clone()
+            self.actions[index]
         }
     }
 
@@ -98,7 +98,7 @@ impl SignalActions {
             return (SignalAction::default(), None);
         }
 
-        let action = self.actions[index].clone();
+        let action = self.actions[index];
         let reset = matches!(action.disposition, SignalDisposition::Handler(_))
             && action.flags.contains(SignalActionFlags::RESETHAND);
         if !reset {
@@ -131,7 +131,7 @@ impl SignalActions {
                 if self.reset_claim_is_current(index) {
                     SignalAction::default()
                 } else {
-                    self.actions[index].clone()
+                    self.actions[index]
                 }
             }),
             generations: [0; 64],
@@ -245,8 +245,9 @@ pub struct ProcessSignalManager {
     /// The default restorer function.
     pub(crate) default_restorer: usize,
 
-    /// Thread-level signal managers.
-    pub(crate) children: SpinNoIrq<Option<Arc<ThreadRegistry>>>,
+    /// Thread-level signal managers. Kernel targets use the sleepable mutex so
+    /// snapshot `Arc` acquisition never runs with interrupts disabled.
+    pub(crate) children: Mutex<Option<Arc<ThreadRegistry>>>,
 
     /// Serializes registry publication with action transitions. On kernel
     /// targets this is a sleepable mutex when the crate's `multitask` feature
@@ -301,7 +302,7 @@ impl ProcessSignalManager {
             pending: SpinNoIrq::new(PendingSignals::default()),
             actions: SpinNoIrq::new(actions),
             default_restorer,
-            children: SpinNoIrq::new(None),
+            children: Mutex::new(None),
             action_update: Mutex::new(()),
             thread_limit,
             possibly_has_signal: AtomicBool::new(false),
@@ -466,9 +467,10 @@ impl ProcessSignalManager {
         let mut published = false;
         if !already_pending {
             let prepared = prepare(sig)?;
+            let blocked_by_any_thread = self.blocked_by_any_thread(signo);
             let outcome = {
                 let actions = self.actions.lock();
-                if Self::action_ignored(&actions, signo) && !self.blocked_by_any_thread(signo) {
+                if Self::action_ignored(&actions, signo) && !blocked_by_any_thread {
                     Err(prepared)
                 } else {
                     let mut pending = self.pending.lock();

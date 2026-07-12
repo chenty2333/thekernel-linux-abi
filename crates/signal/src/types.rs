@@ -304,7 +304,7 @@ impl fmt::Debug for SignalInfo {
 
 /// Signal stack. Compatible with `struct sigaltstack` in libc.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalStack {
     pub sp: usize,
     pub flags: u32,
@@ -353,7 +353,7 @@ impl SignalStack {
         if self.sp.checked_add(self.size).is_none() {
             return Err(SignalStackRestoreError::AddressOverflow);
         }
-        Ok(self.clone())
+        Ok(*self)
     }
 
     /// Checks if signal stack is disabled.

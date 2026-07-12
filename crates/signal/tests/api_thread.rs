@@ -164,7 +164,7 @@ fn nested_onstack_signal_uses_remaining_stack_instead_of_reusing_top() {
     let alt_top = initial_sp();
     let alt_size = 0x8000;
     let alt_stack = SignalStack::new(alt_top - alt_size, 0, alt_size);
-    thr.set_stack(alt_stack.clone());
+    thr.set_stack(alt_stack);
 
     let mut uctx = UserContext::new(0, initial_sp().into(), 0);
     let mut provider = memory_provider();
@@ -484,7 +484,7 @@ fn sigreturn_validates_and_commits_altstack_with_context_and_mask() {
 
     let mut frame = copy_signal_frame(&mut memory, &current);
     let candidate = SignalStack::new(initial_sp() - 0x4000, 0, 0x2000);
-    frame.ucontext_mut().stack = candidate.clone();
+    frame.ucontext_mut().stack = candidate;
     let prepared = thr
         .prepare_restore(
             &current,
@@ -519,7 +519,7 @@ fn sigreturn_squashes_bad_altstack_update_without_partial_state() {
         handler_action(0x4000, SignalActionFlags::empty()),
     );
     let configured = SignalStack::new(initial_sp() - 0x4000, 0, 0x2000);
-    thr.set_stack(configured.clone());
+    thr.set_stack(configured);
 
     let initial = UserContext::new(0x2000, initial_sp().into(), 0);
     let mut current = initial;
@@ -566,7 +566,7 @@ fn sigreturn_squashes_consumer_altstack_policy_error() {
         handler_action(0x4000, SignalActionFlags::empty()),
     );
     let configured = SignalStack::new(initial_sp() - 0x4000, 0, 0x2000);
-    thr.set_stack(configured.clone());
+    thr.set_stack(configured);
 
     let mut current = UserContext::new(0x2000, initial_sp().into(), 0);
     let mut provider = memory_provider();

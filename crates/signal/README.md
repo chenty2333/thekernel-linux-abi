@@ -65,4 +65,13 @@ across usercopy or fallible allocation. Hosted standalone tests retain a spin
 fallback where no kernel IRQ state exists. `kspin/smp` remains enabled in every
 build, including unpacked-package concurrency tests.
 
+The immutable thread-registry pointer also uses that sleepable kernel mutex:
+strong snapshot acquisition never clones an `Arc` with interrupts disabled.
+Registration rollback and endpoint destruction first move any retained
+registry owner out of their short IRQ-safe slot, then release it after the
+guard is gone. Process-directed routing is therefore a sleepable task-context
+operation in 0.1.0; an interrupt-context sender must defer routing through its
+kernel adapter rather than smuggling allocation or destruction into a spin
+critical section.
+
 See `VENDOR.md` and `PATCHES.md` for source identity and semantic changes.

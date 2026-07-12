@@ -117,7 +117,7 @@ impl RawSignalAction {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum SignalDisposition {
     #[default]
     /// Use the default signal action.
@@ -129,7 +129,7 @@ pub enum SignalDisposition {
 }
 
 /// Signal action. Corresponds to `struct sigaction` in libc.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SignalAction {
     pub flags: SignalActionFlags,
     pub mask: SignalSet,

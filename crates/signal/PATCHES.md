@@ -51,5 +51,9 @@ This ledger records changes relative to `starry-signal 0.3.0` identified in
   ceiling, reject `usize::MAX`, and return typed capacity/configuration errors.
 - Reject bare-metal builds without `multitask` so usercopy, allocation, and
   immutable-registry destruction never run under `SpinNoIrq`.
+- Protect the immutable registry owner with the sleepable kernel mutex, and
+  detach manager-held registration `Arc`s before dropping short IRQ-safe
+  guards. No registry snapshot clone or final entry destruction runs with
+  interrupts disabled.
 - Declare the package nightly-only: `Arc::try_new` preserves real OOM errors;
   allocator pre-reservation is not treated as a substitute.
