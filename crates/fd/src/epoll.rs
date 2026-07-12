@@ -108,6 +108,19 @@ pub struct DeliveryToken {
     events: ReadyMask,
 }
 
+impl DeliveryToken {
+    /// Returns the exact interest generation whose delivery is in flight.
+    ///
+    /// An adapter uses this identity after lock-free userspace copyout to find
+    /// its non-authoritative source-control index, recheck level readiness,
+    /// and rearm the retained source before finishing the core transaction.
+    /// User data is intentionally not an identity because Linux permits
+    /// duplicate `epoll_event.data` values.
+    pub const fn interest(self) -> EpollToken {
+        self.interest
+    }
+}
+
 /// Stable candidate returned before an adapter prepares userspace event data.
 ///
 /// Preparing this token never clones caller state or mutates a valid ready
@@ -902,6 +915,7 @@ mod tests {
         );
         let event = core.begin_delivery().unwrap().unwrap();
         assert_eq!(event.events, ReadyMask::IN);
+        assert_eq!(event.delivery.interest(), token);
         core.finish_delivery(
             event.delivery,
             DeliveryOutcome::Copied {

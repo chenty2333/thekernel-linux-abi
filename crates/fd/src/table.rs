@@ -1,3 +1,4 @@
+#[cfg(not(feature = "alloc"))]
 use core::array;
 
 use crate::{DescriptorFlags, FdNumber, FdTableId};
@@ -105,7 +106,10 @@ enum Slot<D> {
 pub struct FdTable<D, const N: usize> {
     id: FdTableId,
     next_generation: u64,
+    #[cfg(not(feature = "alloc"))]
     slots: [Slot<D>; N],
+    #[cfg(feature = "alloc")]
+    slots: Vec<Slot<D>>,
 }
 
 /// Descriptor-table operation failure before errno mapping.
@@ -126,7 +130,8 @@ pub enum FdTableError {
     InsufficientCloseStorage,
     /// Fallible owned storage could not be reserved.
     NoMemory,
-    /// `usize::MAX` was rejected rather than exposed as unbounded storage.
+    /// The requested capacity was effectively unbounded or could not be
+    /// represented by the crate's Linux descriptor-number type.
     Unbounded,
 }
 
@@ -140,13 +145,43 @@ pub struct PublishError<D> {
 }
 
 impl<D, const N: usize> FdTable<D, N> {
-    /// Creates an empty table with an explicit stable identity.
-    pub fn new(id: FdTableId) -> Self {
-        Self {
+    /// Fallibly creates an empty table with an explicit stable identity.
+    ///
+    /// With the `alloc` feature, the complete slot array is reserved and
+    /// initialized directly in heap-backed storage. The table value itself
+    /// therefore stays small even for a kernel-sized descriptor ceiling, and
+    /// moving it into an `Arc` or returning it from `fork_copy` does not create
+    /// an `N * size_of::<Slot<D>>()` stack temporary. No later table mutation
+    /// grows this storage.
+    ///
+    /// Without `alloc`, the caller deliberately selects inline fixed storage;
+    /// construction remains fallible in the public contract so consumers do
+    /// not need a feature-dependent call site.
+    pub fn try_new(id: FdTableId) -> Result<Self, FdTableError> {
+        if N == usize::MAX
+            || u64::try_from(N)
+                .ok()
+                .is_none_or(|capacity| capacity > u64::from(u32::MAX) + 1)
+        {
+            return Err(FdTableError::Unbounded);
+        }
+        #[cfg(feature = "alloc")]
+        let slots = {
+            let mut slots = Vec::new();
+            slots
+                .try_reserve_exact(N)
+                .map_err(|_| FdTableError::NoMemory)?;
+            slots.resize_with(N, || Slot::Vacant);
+            slots
+        };
+        #[cfg(not(feature = "alloc"))]
+        let slots = array::from_fn(|_| Slot::Vacant);
+
+        Ok(Self {
             id,
             next_generation: 1,
-            slots: array::from_fn(|_| Slot::Vacant),
-        }
+            slots,
+        })
     }
 
     /// Returns the table identity used in every token.
@@ -170,6 +205,22 @@ impl<D, const N: usize> FdTable<D, N> {
     /// Returns whether no descriptor is visible.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Iterates visible descriptors in ascending numeric order.
+    ///
+    /// Reserved slots remain unpublished and are intentionally skipped. The
+    /// iterator borrows the table, so the embedding kernel retains its chosen
+    /// external read lock for the duration without exposing crate-owned
+    /// synchronization.
+    pub fn iter(&self) -> impl Iterator<Item = (FdNumber, &DescriptorEntry<D>)> {
+        self.slots.iter().enumerate().filter_map(|(fd, slot)| {
+            let Slot::Occupied { entry, .. } = slot else {
+                return None;
+            };
+            let fd = u32::try_from(fd).ok()?;
+            Some((FdNumber::new(fd), entry))
+        })
     }
 
     fn allocate_generation(&mut self) -> Result<u64, FdTableError> {
@@ -408,7 +459,7 @@ impl<D: Clone, const N: usize> FdTable<D, N> {
     /// Copies visible descriptor entries for fork while sharing every OFD
     /// handle. Unpublished reservations are intentionally not inherited.
     pub fn fork_copy(&self, new_id: FdTableId) -> Result<Self, FdTableError> {
-        let mut copy = Self::new(new_id);
+        let mut copy = Self::try_new(new_id)?;
         for (fd, slot) in self.slots.iter().enumerate() {
             if let Slot::Occupied { entry, .. } = slot {
                 let generation = copy.allocate_generation()?;
@@ -544,7 +595,7 @@ mod tests {
 
     #[test]
     fn reservation_is_invisible_and_publish_is_generation_tagged() {
-        let mut table = FdTable::<Arc<u32>, 4>::new(table_id(1));
+        let mut table = FdTable::<Arc<u32>, 4>::try_new(table_id(1)).unwrap();
         let reservation = table.reserve(0, 4, DescriptorFlags::EMPTY).unwrap();
         assert_eq!(reservation.fd(), FdNumber::new(0));
         assert_eq!(
@@ -556,9 +607,41 @@ mod tests {
     }
 
     #[test]
+    fn alloc_table_handle_stays_small_for_a_kernel_sized_ceiling() {
+        assert!(core::mem::size_of::<FdTable<Arc<u32>, 1024>>() <= 64);
+        let table = FdTable::<Arc<u32>, 1024>::try_new(table_id(1)).unwrap();
+        assert_eq!(table.capacity(), 1024);
+    }
+
+    #[test]
+    fn iterator_is_ordered_and_skips_unpublished_reservations() {
+        let mut table = FdTable::<Arc<u32>, 8>::try_new(table_id(1)).unwrap();
+        let unpublished = table.reserve(0, 8, DescriptorFlags::EMPTY).unwrap();
+        let high = table.reserve(7, 8, DescriptorFlags::EMPTY).unwrap();
+        table.publish(high, Arc::new(7)).unwrap();
+        let middle = table.reserve(3, 7, DescriptorFlags::EMPTY).unwrap();
+        table.publish(middle, Arc::new(3)).unwrap();
+
+        let visible = table
+            .iter()
+            .map(|(fd, entry)| (fd.get(), **entry.description()))
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(visible, alloc::vec![(3, 3), (7, 7)]);
+        table.cancel_reservation(unpublished).unwrap();
+    }
+
+    #[test]
+    fn effectively_unbounded_table_is_rejected_before_allocation() {
+        assert!(matches!(
+            FdTable::<Arc<u32>, { usize::MAX }>::try_new(table_id(1)),
+            Err(FdTableError::Unbounded)
+        ));
+    }
+
+    #[test]
     fn foreign_publication_returns_unpublished_ownership() {
-        let mut one = FdTable::<Arc<u32>, 2>::new(table_id(1));
-        let mut two = FdTable::<Arc<u32>, 2>::new(table_id(2));
+        let mut one = FdTable::<Arc<u32>, 2>::try_new(table_id(1)).unwrap();
+        let mut two = FdTable::<Arc<u32>, 2>::try_new(table_id(2)).unwrap();
         let reservation = one.reserve(0, 2, DescriptorFlags::EMPTY).unwrap();
         let description = Arc::new(9);
         let error = two.publish(reservation, description.clone()).unwrap_err();
@@ -568,7 +651,7 @@ mod tests {
 
     #[test]
     fn stale_token_cannot_close_a_reused_number() {
-        let mut table = FdTable::<Arc<u32>, 1>::new(table_id(1));
+        let mut table = FdTable::<Arc<u32>, 1>::try_new(table_id(1)).unwrap();
         let first = table.reserve(0, 1, DescriptorFlags::EMPTY).unwrap();
         let first = table.publish(first, Arc::new(1)).unwrap();
         drop(table.close_token(first).unwrap());
@@ -580,7 +663,7 @@ mod tests {
 
     #[test]
     fn dup_and_fork_share_ofd_handle_but_copy_descriptor_flags() {
-        let mut table = FdTable::<Arc<u32>, 4>::new(table_id(1));
+        let mut table = FdTable::<Arc<u32>, 4>::try_new(table_id(1)).unwrap();
         let source = table.reserve(0, 4, DescriptorFlags::EMPTY).unwrap();
         let source = table.publish(source, Arc::new(3)).unwrap();
         let duplicate = table
@@ -596,6 +679,7 @@ mod tests {
         );
 
         let fork = table.fork_copy(table_id(2)).unwrap();
+        assert_eq!(fork.iter().count(), 2);
         assert!(Arc::ptr_eq(
             table.get(source.fd()).unwrap().description(),
             fork.get(source.fd()).unwrap().description(),
@@ -604,7 +688,7 @@ mod tests {
 
     #[test]
     fn close_batch_capacity_failure_is_atomic() {
-        let mut table = FdTable::<Arc<u32>, 4>::new(table_id(1));
+        let mut table = FdTable::<Arc<u32>, 4>::try_new(table_id(1)).unwrap();
         for _ in 0..2 {
             let reservation = table.reserve(0, 4, DescriptorFlags::CLOSE_ON_EXEC).unwrap();
             table.publish(reservation, Arc::new(1)).unwrap();
@@ -632,7 +716,7 @@ mod tests {
 
     #[test]
     fn dup_replace_never_steals_a_reserved_target() {
-        let mut table = FdTable::<Arc<u32>, 2>::new(table_id(1));
+        let mut table = FdTable::<Arc<u32>, 2>::try_new(table_id(1)).unwrap();
         let source = table.reserve(0, 1, DescriptorFlags::EMPTY).unwrap();
         let source = table.publish(source, Arc::new(1)).unwrap();
         let target = table.reserve(1, 2, DescriptorFlags::EMPTY).unwrap();

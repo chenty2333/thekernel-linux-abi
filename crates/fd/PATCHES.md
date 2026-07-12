@@ -16,6 +16,9 @@
   explicit stable identities.
 - Split descriptor reservation from publication and return unpublished
   ownership on every failure.
+- Store alloc-enabled table slots in one fallibly pre-reserved heap buffer;
+  keep the table handle small and make fork construction fallible instead of
+  returning a kernel-stack-sized inline array by value.
 - Pre-admit close transaction and ready-queue storage.
 - Replace fire-and-forget waker installation with retained aggregate
   registrations, finite accounting, and cancellation on every terminal path.
@@ -27,6 +30,9 @@
 - Replace arbitrary in-lock user-data cloning with delivery
   prepare/lock-external-payload/commit; stale commits and serial exhaustion
   return the never-published payload to the adapter.
+- Let adapters recover the exact interest token from an in-flight delivery for
+  lock-free copyout recheck/rearm; never use duplicate Linux user data as an
+  internal key.
 - Persist bounded rescan cursor and remaining-work state across calls, tag
   recovery generations, retry a queue-full slot without consuming it, and
   restart recovery when a new overflow invalidates the old scan.

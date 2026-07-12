@@ -8,7 +8,9 @@ lock, or expose raw generic-driver event bits as Linux ABI values.
 Version 0.1.0 provides:
 
 - a caller-owned fixed-capacity `FdTable` with separate descriptor-local flags
-  and shared OFD handles;
+  and shared OFD handles; alloc-enabled tables reserve their complete slot
+  buffer fallibly on the heap, while no-alloc consumers deliberately retain
+  inline fixed storage;
 - generation-tagged reservation/publication and ABA-safe close operations;
 - transactional close-range and close-on-exec batches whose storage is
   admitted before table mutation;
