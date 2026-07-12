@@ -276,7 +276,7 @@ fn thread_prepared_send_defers_ignored_record_release() {
             ..SignalAction::default()
         },
     );
-    let endpoint = thread.prepare_signal_send();
+    let endpoint = thread.try_prepare_signal_send().unwrap();
     let per_user = SignalQueueAccount::try_new(4).unwrap();
     let global = SignalQueueAccount::try_new(4).unwrap();
     let prepared = PreparedSignal::try_accounted(
@@ -304,7 +304,7 @@ fn thread_prepared_send_defers_ignored_record_release() {
 #[test]
 fn thread_prepared_send_rechecks_endpoint_cancellation() {
     let (_proc, thread) = new_test_env();
-    let endpoint = thread.prepare_signal_send();
+    let endpoint = thread.try_prepare_signal_send().unwrap();
     assert!(thread.cancel_registration());
 
     let per_user = SignalQueueAccount::try_new(4).unwrap();
@@ -326,6 +326,44 @@ fn thread_prepared_send_rechecks_endpoint_cancellation() {
     drop(unused);
     assert_eq!(per_user.queued(), 0);
     assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn thread_prepared_send_cannot_cross_registration_reuse() {
+    let (_proc, thread) = new_test_env();
+    let stale = thread.try_prepare_signal_send().unwrap();
+    assert!(thread.cancel_registration());
+    thread.try_register(99).unwrap().commit().unwrap();
+
+    let per_user = SignalQueueAccount::try_new(4).unwrap();
+    let global = SignalQueueAccount::try_new(4).unwrap();
+    let prepared = PreparedSignal::try_accounted(
+        SignalInfo::new_user(Signo::SIGRTMIN, -1, 100),
+        &per_user,
+        4,
+        &global,
+    )
+    .unwrap();
+
+    let deferred = stale.publish(prepared);
+    assert!(!deferred.outcome().published);
+    assert!(!deferred.outcome().wake);
+    let (_, unused) = deferred.finish();
+    assert!(unused.is_some());
+    drop(unused);
+    assert_eq!(per_user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+
+    let current = thread.try_prepare_signal_send().unwrap();
+    let outcome = current.publish(PreparedSignal::unqueued(SignalInfo::new_user(
+        Signo::SIGTERM,
+        -1,
+        100,
+    )));
+    assert!(outcome.outcome().published);
+    assert!(outcome.outcome().wake);
+    let (_, unused) = outcome.finish();
+    assert!(unused.is_none());
 }
 
 #[test]

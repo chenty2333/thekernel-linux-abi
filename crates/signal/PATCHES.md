@@ -61,5 +61,8 @@ This ledger records changes relative to `starry-signal 0.3.0` identified in
   fixed queue state without allocation, sleepable registry locking, or
   arbitrary destruction. Deferred ownership is released by the caller after
   its outer IRQ-disabled guards.
+- Resolve thread-directed preparation through the sleepable process snapshot
+  and retain the exact active registry entry. Cancelling and later
+  re-registering the same manager cannot make an old prepared token valid.
 - Declare the package nightly-only: `Arc::try_new` preserves real OOM errors;
   allocator pre-reservation is not treated as a substitute.

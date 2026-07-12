@@ -40,6 +40,7 @@ pub struct ThreadSignalSendOutcome {
 #[must_use = "publishing or dropping the prepared send releases endpoint ownership"]
 pub struct PreparedThreadSignalSend {
     thread: Arc<ThreadSignalManager>,
+    registration: Arc<RegisteredThread>,
 }
 
 impl PreparedThreadSignalSend {
@@ -51,7 +52,7 @@ impl PreparedThreadSignalSend {
     pub fn publish(self, prepared: PreparedSignal) -> DeferredThreadSignalSend {
         let thread = &self.thread;
         let lifecycle = thread.lifecycle.lock();
-        if !thread.accepting_signals.load(Ordering::Acquire) {
+        if !self.registration.is_active() || !thread.accepting_signals.load(Ordering::Acquire) {
             drop(lifecycle);
             return DeferredThreadSignalSend {
                 _prepared: self,
@@ -132,6 +133,13 @@ pub enum ThreadRegistrationError {
     Capacity,
     /// The admission was cancelled before it could be committed.
     Cancelled,
+}
+
+/// Why an exact endpoint could not be retained for an authorized send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadSignalPrepareError {
+    /// The manager has no currently active registration identity.
+    NotRegistered,
 }
 
 impl From<AllocError> for ThreadRegistrationError {
@@ -440,12 +448,28 @@ impl ThreadSignalManager {
         self.accepting_signals.load(Ordering::Acquire)
     }
 
-    /// Retains this exact endpoint before a non-blocking authorized signal
-    /// commit.
-    pub fn prepare_signal_send(self: &Arc<Self>) -> PreparedThreadSignalSend {
-        PreparedThreadSignalSend {
-            thread: self.clone(),
-        }
+    /// Retains this exact endpoint and registration identity before a
+    /// non-blocking authorized signal commit.
+    ///
+    /// Registry snapshot acquisition is sleepable and every temporary `Arc`
+    /// is released before this method returns. A token prepared before
+    /// cancellation cannot target a later registration of the same manager.
+    pub fn try_prepare_signal_send(
+        self: &Arc<Self>,
+    ) -> Result<PreparedThreadSignalSend, ThreadSignalPrepareError> {
+        let registry = self.proc.children_registry_snapshot();
+        let registration = registry.as_deref().and_then(|registry| {
+            registry.iter().find_map(|entry| {
+                let (_, thread) = entry.upgrade()?;
+                Arc::ptr_eq(&thread, self).then(|| Arc::clone(entry))
+            })
+        });
+        drop(registry);
+        let registration = registration.ok_or(ThreadSignalPrepareError::NotRegistered)?;
+        Ok(PreparedThreadSignalSend {
+            thread: Arc::clone(self),
+            registration,
+        })
     }
 
     /// Dequeues a signal from the thread's pending signals.

@@ -419,7 +419,7 @@ fn deferred_process_send_linearizes_with_ignored_transition() {
 #[test]
 fn deferred_thread_send_linearizes_with_endpoint_cancellation() {
     let (_process, signal) = new_test_env();
-    let endpoint = signal.prepare_signal_send();
+    let endpoint = signal.try_prepare_signal_send().unwrap();
     let user = SignalQueueAccount::try_new(1).unwrap();
     let global = SignalQueueAccount::try_new(1).unwrap();
     let prepared = PreparedSignal::try_accounted(

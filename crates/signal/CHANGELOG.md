@@ -29,5 +29,7 @@
   credential transaction can prepare bounded routing ownership before an
   outer spin lock, perform an allocation-free lifecycle-checked commit, and
   release unused queue/account/endpoint ownership only after that lock is gone.
+- Bind thread-directed prepared sends to the exact active registration
+  identity, preventing a token from crossing cancellation and endpoint reuse.
 - Test real SMP publication, queue accounting, frame placement, and restore
   behavior on the pinned nightly toolchain.

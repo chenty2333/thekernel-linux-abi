@@ -25,7 +25,8 @@ thread teardown before releasing the endpoint.
 Credential- or liveness-checked signal sends also have an explicit two-phase
 path. `try_prepare_signal_send()` fallibly retains a bounded process routing
 cohort before the kernel enters an unrelated IRQ-disabled authorization
-transaction; `prepare_signal_send()` retains one exact thread endpoint. Their
+transaction; the thread manager's `try_prepare_signal_send()` retains one
+exact endpoint and registration identity. Their
 `publish()` methods only take short signal-state spin locks, recheck exact
 registration/lifecycle identity, and move preallocated queue ownership. The
 returned deferred result retains every unused queue record, account, registry

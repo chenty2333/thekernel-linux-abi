@@ -184,14 +184,14 @@ impl RegisteredThread {
         self.tid == tid && self.is_live()
     }
 
-    fn upgrade(&self) -> Option<(u32, Arc<ThreadSignalManager>)> {
+    pub(crate) fn upgrade(&self) -> Option<(u32, Arc<ThreadSignalManager>)> {
         if self.state.load(Ordering::Acquire) != REGISTRATION_ACTIVE {
             return None;
         }
         self.thread.upgrade().map(|thread| (self.tid, thread))
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.state.load(Ordering::Acquire) == REGISTRATION_ACTIVE
     }
 }
