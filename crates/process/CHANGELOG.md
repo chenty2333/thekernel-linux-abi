@@ -4,7 +4,9 @@
 
 - Replace the crate-owned process registry and init singleton with an explicit
   `ProcessDomain` and `ProcessRegistry`.
-- Make durable zombie state a caller-defined generic payload.
+- Make durable zombie state a caller-defined generic payload retained by an
+  already prepared `Arc`, so complete credential/namespace provenance stays
+  owned by the lifecycle object without a shadow registry.
 - Preserve bounded, fallible process/thread admission and rollback.
 - Preserve subreaper reparenting, session/group topology, and allocation-free
   PID/TID iteration.

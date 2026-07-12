@@ -5,10 +5,12 @@ zombie lifecycle state without a crate-owned singleton. A kernel explicitly
 owns a `ProcessDomain<Z>`; its `ProcessRegistry<Z>` is passed to topology
 queries, and independent domains may safely reuse the same PID values.
 
-The generic `Z` is an opaque, caller-defined durable zombie payload. This
-crate does not define Linux wait-status encoding, UID snapshots, CPU usage, or
-errno mapping. A Linux ABI adapter can define one payload containing exactly
-the state its `wait*`, procfs, accounting, and permission paths require.
+The generic `Z` is an opaque, caller-defined durable zombie payload retained
+by `Arc`. The core never reduces it to a raw UID or a global side table. This
+crate does not define Linux wait-status encoding, credential snapshots, CPU
+usage, or errno mapping. A Linux ABI adapter can define one immutable payload
+containing exactly the state its `wait*`, procfs, accounting, namespace, and
+permission paths require.
 
 ## Toolchain
 
@@ -19,9 +21,11 @@ There is no `rust-version` claim for this package. See `PATCHES.md` for the
 stable-allocation alternatives considered and rejected.
 
 ```rust
+use std::sync::Arc;
+
 use thekernel_linux_process::{ExitOutcome, ProcessDomain};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LinuxZombie {
     wait_status: i32,
     uid: u32,
@@ -38,10 +42,10 @@ let child = child_admission
 assert_eq!(
     domain.exit(
         &child,
-        LinuxZombie {
+        Arc::new(LinuxZombie {
             wait_status: 0,
             uid: 0,
-        },
+        }),
         drop,
     ),
     Ok(ExitOutcome::BecameZombie),

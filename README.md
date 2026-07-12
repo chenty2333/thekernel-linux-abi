@@ -9,7 +9,7 @@ The 0.1.0 line contains five packages:
 - `thekernel-linux-usercopy` 0.1.0: explicit-context, bounded, fallible access
   to a caller-provided userspace memory implementation.
 - `thekernel-linux-process` 0.1.0: explicit-domain, bounded process lifecycle
-  state with a caller-defined zombie payload.
+  state with a caller-defined, reference-owned immutable zombie payload.
 - `thekernel-linux-signal` 0.1.0: bounded process/thread pending queues,
   architecture signal frames, generation-safe one-shot actions, quiescent
   teardown, and transactional context/mask/alternate-stack restore. Every

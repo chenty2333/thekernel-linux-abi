@@ -4,19 +4,19 @@ use std::sync::Arc;
 
 use thekernel_linux_process::{Process, ProcessDomain};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Zombie {
     pub wait_status: i32,
     pub uid: u32,
     pub user_ns_cookie: u64,
 }
 
-pub fn zombie(pid: u32) -> Zombie {
-    Zombie {
+pub fn zombie(pid: u32) -> Arc<Zombie> {
+    Arc::new(Zombie {
         wait_status: pid as i32,
         uid: pid,
         user_ns_cookie: 1,
-    }
+    })
 }
 
 pub fn domain() -> ProcessDomain<Zombie> {

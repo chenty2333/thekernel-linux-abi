@@ -25,6 +25,10 @@ This ledger records semantic changes relative to the immutable
   the successful zombie transition.
   Linux wait encoding, credentials, resource accounting, and errno mapping are
   now kernel-adapter policy.
+- Retain that payload as an adapter-prepared `Arc<Z>`. Publication performs no
+  allocation, readers clone only the reference count, and a kernel can keep an
+  immutable credential plus owning user namespace directly in the zombie
+  object instead of reconstructing authority from a raw UID or shadow table.
 - Make duplicate process-exit transitions idempotent without overwriting the
   first durable payload.
 - Validate a live TID before changing the stored exit code; return a typed
