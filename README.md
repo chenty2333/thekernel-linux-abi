@@ -4,7 +4,7 @@
 owned by TheKernel. It is deliberately separate from generic ArceOS
 mechanisms and from TheKernel's syscall and evaluator layers.
 
-The 0.1.0 line contains five packages:
+The 0.1.0 line contains six packages:
 
 - `thekernel-linux-usercopy` 0.1.0: explicit-context, bounded, fallible access
   to a caller-provided userspace memory implementation.
@@ -20,22 +20,25 @@ The 0.1.0 line contains five packages:
 - `thekernel-linux-fd` 0.1.0: bounded FD/OFD state, reservation and close
   transactions, retained readiness registration, epoll delivery, and finite
   epoll-graph validation.
+- `thekernel-linux-cred` 0.1.0: typed kernel/user IDs, immutable credentials
+  and namespace maps, exact-old-bound ordinary and exec transitions, strict
+  Linux file-capability parsing, and typed commoncap policy contexts.
 
 Signal depends on usercopy. Process remains independent; task ownership and
 process-to-signal integration stay with the caller rather than becoming hidden
 workspace-global state.
 
-The workspace name is not a facade package. Credential and MM crates will be
-added only after their Linux-visible contracts pass the semantic, failure,
-concurrency, and dual-architecture gates documented in this repository.
+The workspace name is not a facade package. MM will be added only after its
+Linux-visible contract passes the semantic, failure, concurrency, and
+dual-architecture gates documented in this repository.
 
 ## Development
 
 The repository pins the same nightly used by its initial TheKernel consumer.
 The usercopy, VFS, and FD crates are additionally checked against stable Rust
-1.85 or newer. The process and signal crates are explicitly nightly-only
-because preserving fallible standard `Arc` allocation currently requires
-`allocator_api`; neither inherits or claims a stable `rust-version`.
+1.85 or newer. The process, signal, and credential crates are explicitly
+nightly-only because preserving fallible standard `Arc` allocation currently
+requires `allocator_api`; none inherits or claims a stable `rust-version`.
 
 ```bash
 cargo test --workspace --all-features
@@ -43,6 +46,7 @@ cargo check -p thekernel-linux-usercopy --no-default-features --locked
 cargo check -p thekernel-linux-signal --no-default-features --locked
 cargo check -p thekernel-linux-vfs --no-default-features --locked
 cargo check -p thekernel-linux-fd --no-default-features --locked
+cargo check -p thekernel-linux-cred --no-default-features --locked
 CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh
 PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   ./scripts/test-package.sh
@@ -63,6 +67,10 @@ PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
 - VFS and FD policy consume caller-supplied stable handles and snapshots. They
   do not choose generic filesystem walkers, source-waker storage, locks, task
   globals, or concrete RCU/indexing algorithms.
+- Credential policy is an independent leaf. It owns immutable Linux identity,
+  namespace-map, transition, and commoncap values, but not credential slots,
+  security-hook dispatch, process/VFS/MM objects, locks, syscalls, or errno
+  mapping.
 - Pathwalk, descriptor, watch, ready-queue, graph, and recovery work are all
   finite. Epoll payload preparation is lock-external and recovery is
   generation-tagged and incrementally bounded. Unsupported exclusive selection
