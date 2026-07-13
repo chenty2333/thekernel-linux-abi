@@ -7,6 +7,8 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 - immutable, bidirectional user-namespace ID maps with bounded extent counts;
 - immutable user-namespace hierarchy/owner facts plus lock-neutral, one-write
   UID/GID map and irreversible `setgroups` publication state;
+- allocation-free parsing and normalized, validated values for Linux
+  `security.capability` revisions 1, 2, and 3;
 - immutable credential and capability-set values whose invariants are checked
   before publication by a consumer; and
 - namespace-capability topology decisions over an immutable caller-provided
@@ -16,7 +18,7 @@ The crate owns a concrete namespace *policy core*, but not the embedding
 namespace wrapper, synchronization, lifetime admission, procfs identity, or
 signal accounting extension. It also does not own a credential publication
 slot, process, VFS object, signal queue, address space, security-hook registry,
-exec transition, syscall, or errno type. A kernel adapter selects the lock,
+exec transition, xattr store, syscall, or errno type. A kernel adapter selects the lock,
 prebuilds immutable replacement maps outside it, and attaches the remaining
 objects. Map publication borrows that caller-owned replacement and clones it
 into an empty slot, so the guarded operation neither retires nor destroys map

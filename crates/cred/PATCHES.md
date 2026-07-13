@@ -17,6 +17,8 @@
   monotonic across a prepared transition.
 - Apply namespace capabilities in the correct direction: same namespace,
   descendants, and immediate-child owner authority, never upward or sideways.
+- Parse Linux file-capability revisions 1, 2, and 3 with exact size,
+  endianness, flag, mask, and namespaced-root validation.
 
 ## 0.1.0 extraction changes
 
@@ -32,6 +34,8 @@
   publication state into a lock-neutral core. Publication borrows a fully
   built replacement and clones it into an unused slot, so no caller or prior
   map owner can be destroyed by the guarded operation.
+- Normalize `security.capability` wire records into a field-private checked
+  value without importing a VFS, xattr store, process object, or kernel errno.
 - Declare the `allocator_api` nightly requirement without inventing a `kspin`
   dependency; synchronization remains a consumer decision.
 
@@ -40,8 +44,8 @@
 - embedding user-namespace allocation, lifetime limits, synchronization,
   procfs identity, and signal-pending accounting;
 - credential-slot synchronization, generation handling, and task attachment;
-- executable leases, file-capability parsing, set-ID/exec derivation,
-  dumpability and parent-death-signal effects;
+- executable leases, set-ID/exec derivation, dumpability and
+  parent-death-signal effects;
 - security-hook registry storage, dispatch, and kernel object contexts;
 - VFS DAC adapters, process/signal/scheduler/IPC authorization adapters, MM,
   and syscall/usercopy glue; and

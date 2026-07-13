@@ -29,9 +29,11 @@ The baseline contains the full in-kernel Credential v2 integration. Version
 0.1.0 of this crate extracts the independent value and topology-policy slice:
 typed IDs and ID maps, immutable credential/capability values,
 namespace-capability decisions, and a lock-neutral concrete namespace core for
-hierarchy, owner, map, and setgroups state. Namespace synchronization,
-lifetime admission, procfs identity, signal accounting, exec transitions,
-security hooks, and subsystem adapters remain outside this crate.
+hierarchy, owner, map, and setgroups state. It also extracts strict normalized
+parsing of Linux file-capability revisions 1, 2, and 3. Namespace
+synchronization, lifetime admission, procfs identity, signal accounting, xattr
+storage, exec derivation, security hooks, and subsystem adapters remain
+outside this crate.
 
 ## RFC 0001 research snapshots
 

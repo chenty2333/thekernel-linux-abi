@@ -15,6 +15,9 @@
   creator ownership, one-write UID/GID publication from borrowed immutable
   replacements, snapshot-stable empty maps, and irreversible `setgroups`
   policy.
+- Add an allocation-free parser and checked normalized value for Linux
+  `security.capability` revisions 1, 2, and 3, including exact sizes,
+  little-endian words, flags, capability masks, and namespaced root IDs.
 - Introduce non-exhaustive `CredError` values so adapters retain control of
   errno mapping.
 - Keep namespace locks, lifetime admission, procfs identity, and signal
