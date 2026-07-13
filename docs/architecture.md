@@ -8,17 +8,25 @@ The initial graph is:
 
 ```text
 thekernel-linux-signal -> thekernel-linux-usercopy
+thekernel-linux-cred      (independent credential policy leaf)
 thekernel-linux-vfs       (independent policy core)
 thekernel-linux-fd        (independent policy core)
 thekernel-linux-process   (independent)
 thekernel-linux-usercopy  (independent)
 ```
 
-Future credentials remain independent. VFS and FD currently accept typed
-caller snapshots rather than depending on a credential, signal, or generic
-mechanism package. MM may depend on credentials, usercopy, and generic mapping
-mechanisms. VFS objects and file-backed MM are connected through explicit
-adapter traits rather than dependency cycles.
+Credentials are an independent leaf. The first extraction slice owns typed
+kernel/user IDs, immutable bidirectional ID maps, immutable credential values,
+capability-set invariants, and namespace-capability topology policy. It does
+not own a concrete user namespace, credential publication slot, process, VFS,
+signal, MM, security-hook registry, exec transaction, syscall, or errno type.
+Its nightly `allocator_api` requirement is a fallible-allocation toolchain
+constraint, not a dependency on `kspin` or any kernel synchronization crate.
+
+VFS and FD accept typed caller snapshots rather than depending on a
+credential, signal, or generic mechanism package. MM may depend on credentials,
+usercopy, and generic mapping mechanisms. VFS objects and file-backed MM are
+connected through explicit adapter traits rather than dependency cycles.
 
 No crate obtains the current task, address space, filesystem context, or FD
 table implicitly. Operation context and immutable snapshots are passed by the

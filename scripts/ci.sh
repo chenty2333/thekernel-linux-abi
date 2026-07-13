@@ -38,6 +38,7 @@ else
         run_cargo doc --workspace --all-features --no-deps --locked
     run_cargo check -p thekernel-linux-process --no-default-features --lib --locked
     run_cargo check -p thekernel-linux-signal --no-default-features --lib --locked
+    run_cargo check -p thekernel-linux-cred --no-default-features --lib --locked
 fi
 
 run_cargo check -p thekernel-linux-usercopy --no-default-features --lib --locked
@@ -54,6 +55,7 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
     if [ "$stable_only" = 0 ]; then
         run_cargo check -p thekernel-linux-process --no-default-features --target "$target" --locked
         run_cargo check -p thekernel-linux-signal --features multitask --target "$target" --locked
+        run_cargo check -p thekernel-linux-cred --no-default-features --target "$target" --locked
     fi
 done
 
@@ -67,6 +69,7 @@ else
         thekernel-linux-signal
         thekernel-linux-vfs
         thekernel-linux-fd
+        thekernel-linux-cred
     )
 fi
 CARGO_TOOLCHAIN=${CARGO_TOOLCHAIN:-} \
@@ -85,6 +88,7 @@ else
         thekernel-linux-process
         thekernel-linux-vfs
         thekernel-linux-fd
+        thekernel-linux-cred
     )
 fi
 CARGO_TOOLCHAIN=${CARGO_TOOLCHAIN:-} \

@@ -8,6 +8,7 @@ process_dir="$repo_root/crates/process"
 signal_dir="$repo_root/crates/signal"
 vfs_dir="$repo_root/crates/vfs"
 fd_dir="$repo_root/crates/fd"
+cred_dir="$repo_root/crates/cred"
 
 check_sha256() {
     local expected=$1
@@ -83,5 +84,13 @@ grep -Fq '44696aa3a489d2baf58efa61b37833f100072bee' "$fd_dir/VENDOR.md"
 grep -Fq '62e22d7cfc1ca1c25bede6aaeca370c163a9a1ef' "$fd_dir/VENDOR.md"
 grep -Fq '3849af2' "$fd_dir/VENDOR.md"
 grep -Fq 'cc09058dc94bd0c3599e3f5538a55a8981026af5' "$fd_dir/VENDOR.md"
+
+check_sha256 \
+    cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 \
+    "$cred_dir/LICENSE"
+grep -Fq '38ed3c257e833a5d92c5246935adf071eb3df283' "$cred_dir/VENDOR.md"
+grep -Fq 'c5207dc09b5524eb67c53d181c28dfdf696415b2' "$cred_dir/VENDOR.md"
+grep -Fq 'dd3210c47e8d3ac6b4e9141fc68acc03b38c0ba3' "$cred_dir/VENDOR.md"
+grep -Fq '86691d52a6d3796ad36ba474cf0a9493f6d99202' "$cred_dir/VENDOR.md"
 
 printf 'provenance: PASS\n'

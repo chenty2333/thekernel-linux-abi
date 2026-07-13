@@ -891,6 +891,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-linux-cred"
+version = "0.1.0"
+dependencies = [
+ "linux-raw-sys",
+]
+
+[[package]]
 name = "thekernel-linux-fd"
 version = "0.1.0"
 

@@ -19,6 +19,7 @@ if [ "$#" -eq 0 ]; then
         thekernel-linux-signal
         thekernel-linux-vfs
         thekernel-linux-fd
+        thekernel-linux-cred
     )
 else
     packages=("$@")
@@ -70,6 +71,10 @@ for package in "${packages[@]}"; do
         thekernel-linux-fd)
             version=0.1.0
             crate_path=crates/fd
+            ;;
+        thekernel-linux-cred)
+            version=0.1.0
+            crate_path=crates/cred
             ;;
         *)
             printf 'unknown workspace package: %s\n' "$package" >&2
@@ -148,13 +153,17 @@ for package in "${packages[@]}"; do
     grep -Fq 'repository = "https://github.com/chenty2333/thekernel-linux-abi"' \
         "$package_dir/Cargo.toml"
     case "$package" in
-        thekernel-linux-process|thekernel-linux-signal)
+        thekernel-linux-process|thekernel-linux-signal|thekernel-linux-cred)
             ! grep -Fq 'rust-version' "$package_dir/Cargo.toml" || {
                 printf '%s must not claim a stable rust-version\n' "$package" >&2
                 exit 1
             }
             grep -Fq 'toolchain = "nightly-2025-05-20"' "$package_dir/Cargo.toml"
             grep -Fq 'nightly-features = ["allocator_api"]' "$package_dir/Cargo.toml"
+            ;;
+    esac
+    case "$package" in
+        thekernel-linux-process|thekernel-linux-signal)
             awk '
                 $0 == "[dependencies.kspin]" { in_kspin = 1; next }
                 in_kspin && /^\[/ { in_kspin = 0 }

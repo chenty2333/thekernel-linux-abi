@@ -8,8 +8,8 @@ bump the minor version; compatible fixes bump the patch version.
 1. Confirm the release commit is clean and all provenance assets are present.
 2. Run `CARGO_TOOLCHAIN=1.85.0 ./scripts/ci.sh` for stable packages and
    `CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh` for the complete
-   workspace. Both gates enforce the lockfile; nightly also covers process and
-   signal.
+   workspace. Both gates enforce the lockfile; nightly also covers process,
+   signal, and credentials.
 3. Let `scripts/test-package.sh` unpack every archive, verify provenance files,
    reject dependency `path`, `git`, or `workspace` leakage from the
    Cargo-normalized manifest, and test the unpacked source. Cargo-generated
@@ -20,8 +20,9 @@ bump the minor version; compatible fixes bump the patch version.
 5. Build registry-only adapters and real TheKernel consumers for both
    architectures. A workspace-only compile is not a consumer gate.
 6. Update the workspace and crate `CHANGELOG.md`, README, and patch ledger.
-7. Run `scripts/test-publish-dry-run.sh`. Its default set is the four
-   independently resolvable packages: usercopy, process, VFS, and FD.
+7. Run `scripts/test-publish-dry-run.sh`. Its default set is the five
+   independently resolvable packages: usercopy, process, VFS, FD, and
+   credentials.
 8. Publish only with explicit maintainer authorization. A passing dry-run is
    not authorization to upload, tag, or create a release.
 9. Download each released archive, record its checksum, audit its normalized
@@ -29,11 +30,12 @@ bump the minor version; compatible fixes bump the patch version.
 
 ## Dependency order
 
-The 0.1.0 registry order is usercopy, process, VFS, FD, then signal. Signal is
-last because its registry manifest depends on the published usercopy version;
-the other three packages are independent. Future credential and MM packages
-are published only after their respective semantic and real-consumer gates.
-No empty `thekernel-linux-abi` facade is published.
+The 0.1.0 registry order is usercopy, process, VFS, FD, credentials, then
+signal. Signal is last because its registry manifest depends on the published
+usercopy version; the other five packages are independent. Credentials require
+the pinned nightly for fallible `allocator_api`, but do not depend on `kspin`
+or another workspace package. MM is published only after its semantic and
+real-consumer gates. No empty `thekernel-linux-abi` facade is published.
 
 Before the first upload, the nightly package gate builds signal together with
 the packaged usercopy archive and patches the unpacked signal test to that

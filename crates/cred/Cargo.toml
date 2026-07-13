@@ -1,0 +1,29 @@
+[package]
+name = "thekernel-linux-cred"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+description = "Typed credentials and immutable user-namespace ID maps for no_std Linux ABI kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "credentials"]
+categories = ["no-std", "os"]
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
+
+[features]
+default = []
+
+[dependencies]
+linux-raw-sys.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[package.metadata.thekernel]
+toolchain = "nightly-2025-05-20"
+nightly-features = ["allocator_api"]
+
+[lints]
+workspace = true
