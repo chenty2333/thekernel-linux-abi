@@ -30,10 +30,11 @@ The baseline contains the full in-kernel Credential v2 integration. Version
 typed IDs and ID maps, immutable credential/capability values,
 namespace-capability decisions, and a lock-neutral concrete namespace core for
 hierarchy, owner, map, and setgroups state. It also extracts strict normalized
-parsing of Linux file-capability revisions 1, 2, and 3. Namespace
+parsing of Linux file-capability revisions 1, 2, and 3, and pure exec
+credential derivation into an exact-old-bound immutable proposal. Namespace
 synchronization, lifetime admission, procfs identity, signal accounting, xattr
-storage, exec derivation, security hooks, and subsystem adapters remain
-outside this crate.
+storage, executable leases, credential/process/MM publication, security-hook
+dispatch, and subsystem adapters remain outside this crate.
 
 ## RFC 0001 research snapshots
 

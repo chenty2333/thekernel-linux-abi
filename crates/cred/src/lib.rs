@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod credential;
 mod error;
+mod exec;
 mod file_capability;
 mod idmap;
 mod namespace;
@@ -25,6 +26,12 @@ pub use credential::{
     SECURE_ALL_BITS, SECURE_ALL_LOCKS, UserNamespaceView, credential_cap_is_subset, ns_capable,
 };
 pub use error::CredError;
+pub use exec::{
+    ExecAuxIdentity, ExecCredentialEffects, ExecCredentialInput, ExecCredentialProposal,
+    ExecDumpability, ExecFileOwner, ExecImageReadability, ExecMountPrivilege,
+    ExecPtraceRevalidation, ExecTraceState, ExecUserNamespaceView, commoncap_exec_transition,
+    derive_exec_credential,
+};
 pub use file_capability::{
     FileCapabilities, SECURITY_CAPABILITY_XATTR_NAME, parse_file_capabilities,
 };

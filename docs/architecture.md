@@ -20,11 +20,14 @@ IDs, immutable bidirectional ID maps, immutable credential values,
 capability-set invariants, namespace-capability topology policy, and a
 lock-neutral namespace core for hierarchy, owner, map, and setgroups state. It
 also owns normalized parsing of Linux executable file-capability records, but
-not xattr storage or executable lookup. It does not own the embedding namespace
+not xattr storage or executable lookup. Pure exec policy consumes frozen facts
+and produces an exact-old-bound immutable credential proposal plus typed
+effects. The crate does not own the embedding namespace
 allocation/lock/lifetime extension, credential publication slot, process, VFS,
-signal, MM, security-hook registry, exec transaction, syscall, or errno type.
-Its nightly `allocator_api` requirement is a fallible-allocation toolchain
-constraint, not a dependency on `kspin` or any kernel synchronization crate.
+signal, MM, security-hook registry/dispatch, executable lease, exec publication
+transaction, syscall, or errno type. Its nightly `allocator_api` requirement is
+a fallible-allocation toolchain constraint, not a dependency on `kspin` or any
+kernel synchronization crate.
 
 VFS and FD accept typed caller snapshots rather than depending on a
 credential, signal, or generic mechanism package. MM may depend on credentials,

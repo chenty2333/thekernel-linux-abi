@@ -36,6 +36,12 @@
   map owner can be destroyed by the guarded operation.
 - Normalize `security.capability` wire records into a field-private checked
   value without importing a VFS, xattr store, process object, or kernel errno.
+- Replace independently supplied set-ID/mapped booleans with a field-private
+  exec input over mode, paired inode IDs, typed mount/trace/readability facts,
+  and one coherent immutable UID/GID map snapshot.
+- Produce a complete immutable credential through checked `CapabilitySets`
+  and `ExecClearsKeepCaps`, then bind its release to the exact old `Arc` while
+  returning process/MM side effects only as typed values.
 - Declare the `allocator_api` nightly requirement without inventing a `kspin`
   dependency; synchronization remains a consumer decision.
 
@@ -44,8 +50,8 @@
 - embedding user-namespace allocation, lifetime limits, synchronization,
   procfs identity, and signal-pending accounting;
 - credential-slot synchronization, generation handling, and task attachment;
-- executable leases, set-ID/exec derivation, dumpability and
-  parent-death-signal effects;
+- executable leases, xattr lookup, credential writer/publication locks, and
+  application of dumpability, MM-owner, ptrace, and parent-death effects;
 - security-hook registry storage, dispatch, and kernel object contexts;
 - VFS DAC adapters, process/signal/scheduler/IPC authorization adapters, MM,
   and syscall/usercopy glue; and

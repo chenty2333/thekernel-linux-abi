@@ -18,6 +18,13 @@
 - Add an allocation-free parser and checked normalized value for Linux
   `security.capability` revisions 1, 2, and 3, including exact sizes,
   little-endian words, flags, capability masks, and namespaced root IDs.
+- Add typed, field-private exec inputs which derive set-ID intent from mode,
+  paired inode ownership, and one coherent UID/GID map snapshot rather than
+  accepting caller-supplied transition booleans.
+- Add an opaque exec proposal which owns the exact old credential `Arc`,
+  releases its validated proposed `Arc` only after a pointer-identity check,
+  and carries typed dumpability, aux-identity, ptrace-revalidation, and
+  commoncap decisions without owning process or MM publication.
 - Introduce non-exhaustive `CredError` values so adapters retain control of
   errno mapping.
 - Keep namespace locks, lifetime admission, procfs identity, and signal
