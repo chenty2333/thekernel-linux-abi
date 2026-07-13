@@ -15,6 +15,9 @@
   mask.
 - Keep committed credential values immutable and make `no_new_privs`
   monotonic across a prepared transition.
+- Bind ordinary replacement release to the exact old credential `Arc`, keep
+  old/proposed owners opaque behind borrowed views, and derive the coupled
+  dumpability/parent-death reset decision before consumer publication.
 - Apply namespace capabilities in the correct direction: same namespace,
   descendants, and immediate-child owner authority, never upward or sideways.
 - Parse Linux file-capability revisions 1, 2, and 3 with exact size,
@@ -40,8 +43,11 @@
   exec input over mode, paired inode IDs, typed mount/trace/readability facts,
   and one coherent immutable UID/GID map snapshot.
 - Produce a complete immutable credential through checked `CapabilitySets`
-  and `ExecClearsKeepCaps`, then bind its release to the exact old `Arc` while
-  returning process/MM side effects only as typed values.
+  and crate-private `ExecClearsKeepCaps`, then bind exec release to the exact
+  old `Arc` while returning process/MM side effects only as typed values.
+- Restrict the raw transition constructor and exec-only transition mode to the
+  crate; ordinary consumers receive a dedicated exact-old-bound proposal that
+  cannot replace the user namespace or select an exec relaxation.
 - Replace kernel-object-specific ptrace/scheduler contexts and caller-supplied
   ownership booleans with immutable generic contexts; retain opaque object
   identity for stacked hooks while extracting pure commoncap rules.

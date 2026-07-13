@@ -20,9 +20,12 @@ IDs, immutable bidirectional ID maps, immutable credential values,
 capability-set invariants, namespace-capability topology policy, and a
 lock-neutral namespace core for hierarchy, owner, map, and setgroups state. It
 also owns normalized parsing of Linux executable file-capability records, but
-not xattr storage or executable lookup. Pure exec policy consumes frozen facts
-and produces an exact-old-bound immutable credential proposal plus typed
-effects. The crate does not own the embedding namespace
+not xattr storage or executable lookup. Ordinary transitions and pure exec
+policy produce exact-old-bound immutable credential proposals plus typed
+effects. Proposal accessors borrow old/proposed values, and only an exact old
+Linux credential `Arc` releases the proposed owner. A consumer wrapping the
+same core in distinct composite credentials additionally binds its exact outer
+identity locally. The crate does not own the embedding namespace
 allocation/lock/lifetime extension, credential publication slot, process, VFS,
 signal, MM, security-hook registry/dispatch, executable lease, exec publication
 transaction, syscall, or errno type. Ptrace, traceme, and scheduler commoncap

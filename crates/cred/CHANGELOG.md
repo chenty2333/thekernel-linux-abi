@@ -9,6 +9,13 @@
 - Add immutable credential and capability-set values with checked effective,
   permitted, inheritable, bounding, ambient, securebits, group, and
   `no_new_privs` invariants.
+- Add an opaque ordinary-transition proposal which inherits the old user
+  namespace, excludes exec-only invariant relaxations, owns the exact old
+  credential `Arc`, and releases its proposed owner only after a pointer
+  identity check.
+- Derive ordinary-transition dumpability and parent-death effects from
+  effective/filesystem ID changes and Linux `cred_cap_issubset()` instead of
+  requiring a kernel adapter to reconstruct that policy.
 - Add namespace-capability decisions over immutable caller-provided namespace
   topology without owning a process registry.
 - Add a lock-neutral user-namespace domain and map state for bounded hierarchy,

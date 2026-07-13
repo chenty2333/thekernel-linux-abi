@@ -19,12 +19,14 @@ mod idmap;
 mod namespace;
 mod security;
 
+pub(crate) use credential::CredentialTransitionMode;
 pub use credential::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, Credential, CredentialIds,
-    CredentialTransitionMode, FsCredentialSnapshot, GroupInfo, SECBIT_KEEP_CAPS,
-    SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
-    SECBIT_NO_SETUID_FIXUP, SECBIT_NO_SETUID_FIXUP_LOCKED, SECBIT_NOROOT, SECBIT_NOROOT_LOCKED,
-    SECURE_ALL_BITS, SECURE_ALL_LOCKS, UserNamespaceView, credential_cap_is_subset, ns_capable,
+    CredentialTransitionEffects, FsCredentialSnapshot, GroupInfo, PreparedCredential,
+    SECBIT_KEEP_CAPS, SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE,
+    SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED, SECBIT_NO_SETUID_FIXUP, SECBIT_NO_SETUID_FIXUP_LOCKED,
+    SECBIT_NOROOT, SECBIT_NOROOT_LOCKED, SECURE_ALL_BITS, SECURE_ALL_LOCKS, UserNamespaceView,
+    credential_cap_is_subset, ns_capable,
 };
 pub use error::CredError;
 pub use exec::{

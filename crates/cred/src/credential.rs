@@ -1,8 +1,9 @@
 //! Immutable Linux credential values and namespace-relative capability rules.
 //!
 //! This module deliberately owns no task, process, hook registry, or
-//! publication lock. An embedding kernel serializes writers and atomically
-//! publishes the fully validated `Arc<Credential<_>>` returned here.
+//! publication lock. An embedding kernel serializes writers, prepares an
+//! exact-old-bound [`PreparedCredential`], attaches its own unpublished state,
+//! and atomically publishes the fully validated replacement.
 
 use alloc::{sync::Arc, vec::Vec};
 
@@ -403,9 +404,97 @@ pub struct Credential<N: UserNamespaceView> {
     user_ns: Arc<N>,
 }
 
-/// Special invariant relaxation allowed while finalizing a credential.
+/// Process-level effects derived from one ordinary credential transition.
+///
+/// The crate reports the Linux decision but deliberately does not own process
+/// dumpability, parent-death signals, locking, or publication. A consumer must
+/// apply these effects together with the prepared credential in its own
+/// atomic transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CredentialTransitionMode {
+pub struct CredentialTransitionEffects {
+    reset_process_security: bool,
+}
+
+impl CredentialTransitionEffects {
+    fn between<N: UserNamespaceView>(old: &Credential<N>, proposed: &Credential<N>) -> Self {
+        let old_ids = old.ids;
+        let proposed_ids = proposed.ids;
+        Self {
+            reset_process_security: old_ids.euid != proposed_ids.euid
+                || old_ids.egid != proposed_ids.egid
+                || old_ids.fsuid != proposed_ids.fsuid
+                || old_ids.fsgid != proposed_ids.fsgid
+                || !credential_cap_is_subset(old, proposed),
+        }
+    }
+
+    /// Reports whether the consumer must lower process dumpability before
+    /// publishing the proposed credential.
+    pub const fn requires_dumpability_drop(self) -> bool {
+        self.reset_process_security
+    }
+
+    /// Reports whether the consumer must clear the parent-death signal before
+    /// publishing the proposed credential.
+    pub const fn clear_pdeath_signal(self) -> bool {
+        self.reset_process_security
+    }
+}
+
+/// Fully validated but unpublished ordinary credential transition.
+///
+/// The token owns a clone of the exact old [`Arc`] used for preparation. Its
+/// proposed owner can only be released by consuming the token with that same
+/// old pointer, preventing an equal-looking credential from authorizing a
+/// different Linux-core writer snapshot. Accessors intentionally expose
+/// borrowed credential values rather than cloneable owners. A kernel that
+/// wraps this value with module state must additionally bind its own exact
+/// outer credential or publication slot; this leaf cannot identify those
+/// consumer-owned objects.
+pub struct PreparedCredential<N: UserNamespaceView> {
+    old: Arc<Credential<N>>,
+    proposed: Arc<Credential<N>>,
+    effects: CredentialTransitionEffects,
+}
+
+impl<N: UserNamespaceView> PreparedCredential<N> {
+    /// Borrows the exact old credential used to prepare this transition.
+    pub fn old(&self) -> &Credential<N> {
+        self.old.as_ref()
+    }
+
+    /// Borrows the complete immutable proposed credential.
+    pub fn proposed(&self) -> &Credential<N> {
+        self.proposed.as_ref()
+    }
+
+    /// Returns the process-level effects that must accompany publication.
+    pub const fn effects(&self) -> CredentialTransitionEffects {
+        self.effects
+    }
+
+    /// Releases the proposed owner only for the exact writer snapshot from
+    /// which this token was prepared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredError::NotPermitted`] when `expected_old` is a distinct
+    /// [`Arc`], even if every observable credential field is equal.
+    pub fn try_into_proposed(
+        self,
+        expected_old: &Arc<Credential<N>>,
+    ) -> Result<Arc<Credential<N>>, CredError> {
+        if !Arc::ptr_eq(&self.old, expected_old) {
+            return Err(CredError::NotPermitted);
+        }
+        Ok(self.proposed)
+    }
+}
+
+/// Special invariant relaxation allowed while finalizing a credential inside
+/// this crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CredentialTransitionMode {
     /// Ordinary credential transition; every locked securebit is immutable.
     Normal,
     /// Exec may clear `KEEP_CAPS` even when its lock bit remains set.
@@ -474,10 +563,41 @@ impl<N: UserNamespaceView> Credential<N> {
         Self::try_with_user_namespace(current, user_ns)
     }
 
+    /// Validates and prepares one ordinary immutable replacement bound to the
+    /// exact old credential owner.
+    ///
+    /// The user namespace is inherited from `old`, `no_new_privs` remains
+    /// monotonic, and ordinary transitions cannot use exec-only securebit
+    /// relaxations. Failure or dropping the returned token leaves `old`
+    /// untouched and publishes nothing.
+    pub fn try_prepare_transition(
+        old: &Arc<Self>,
+        ids: CredentialIds,
+        groups: Arc<GroupInfo>,
+        caps: CapabilitySets,
+        no_new_privs: bool,
+    ) -> Result<PreparedCredential<N>, CredError> {
+        let proposed = Self::try_from_transition(
+            old.as_ref(),
+            ids,
+            groups,
+            caps,
+            no_new_privs,
+            old.user_ns.clone(),
+            CredentialTransitionMode::Normal,
+        )?;
+        let effects = CredentialTransitionEffects::between(old.as_ref(), proposed.as_ref());
+        Ok(PreparedCredential {
+            old: old.clone(),
+            proposed,
+            effects,
+        })
+    }
+
     /// Validates a complete unpublished value and allocates the immutable
     /// replacement. Failure leaves `old` untouched and publishes nothing.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_from_transition(
+    pub(crate) fn try_from_transition(
         old: &Self,
         ids: CredentialIds,
         groups: Arc<GroupInfo>,
@@ -1048,6 +1168,117 @@ mod tests {
         .unwrap();
         drop(proposed);
         assert_eq!((old.ids(), old.capabilities(), old.no_new_privs()), before);
+    }
+
+    #[test]
+    fn prepared_transition_rejects_equal_looking_distinct_old_arc() {
+        let namespace = MockNamespace::root();
+        let old = Credential::try_root(namespace.clone()).unwrap();
+        let equal_but_distinct = Credential::try_from_transition(
+            old.as_ref(),
+            old.ids(),
+            old.groups().clone(),
+            old.capabilities(),
+            old.no_new_privs(),
+            namespace,
+            CredentialTransitionMode::Normal,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&old, &equal_but_distinct));
+
+        let old_refcount = Arc::strong_count(&old);
+        let prepared = Credential::try_prepare_transition(
+            &old,
+            ids(1000, 100),
+            old.groups().clone(),
+            CapabilitySets::empty(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(prepared.old().ids(), old.ids());
+        assert_eq!(prepared.proposed().ids(), ids(1000, 100));
+        assert_eq!(Arc::strong_count(&old), old_refcount + 1);
+        assert!(matches!(
+            prepared.try_into_proposed(&equal_but_distinct),
+            Err(CredError::NotPermitted)
+        ));
+        assert_eq!(Arc::strong_count(&old), old_refcount);
+
+        let prepared = Credential::try_prepare_transition(
+            &old,
+            ids(1000, 100),
+            old.groups().clone(),
+            CapabilitySets::empty(),
+            true,
+        )
+        .unwrap();
+        let proposed = prepared.try_into_proposed(&old).unwrap();
+        assert_eq!(proposed.ids(), ids(1000, 100));
+        assert!(proposed.no_new_privs());
+    }
+
+    #[test]
+    fn ordinary_transition_effects_follow_linux_process_security_reset_rules() {
+        let namespace = MockNamespace::root();
+        let root = Credential::try_root(namespace.clone()).unwrap();
+
+        let assert_reset = |ids: CredentialIds, caps: CapabilitySets, expected: bool| {
+            let prepared = Credential::try_prepare_transition(
+                &root,
+                ids,
+                root.groups().clone(),
+                caps,
+                root.no_new_privs(),
+            )
+            .unwrap();
+            let effects = prepared.effects();
+            assert_eq!(effects.requires_dumpability_drop(), expected);
+            assert_eq!(effects.clear_pdeath_signal(), expected);
+        };
+
+        assert_reset(root.ids(), root.capabilities(), false);
+
+        let mut changed = root.ids();
+        changed.ruid = kuid(1000);
+        changed.suid = kuid(1000);
+        changed.rgid = kgid(100);
+        changed.sgid = kgid(100);
+        assert_reset(changed, root.capabilities(), false);
+
+        for change in 0..4 {
+            let mut changed = root.ids();
+            match change {
+                0 => changed.euid = kuid(1000),
+                1 => changed.egid = kgid(100),
+                2 => changed.fsuid = kuid(1000),
+                3 => changed.fsgid = kgid(100),
+                _ => unreachable!(),
+            }
+            assert_reset(changed, root.capabilities(), true);
+        }
+
+        assert_reset(root.ids(), CapabilitySets::empty(), false);
+
+        let restricted = Credential::try_from_transition(
+            root.as_ref(),
+            root.ids(),
+            root.groups().clone(),
+            CapabilitySets::empty(),
+            false,
+            namespace,
+            CredentialTransitionMode::Normal,
+        )
+        .unwrap();
+        let gained = Credential::try_prepare_transition(
+            &restricted,
+            restricted.ids(),
+            restricted.groups().clone(),
+            caps(bit(CAP_CHOWN), [0; CAPABILITY_WORDS], 0),
+            restricted.no_new_privs(),
+        )
+        .unwrap();
+        assert!(gained.effects().requires_dumpability_drop());
+        assert!(gained.effects().clear_pdeath_signal());
     }
 
     #[test]
