@@ -34,7 +34,9 @@ parsing of Linux file-capability revisions 1, 2, and 3, and pure exec
 credential derivation into an exact-old-bound immutable proposal. Namespace
 synchronization, lifetime admission, procfs identity, signal accounting, xattr
 storage, executable leases, credential/process/MM publication, security-hook
-dispatch, and subsystem adapters remain outside this crate.
+registry/dispatch, and subsystem adapters remain outside this crate. Typed
+ptrace, traceme, and scheduler contexts keep exact caller-owned object payloads
+opaque while the crate supplies only commoncap policy.
 
 ## RFC 0001 research snapshots
 

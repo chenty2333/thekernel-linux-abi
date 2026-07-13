@@ -25,6 +25,10 @@
   releases its validated proposed `Arc` only after a pointer-identity check,
   and carries typed dumpability, aux-identity, ptrace-revalidation, and
   commoncap decisions without owning process or MM publication.
+- Add typed ptrace/traceme contexts with opaque caller-owned object payloads,
+  typed scheduler operations whose ownership relation is derived internally,
+  and policy-neutral commoncap authorization errors preserving `EPERM` versus
+  `EACCES` adapter choices.
 - Introduce non-exhaustive `CredError` values so adapters retain control of
   errno mapping.
 - Keep namespace locks, lifetime admission, procfs identity, and signal

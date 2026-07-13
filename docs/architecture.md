@@ -25,9 +25,11 @@ and produces an exact-old-bound immutable credential proposal plus typed
 effects. The crate does not own the embedding namespace
 allocation/lock/lifetime extension, credential publication slot, process, VFS,
 signal, MM, security-hook registry/dispatch, executable lease, exec publication
-transaction, syscall, or errno type. Its nightly `allocator_api` requirement is
-a fallible-allocation toolchain constraint, not a dependency on `kspin` or any
-kernel synchronization crate.
+transaction, syscall, or errno type. Ptrace, traceme, and scheduler commoncap
+policy consumes typed immutable contexts whose kernel object payload is an
+opaque caller-owned generic; it introduces no process/MM trait or orphan-rule
+edge. The nightly `allocator_api` requirement is a fallible-allocation
+toolchain constraint, not a dependency on `kspin` or kernel synchronization.
 
 VFS and FD accept typed caller snapshots rather than depending on a
 credential, signal, or generic mechanism package. MM may depend on credentials,

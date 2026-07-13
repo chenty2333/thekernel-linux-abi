@@ -17,6 +17,7 @@ mod exec;
 mod file_capability;
 mod idmap;
 mod namespace;
+mod security;
 
 pub use credential::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, Credential, CredentialIds,
@@ -42,4 +43,9 @@ pub use idmap::{
 pub use namespace::{
     USER_NAMESPACE_MAX_CREATION_PARENT_LEVEL, USER_NAMESPACE_OVERFLOW_ID, UserNamespaceDomain,
     UserNamespaceMapState,
+};
+pub use security::{
+    AuthorizationError, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
+    PtraceTracemeContext, SchedulerSecurityContext, SchedulerSecurityOperation,
+    commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler,
 };

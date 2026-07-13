@@ -42,6 +42,9 @@
 - Produce a complete immutable credential through checked `CapabilitySets`
   and `ExecClearsKeepCaps`, then bind its release to the exact old `Arc` while
   returning process/MM side effects only as typed values.
+- Replace kernel-object-specific ptrace/scheduler contexts and caller-supplied
+  ownership booleans with immutable generic contexts; retain opaque object
+  identity for stacked hooks while extracting pure commoncap rules.
 - Declare the `allocator_api` nightly requirement without inventing a `kspin`
   dependency; synchronization remains a consumer decision.
 
@@ -52,7 +55,8 @@
 - credential-slot synchronization, generation handling, and task attachment;
 - executable leases, xattr lookup, credential writer/publication locks, and
   application of dumpability, MM-owner, ptrace, and parent-death effects;
-- security-hook registry storage, dispatch, and kernel object contexts;
+- security-hook registry storage, dispatch, boot freeze, notification phases,
+  and concrete kernel object wrappers;
 - VFS DAC adapters, process/signal/scheduler/IPC authorization adapters, MM,
   and syscall/usercopy glue; and
 - kernel errno values, concrete lock types, hash maps, RCU, or epoch schemes.

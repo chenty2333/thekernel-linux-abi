@@ -12,6 +12,9 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 - pure set-ID/file-capability exec derivation into an opaque proposal bound to
   the exact old credential snapshot, plus typed dumpability, aux-identity,
   ptrace-revalidation, and commoncap decisions;
+- typed ptrace, traceme, and scheduler authorization contexts over immutable
+  credentials and caller-owned opaque object identities, with policy-neutral
+  commoncap decisions and no caller-supplied ownership shortcut;
 - immutable credential and capability-set values whose invariants are checked
   before publication by a consumer; and
 - namespace-capability topology decisions over an immutable caller-provided
@@ -20,9 +23,9 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 The crate owns a concrete namespace *policy core*, but not the embedding
 namespace wrapper, synchronization, lifetime admission, procfs identity, or
 signal accounting extension. It also does not own a credential publication
-slot, process, VFS object, signal queue, address space, security-hook registry,
-executable lease, exec publication transaction, xattr store, syscall, or errno
-type. A kernel adapter selects the lock, prebuilds immutable replacement maps
+slot, process, VFS object, signal queue, address space, security-hook registry
+or dispatch, executable lease, exec publication transaction, xattr store,
+syscall, or errno type. A kernel adapter selects the lock, prebuilds immutable replacement maps
 outside it, and attaches the remaining objects. Map publication borrows that
 caller-owned replacement and clones it into an empty slot, so the guarded
 operation neither retires nor destroys map ownership. In particular,
