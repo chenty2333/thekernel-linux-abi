@@ -261,6 +261,10 @@ impl<Z> RegistryState<Z> {
 pub struct ProcessRegistry<Z> {
     // When both guards are needed, topology is always acquired before state.
     // Admission paths that touch state first release it before taking topology.
+    // Every removal of a published process must hold topology through the
+    // state-tree unlink. Consequently topology alone pins the registry-owned
+    // Arc behind every published ancestry Weak; unpublished admission rollback
+    // may unlink under state alone because it can never appear in ancestry.
     state: SpinNoIrq<RegistryState<Z>>,
     topology: SpinNoIrq<()>,
     membership_limit: usize,
@@ -351,7 +355,6 @@ impl<Z> ProcessRegistry<Z> {
             .map(|process| process.pid);
         ProcessesThroughCurrentMax {
             registry: self,
-            last: None,
             after: None,
             upper_bound,
             finished: upper_bound.is_none(),
@@ -674,24 +677,47 @@ fn reparent_if_owned<Z>(
     child: &Process<Z>,
     expected_parent: &Arc<Process<Z>>,
     replacement: &Weak<Process<Z>>,
-) -> bool {
+) -> Option<Weak<Process<Z>>> {
     let old_parent = {
         let mut parent = child.parent.lock();
         if parent.as_ptr() != Arc::as_ptr(expected_parent) {
-            return false;
+            return None;
         }
         core::mem::replace(&mut *parent, replacement.clone())
     };
-    drop(old_parent);
-    true
+    Some(old_parent)
+}
+
+struct ReaperSelection<Z> {
+    reaper: Arc<Process<Z>>,
+    retired_first_ancestor: Option<Arc<Process<Z>>>,
 }
 
 fn select_reaper_for_exit_locked<Z>(
     process: &Arc<Process<Z>>,
     init: &Arc<Process<Z>>,
-) -> Arc<Process<Z>> {
-    let mut ancestor = process.parent();
-    while let Some(candidate) = ancestor {
+) -> ReaperSelection<Z> {
+    let Some(first_ancestor) = process.parent() else {
+        return ReaperSelection {
+            reaper: init.clone(),
+            retired_first_ancestor: None,
+        };
+    };
+
+    // The caller owns the topology guard. Published-process removal follows
+    // topology -> state, so the registry's owning Arc keeps every ancestry
+    // pointer alive without taking state here. This avoids inverting state ->
+    // thread-group against thread admission's thread-group -> state check.
+    // Final exit reparents children before reap, therefore a live ancestry
+    // relation always names a process still present in this registry.
+    let first_ptr = Arc::as_ptr(&first_ancestor);
+    let mut candidate_ptr = first_ptr;
+    loop {
+        // SAFETY: `first_ancestor` retains `first_ptr`. Every later pointer was
+        // read from the parent relation of a registered live process while the
+        // topology guard prevents exit mutation and published registry removal,
+        // keeping the registry's owning Arc alive.
+        let candidate = unsafe { &*candidate_ptr };
         if candidate.is_child_subreaper() {
             let tg = candidate.tg.lock();
             if tg.live_threads != 0
@@ -699,12 +725,39 @@ fn select_reaper_for_exit_locked<Z>(
                 && !candidate.is_zombie.load(Ordering::Acquire)
             {
                 drop(tg);
-                return candidate;
+                let reaper = if candidate_ptr == first_ptr {
+                    return ReaperSelection {
+                        reaper: first_ancestor,
+                        retired_first_ancestor: None,
+                    };
+                } else {
+                    // SAFETY: the caller's topology guard prevents the
+                    // candidate's published registry Arc from being removed
+                    // until the newly incremented reference is materialized.
+                    unsafe {
+                        Arc::increment_strong_count(candidate_ptr);
+                        Arc::from_raw(candidate_ptr)
+                    }
+                };
+                return ReaperSelection {
+                    reaper,
+                    retired_first_ancestor: Some(first_ancestor),
+                };
             }
         }
-        ancestor = candidate.parent();
+
+        let parent = candidate.parent.lock();
+        let next_ptr = (parent.strong_count() != 0).then(|| parent.as_ptr());
+        drop(parent);
+        let Some(next_ptr) = next_ptr else {
+            break;
+        };
+        candidate_ptr = next_ptr;
     }
-    init.clone()
+    ReaperSelection {
+        reaper: init.clone(),
+        retired_first_ancestor: Some(first_ancestor),
+    }
 }
 
 impl<Z> ProcessDomain<Z> {
@@ -826,6 +879,15 @@ impl<Z> ProcessDomain<Z> {
         let Some(node) = node else {
             return Ok(ThreadExitTransition::NotFound);
         };
+
+        // A reserved-but-unpublished membership may still become live. Do not
+        // consume the last currently-live thread and strand a zero-live,
+        // non-zombie process if that reservation later rolls back. Adapters
+        // normally serialize clone publication with their lifecycle gate; the
+        // core still rejects violations of that outer contract safely.
+        if tg.live_threads == 1 && tg.memberships != 1 {
+            return Err(ProcessError::Busy);
+        }
 
         if tg.live_threads != 1 {
             if !tg.group_exited {
@@ -1068,11 +1130,14 @@ impl<Z> ProcessDomain<Z> {
         if !self.registry.belongs(process) {
             return Err(ProcessError::WrongDomain);
         }
+        let topology = self.registry.topology.lock();
         if process.reaped.load(Ordering::Acquire) {
+            drop(topology);
             return Ok(false);
         }
         self.registry.ensure_published(process)?;
         if process.tg.lock().memberships != 0 {
+            drop(topology);
             return Err(ProcessError::NotLive);
         }
         if !process.is_zombie()
@@ -1081,6 +1146,7 @@ impl<Z> ProcessDomain<Z> {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
+            drop(topology);
             return Ok(false);
         }
 
@@ -1101,6 +1167,7 @@ impl<Z> ProcessDomain<Z> {
             removed
         };
         let existed = removed.is_some();
+        drop(topology);
         drop(removed);
         if existed {
             self.registry.release_group_member(&group);
@@ -1116,6 +1183,69 @@ impl<Z> ProcessDomain<Z> {
 pub struct CommittedProcessExit<Z> {
     outcome: ExitOutcome,
     notification_parent: Option<Arc<Process<Z>>>,
+}
+
+/// One process whose parent pointer was changed by a committed exit batch.
+///
+/// The process and its exact replacement reaper are retained by the enclosing
+/// [`ProcessReparentBatch`]. Consumers therefore compare stable object
+/// identities rather than PIDs which may later be reused.
+pub struct ReparentedProcess<Z> {
+    child: Arc<Process<Z>>,
+    was_zombie: bool,
+}
+
+impl<Z> ReparentedProcess<Z> {
+    /// Returns the process whose parent pointer was changed in this batch.
+    pub fn child(&self) -> &Arc<Process<Z>> {
+        &self.child
+    }
+
+    /// Returns whether the child had already published zombie state when it
+    /// was moved. Adapters commonly use this to wake the new wait parent.
+    pub fn was_zombie(&self) -> bool {
+        self.was_zombie
+    }
+}
+
+/// Allocation-free handoff for one process-exit reparent topology section.
+///
+/// Every child in the batch was moved to [`reaper`](Self::reaper) while the
+/// process-domain topology lock was held. The batch is constructed from fixed
+/// stack storage and is delivered only after every core topology, thread-group,
+/// and parent-pointer guard has been released. Different batches from the same
+/// exit may name different reapers if a selected subreaper exits or changes
+/// state between bounded topology sections.
+pub struct ProcessReparentBatch<Z> {
+    reaper: Arc<Process<Z>>,
+    reparented: [Option<ReparentedProcess<Z>>; REPARENT_BATCH_LIMIT],
+    len: usize,
+}
+
+impl<Z> ProcessReparentBatch<Z> {
+    /// Returns the exact process selected as reaper for this core transaction.
+    pub fn reaper(&self) -> &Arc<Process<Z>> {
+        &self.reaper
+    }
+
+    /// Iterates only processes whose parent pointer was actually replaced.
+    pub fn reparented(&self) -> impl ExactSizeIterator<Item = &ReparentedProcess<Z>> {
+        self.reparented[..self.len].iter().map(|entry| {
+            entry
+                .as_ref()
+                .expect("reparent batch prefix is initialized")
+        })
+    }
+
+    /// Returns the number of processes actually moved in this batch.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns whether this batch moved no process parent pointers.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl<Z> CommittedProcessExit<Z> {
@@ -1153,9 +1283,27 @@ impl<Z> ProcessExitAdmission<Z> {
     /// Publishes the durable payload, transitions to zombie state, and
     /// reparents children without allocation or a recoverable error.
     pub fn commit(
+        self,
+        payload: Arc<Z>,
+        inherited_zombie: impl FnMut(Arc<Process<Z>>),
+    ) -> CommittedProcessExit<Z> {
+        self.commit_with_reparent_handoff(payload, inherited_zombie, |_| {})
+    }
+
+    /// Publishes the durable payload and hands every authoritative child to
+    /// reaper mapping to an adapter after releasing all core topology guards.
+    ///
+    /// `reparent_batch` may allocate, destroy arbitrary adapter objects, or
+    /// acquire sleepable locks because it is never invoked under a core spin
+    /// guard. Core-owned `Arc` and `Weak` values displaced while a topology
+    /// section is active are retained in fixed stack slots and destroyed only
+    /// after that section has ended. The callback must consume each batch
+    /// synchronously; retaining identities requires explicitly cloning them.
+    pub fn commit_with_reparent_handoff(
         mut self,
         payload: Arc<Z>,
         mut inherited_zombie: impl FnMut(Arc<Process<Z>>),
+        mut reparent_batch: impl FnMut(&ProcessReparentBatch<Z>),
     ) -> CommittedProcessExit<Z> {
         // Job-control replacement and the zombie state transition share this
         // topology lock. The nested lifecycle order is topology -> thread
@@ -1192,28 +1340,74 @@ impl<Z> ProcessExitAdmission<Z> {
         let mut children = self.registry.processes_through_current_max();
         let mut finished = false;
         while !finished {
+            let mut reparented = [const { None }; REPARENT_BATCH_LIMIT];
+            let mut retired_scanned = [const { None }; REPARENT_BATCH_LIMIT];
+            let mut retired_parents = [const { None }; REPARENT_BATCH_LIMIT];
+            let mut retired_terminal = None;
             let topology = self.registry.topology.lock();
-            let reaper = select_reaper_for_exit_locked(&self.process, &self.init);
-            let reaper = Arc::downgrade(&reaper);
-            let mut moved_zombie = None;
+            let selection = select_reaper_for_exit_locked(&self.process, &self.init);
+            let reaper = selection.reaper;
+            let retired_first_ancestor = selection.retired_first_ancestor;
+            let reaper_weak = Arc::downgrade(&reaper);
+            let mut reparented_len = 0;
+            let mut retired_scanned_len = 0;
             let mut batch_len = 0;
             while batch_len < REPARENT_BATCH_LIMIT {
-                let Some(child) = children.next() else {
-                    finished = true;
-                    break;
+                let child = match children.next_raw() {
+                    ProcessCursorStep::Process(child) => child,
+                    ProcessCursorStep::Finished(retired) => {
+                        retired_terminal = retired;
+                        finished = true;
+                        break;
+                    }
                 };
                 batch_len += 1;
-                let moved = reparent_if_owned(&child, &self.process, &reaper);
-                if moved && child.is_zombie() {
-                    moved_zombie = Some(child);
-                    break;
+                if !child.published.load(Ordering::Acquire) {
+                    retired_scanned[retired_scanned_len] = Some(child);
+                    retired_scanned_len += 1;
+                    continue;
+                }
+                if let Some(old_parent) = reparent_if_owned(&child, &self.process, &reaper_weak) {
+                    let was_zombie = child.is_zombie();
+                    retired_parents[reparented_len] = Some(old_parent);
+                    reparented[reparented_len] = Some(ReparentedProcess { child, was_zombie });
+                    reparented_len += 1;
+                    if was_zombie {
+                        // Preserve the existing prompt inherited-zombie wakeup
+                        // boundary instead of delaying it behind a full batch.
+                        break;
+                    }
+                } else {
+                    retired_scanned[retired_scanned_len] = Some(child);
+                    retired_scanned_len += 1;
                 }
             }
             #[cfg(test)]
             MAX_REPARENT_BATCH_OBSERVED.fetch_max(batch_len, Ordering::Relaxed);
             drop(topology);
-            if let Some(child) = moved_zombie {
-                inherited_zombie(child);
+
+            // Weak/Arc reference-count decrements, arbitrary adapter work, and
+            // inherited-zombie notification all happen after the IRQ-disabled
+            // core topology section. The fixed arrays themselves never allocate.
+            drop(reaper_weak);
+            drop(retired_parents);
+            drop(retired_scanned);
+            drop(retired_terminal);
+            drop(retired_first_ancestor);
+
+            if reparented_len != 0 {
+                let batch = ProcessReparentBatch {
+                    reaper,
+                    reparented,
+                    len: reparented_len,
+                };
+                reparent_batch(&batch);
+                for moved in batch.reparented().filter(|moved| moved.was_zombie()) {
+                    inherited_zombie(moved.child().clone());
+                }
+                drop(batch);
+            } else {
+                drop(reaper);
             }
         }
 
@@ -1303,54 +1497,71 @@ impl<Z> Iterator for Processes<'_, Z> {
 /// construction. Used by multi-section exit reparenting.
 struct ProcessesThroughCurrentMax<'a, Z> {
     registry: &'a ProcessRegistry<Z>,
-    last: Option<Arc<Process<Z>>>,
     after: Option<Pid>,
     upper_bound: Option<Pid>,
     finished: bool,
+}
+
+enum ProcessCursorStep<Z> {
+    Process(Arc<Process<Z>>),
+    /// The optional process lies above the cursor's captured maximum and is
+    /// returned to the caller so its `Arc` can be destroyed outside a topology
+    /// section.
+    Finished(Option<Arc<Process<Z>>>),
+}
+
+impl<Z> ProcessesThroughCurrentMax<'_, Z> {
+    fn next_raw(&mut self) -> ProcessCursorStep<Z> {
+        let Some(upper_bound) = self.upper_bound else {
+            self.finished = true;
+            return ProcessCursorStep::Finished(None);
+        };
+        if self.finished {
+            return ProcessCursorStep::Finished(None);
+        }
+
+        let state = self.registry.state.lock();
+        let next = if let Some(after) = self.after.as_ref() {
+            state
+                .entries
+                .lower_bound(Bound::Excluded(after))
+                .clone_pointer()
+        } else {
+            state.entries.front().clone_pointer()
+        };
+        drop(state);
+
+        let Some(next) = next else {
+            self.finished = true;
+            return ProcessCursorStep::Finished(None);
+        };
+        if next.pid > upper_bound {
+            self.finished = true;
+            return ProcessCursorStep::Finished(Some(next));
+        }
+        self.after = Some(next.pid);
+        ProcessCursorStep::Process(next)
+    }
 }
 
 impl<Z> Iterator for ProcessesThroughCurrentMax<'_, Z> {
     type Item = Arc<Process<Z>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let upper_bound = self.upper_bound?;
-        while !self.finished {
-            let state = self.registry.state.lock();
-            let next = if let Some(last) = self
-                .last
-                .as_ref()
-                .filter(|last| last.registry_link.is_linked())
-            {
-                // SAFETY: a linked node with matching registry identity is in
-                // this tree; the state lock prevents concurrent removal.
-                let mut cursor = unsafe { state.entries.cursor_from_ptr(Arc::as_ptr(last)) };
-                cursor.move_next();
-                cursor.clone_pointer()
-            } else if let Some(after) = self.after.as_ref() {
-                state
-                    .entries
-                    .lower_bound(Bound::Excluded(after))
-                    .clone_pointer()
-            } else {
-                state.entries.front().clone_pointer()
-            };
-            drop(state);
-
-            let Some(next) = next.filter(|process| process.pid <= upper_bound) else {
-                self.finished = true;
-                break;
-            };
-            self.after = Some(next.pid);
-            let last = self.last.replace(next.clone());
-            drop(last);
-            if next.published.load(Ordering::Acquire) {
-                return Some(next);
+        loop {
+            match self.next_raw() {
+                ProcessCursorStep::Process(process) => {
+                    if process.published.load(Ordering::Acquire) {
+                        return Some(process);
+                    }
+                    drop(process);
+                }
+                ProcessCursorStep::Finished(retired) => {
+                    drop(retired);
+                    return None;
+                }
             }
         }
-
-        let last = self.last.take();
-        drop(last);
-        None
     }
 }
 
@@ -2078,11 +2289,9 @@ mod tests {
         child.commit();
 
         *child_process.parent.lock() = Arc::downgrade(&second_process);
-        assert!(!reparent_if_owned(
-            &child_process,
-            &first_process,
-            &Arc::downgrade(&init),
-        ));
+        assert!(
+            reparent_if_owned(&child_process, &first_process, &Arc::downgrade(&init),).is_none()
+        );
         assert!(Arc::ptr_eq(
             &child_process.parent().unwrap(),
             &second_process
