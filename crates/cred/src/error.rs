@@ -12,6 +12,8 @@ pub enum CredError {
     NotPermitted,
     /// A required allocation could not be completed.
     NoMemory,
+    /// A bounded credential or namespace resource is exhausted.
+    Capacity,
 }
 
 impl fmt::Display for CredError {
@@ -20,6 +22,7 @@ impl fmt::Display for CredError {
             Self::InvalidInput => f.write_str("invalid credential input"),
             Self::NotPermitted => f.write_str("credential operation not permitted"),
             Self::NoMemory => f.write_str("credential allocation failed"),
+            Self::Capacity => f.write_str("credential resource capacity exhausted"),
         }
     }
 }

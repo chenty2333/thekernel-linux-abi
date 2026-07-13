@@ -15,13 +15,15 @@ thekernel-linux-process   (independent)
 thekernel-linux-usercopy  (independent)
 ```
 
-Credentials are an independent leaf. The first extraction slice owns typed
-kernel/user IDs, immutable bidirectional ID maps, immutable credential values,
-capability-set invariants, and namespace-capability topology policy. It does
-not own a concrete user namespace, credential publication slot, process, VFS,
-signal, MM, security-hook registry, exec transaction, syscall, or errno type.
-Its nightly `allocator_api` requirement is a fallible-allocation toolchain
-constraint, not a dependency on `kspin` or any kernel synchronization crate.
+Credentials are an independent leaf. The extraction owns typed kernel/user
+IDs, immutable bidirectional ID maps, immutable credential values,
+capability-set invariants, namespace-capability topology policy, and a
+lock-neutral namespace core for hierarchy, owner, map, and setgroups state. It
+does not own the embedding namespace allocation/lock/lifetime extension,
+credential publication slot, process, VFS, signal, MM, security-hook registry,
+exec transaction, syscall, or errno type. Its nightly `allocator_api`
+requirement is a fallible-allocation toolchain constraint, not a dependency on
+`kspin` or any kernel synchronization crate.
 
 VFS and FD accept typed caller snapshots rather than depending on a
 credential, signal, or generic mechanism package. MM may depend on credentials,

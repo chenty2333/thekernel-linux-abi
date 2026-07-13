@@ -10,11 +10,16 @@
   permitted, inheritable, bounding, ambient, securebits, group, and
   `no_new_privs` invariants.
 - Add namespace-capability decisions over immutable caller-provided namespace
-  topology without owning a concrete namespace or process registry.
+  topology without owning a process registry.
+- Add a lock-neutral user-namespace domain and map state for bounded hierarchy,
+  creator ownership, one-write UID/GID publication from borrowed immutable
+  replacements, snapshot-stable empty maps, and irreversible `setgroups`
+  policy.
 - Introduce non-exhaustive `CredError` values so adapters retain control of
   errno mapping.
-- Keep the crate independent of process, VFS, signal, FD, MM, usercopy,
-  `kspin`, syscall, and concrete publication mechanisms.
+- Keep namespace locks, lifetime admission, procfs identity, and signal
+  accounting in the kernel extension, preserving independence from process,
+  VFS, signal, FD, MM, usercopy, `kspin`, and syscall mechanisms.
 - Declare and test the package as nightly-only while fallible standard `Arc`
   allocation requires `allocator_api`.
 - Record the exact TheKernel baseline, RFC contract, and Linux/FreeBSD research

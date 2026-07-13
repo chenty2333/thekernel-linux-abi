@@ -2,8 +2,8 @@
 //!
 //! This crate contains no syscall glue and owns no process, signal, VFS,
 //! file-descriptor, memory-management, or usercopy state. Kernel adapters map
-//! [`CredError`] into their local errno type and explicitly own all namespace
-//! publication policy.
+//! [`CredError`] into their local errno type and explicitly own namespace
+//! synchronization, lifetime admission, and subsystem extensions.
 
 #![no_std]
 #![feature(allocator_api)]
@@ -14,6 +14,7 @@ extern crate alloc;
 mod credential;
 mod error;
 mod idmap;
+mod namespace;
 
 pub use credential::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, Credential, CredentialIds,
@@ -26,4 +27,8 @@ pub use error::CredError;
 pub use idmap::{
     ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
     validate_id_map_input,
+};
+pub use namespace::{
+    USER_NAMESPACE_MAX_CREATION_PARENT_LEVEL, USER_NAMESPACE_OVERFLOW_ID, UserNamespaceDomain,
+    UserNamespaceMapState,
 };

@@ -26,11 +26,12 @@ package; inventing `Cargo.toml.orig` or `.cargo_vcs_info.json` would
 misrepresent its provenance.
 
 The baseline contains the full in-kernel Credential v2 integration. Version
-0.1.0 of this crate extracts only the independent value and topology-policy
-slice: typed IDs and ID maps, immutable credential/capability values, and
-namespace-capability decisions over caller-provided immutable views. Concrete
-user-namespace ownership, publication, accounting, exec transitions, security
-hooks, and subsystem adapters remain outside this crate.
+0.1.0 of this crate extracts the independent value and topology-policy slice:
+typed IDs and ID maps, immutable credential/capability values,
+namespace-capability decisions, and a lock-neutral concrete namespace core for
+hierarchy, owner, map, and setgroups state. Namespace synchronization,
+lifetime admission, procfs identity, signal accounting, exec transitions,
+security hooks, and subsystem adapters remain outside this crate.
 
 ## RFC 0001 research snapshots
 
@@ -52,7 +53,8 @@ copy their source.
 ## Independent-leaf boundary
 
 `thekernel-linux-cred` has no dependency edge to process, VFS, signal, FD, MM,
-usercopy, `kspin`, or a syscall/errno package. Consumers own mutable namespace
-domains, credential slots, synchronization, security-hook registries, exec/MM
-effects, and cross-subsystem publication. Future MM policy may depend on this
-leaf; this leaf must not depend back on MM or another consumer.
+usercopy, `kspin`, or a syscall/errno package. Consumers own namespace locks,
+lifetime/resource admission and extensions, credential slots, security-hook
+registries, exec/MM effects, and cross-subsystem publication. Future MM policy
+may depend on this leaf; this leaf must not depend back on MM or another
+consumer.

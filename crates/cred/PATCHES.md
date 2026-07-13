@@ -22,19 +22,23 @@
 
 - Replace raw IDs and kernel-local `AxError` values with typed IDs and a
   non-exhaustive, adapter-mapped `CredError`.
-- Replace a concrete mutable `UserNamespace` with immutable ID-map values and
-  a caller-provided namespace topology view.
+- Split the concrete mutable `UserNamespace` into a lock-neutral domain/map
+  core and a caller-provided synchronized wrapper/topology view.
 - Use fallible `Vec` and `Arc` construction so allocation failure is explicit
   and occurs before a consumer publishes state.
 - Separate pure credential/capability invariants and topology authorization
   from process state, locks, global registries, syscalls, and errno mapping.
+- Move immutable namespace hierarchy/owner facts and UID/GID/setgroups
+  publication state into a lock-neutral core. Publication borrows a fully
+  built replacement and clones it into an unused slot, so no caller or prior
+  map owner can be destroyed by the guarded operation.
 - Declare the `allocator_api` nightly requirement without inventing a `kspin`
   dependency; synchronization remains a consumer decision.
 
 ## Deliberately not extracted or frozen
 
-- concrete user-namespace construction, lifetime limits, map publication,
-  `setgroups` state, and signal-pending accounting;
+- embedding user-namespace allocation, lifetime limits, synchronization,
+  procfs identity, and signal-pending accounting;
 - credential-slot synchronization, generation handling, and task attachment;
 - executable leases, file-capability parsing, set-ID/exec derivation,
   dumpability and parent-death-signal effects;
