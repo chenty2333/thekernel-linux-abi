@@ -15,6 +15,9 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 - typed ptrace, traceme, and scheduler authorization contexts over immutable
   credentials and caller-owned opaque object identities, with policy-neutral
   commoncap decisions and no caller-supplied ownership shortcut;
+- typed signal source, delivery-scope, and validated-number values plus an
+  opaque core-authorization proof bound to the exact actor/target credentials
+  and caller-owned target identity;
 - immutable credential and capability-set values whose invariants are checked
   before publication by a consumer;
 - ordinary transitions represented by an opaque proposal bound to the exact
@@ -25,7 +28,7 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 
 The crate owns a concrete namespace *policy core*, but not the embedding
 namespace wrapper, synchronization, lifetime admission, procfs identity, or
-signal accounting extension. It also does not own a credential publication
+signal queue/accounting extension. It also does not own a credential publication
 slot, process, VFS object, signal queue, address space, security-hook registry
 or dispatch, executable lease, exec publication transaction, xattr store,
 syscall, or errno type. A kernel adapter selects the lock, prebuilds immutable

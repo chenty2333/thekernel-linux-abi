@@ -36,6 +36,10 @@
   typed scheduler operations whose ownership relation is derived internally,
   and policy-neutral commoncap authorization errors preserving `EPERM` versus
   `EACCES` adapter choices.
+- Add typed userspace signal sources and thread/thread-group delivery scopes,
+  a bounded validated Linux signal number, and an opaque core-authorization
+  proof which retains the exact immutable actor/target pair through policy
+  context construction.
 - Introduce non-exhaustive `CredError` values so adapters retain control of
   errno mapping.
 - Keep namespace locks, lifetime admission, procfs identity, and signal

@@ -49,5 +49,7 @@ pub use namespace::{
 pub use security::{
     AuthorizationError, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
     PtraceTracemeContext, SchedulerSecurityContext, SchedulerSecurityOperation,
+    SignalCoreAuthorization, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
+    SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, authorize_signal_core,
     commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler,
 };

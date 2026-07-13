@@ -6,9 +6,9 @@
 //! lock, publication mechanism, or errno mapping.
 
 use alloc::sync::Arc;
-use core::fmt;
+use core::{fmt, num::NonZeroU32};
 
-use linux_raw_sys::general::{CAP_SYS_NICE, CAP_SYS_PTRACE};
+use linux_raw_sys::general::{CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT};
 
 use crate::{CAPABILITY_WORDS, Credential, UserNamespaceView, ns_capable};
 
@@ -311,6 +311,312 @@ pub fn commoncap_ptrace_traceme<N: UserNamespaceView, O: ?Sized>(
     }
 }
 
+/// Origin class for one userspace-requested signal authorization.
+///
+/// This is intentionally narrower than a raw `siginfo_t`: the embedding ABI
+/// adapter validates and resolves userspace records first, then preserves only
+/// the source facts a policy module can safely consume without retaining a
+/// userspace pointer or repeating usercopy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalSecuritySource {
+    /// `kill(2)` and its process-group or broadcast forms.
+    Kill,
+    /// `tkill(2)` or `tgkill(2)`.
+    Thread,
+    /// `rt_sigqueueinfo(2)` or `rt_tgsigqueueinfo(2)` with its validated code.
+    Queued {
+        /// Frozen `si_code` copied from the mandatory userspace record.
+        code: i32,
+    },
+    /// `pidfd_send_signal(2)` with its validated optional `siginfo_t` code.
+    PidFd {
+        /// Frozen supplied or kernel-synthesized `si_code`.
+        code: i32,
+    },
+}
+
+/// Publication scope after an exact target task passes authorization.
+///
+/// Linux can authorize a named non-leader task while publishing to that
+/// task's shared thread-group pending queue, so this is deliberately separate
+/// from source and object identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalDeliveryScope {
+    /// Publish to the target task's thread group/shared pending queue.
+    ThreadGroup,
+    /// Publish only to the exact target task's private pending queue.
+    Thread,
+}
+
+/// Valid Linux signal number accepted by the typed security contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SignalNumber(NonZeroU32);
+
+impl SignalNumber {
+    /// Highest signal number in the Linux 64-signal ABI set.
+    pub const MAX: u32 = 64;
+
+    /// Validates a raw Linux signal number.
+    pub const fn try_new(raw: u32) -> Option<Self> {
+        if raw > Self::MAX {
+            return None;
+        }
+        match NonZeroU32::new(raw) {
+            Some(raw) => Some(Self(raw)),
+            None => None,
+        }
+    }
+
+    /// Returns the validated raw Linux signal number.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// One already-validated userspace signal request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalSecurityOperation {
+    signal: Option<SignalNumber>,
+    source: SignalSecuritySource,
+    delivery_scope: SignalDeliveryScope,
+}
+
+impl SignalSecurityOperation {
+    /// Constructs a signal-zero existence/permission probe.
+    pub const fn probe(source: SignalSecuritySource, delivery_scope: SignalDeliveryScope) -> Self {
+        Self {
+            signal: None,
+            source,
+            delivery_scope,
+        }
+    }
+
+    /// Constructs a request to send one already-validated nonzero signal.
+    pub const fn send(
+        signal: SignalNumber,
+        source: SignalSecuritySource,
+        delivery_scope: SignalDeliveryScope,
+    ) -> Self {
+        Self {
+            signal: Some(signal),
+            source,
+            delivery_scope,
+        }
+    }
+
+    /// Constructs the corresponding probe or send operation.
+    pub const fn from_optional_signal(
+        signal: Option<SignalNumber>,
+        source: SignalSecuritySource,
+        delivery_scope: SignalDeliveryScope,
+    ) -> Self {
+        match signal {
+            Some(signal) => Self::send(signal, source, delivery_scope),
+            None => Self::probe(source, delivery_scope),
+        }
+    }
+
+    /// Returns the requested signal, or `None` for a signal-zero probe.
+    pub const fn signal(self) -> Option<SignalNumber> {
+        self.signal
+    }
+
+    /// Fallibly constructs a send operation from an untrusted raw number.
+    /// Embedding adapters which already parsed a signal should prefer
+    /// [`Self::send`] and carry [`SignalNumber`] directly.
+    pub const fn try_send(
+        signal: u32,
+        source: SignalSecuritySource,
+        delivery_scope: SignalDeliveryScope,
+    ) -> Option<Self> {
+        match SignalNumber::try_new(signal) {
+            Some(signal) => Some(Self::send(signal, source, delivery_scope)),
+            None => None,
+        }
+    }
+
+    /// Returns the frozen userspace request source.
+    pub const fn source(self) -> SignalSecuritySource {
+        self.source
+    }
+
+    /// Returns the frozen publication scope.
+    pub const fn delivery_scope(self) -> SignalDeliveryScope {
+        self.delivery_scope
+    }
+}
+
+/// Linux core rule which admitted a signal request before policy hooks run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalCoreAuthorizationReason {
+    /// Actor and target belong to the same Linux thread group.
+    SameThreadGroup,
+    /// A real/effective actor UID matches the target real/saved UID.
+    CredentialMatch,
+    /// The actor holds `CAP_KILL` over the target credential namespace.
+    Capability,
+    /// A `SIGCONT` request crosses credentials within the same session.
+    SigcontSameSession,
+}
+
+/// Opaque proof that Linux's non-LSM signal permission rule admitted one exact
+/// immutable actor/target pair.
+///
+/// The token borrows both credentials and carries the normalized operation, so
+/// it cannot be rebound to a later credential snapshot before construction of
+/// [`SignalSecurityContext`].
+pub struct SignalCoreAuthorization<'a, N: UserNamespaceView> {
+    actor: &'a Credential<N>,
+    target: &'a Credential<N>,
+    operation: SignalSecurityOperation,
+    reason: SignalCoreAuthorizationReason,
+    same_thread_group: bool,
+    sigcont_same_session: bool,
+}
+
+impl<'a, N: UserNamespaceView> SignalCoreAuthorization<'a, N> {
+    /// Borrows the exact immutable actor credential admitted by the core rule.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact immutable target credential admitted by the core rule.
+    pub const fn target(&self) -> &'a Credential<N> {
+        self.target
+    }
+
+    /// Returns the frozen signal operation.
+    pub const fn operation(&self) -> SignalSecurityOperation {
+        self.operation
+    }
+
+    /// Returns the core rule which admitted this request.
+    pub const fn reason(&self) -> SignalCoreAuthorizationReason {
+        self.reason
+    }
+
+    /// Returns the already-resolved same-thread-group fact.
+    pub const fn same_thread_group(&self) -> bool {
+        self.same_thread_group
+    }
+
+    /// Returns whether the request is `SIGCONT` and both processes share one
+    /// already-resolved session identity.
+    pub const fn sigcont_same_session(&self) -> bool {
+        self.sigcont_same_session
+    }
+}
+
+/// Applies Linux's core signal permission rule before stacked policy hooks.
+///
+/// Same-thread-group admission is checked first. Otherwise the actor's real or
+/// effective UID must match the target's real or saved UID, the actor must hold
+/// `CAP_KILL` over the target namespace, or `SIGCONT` must target the same
+/// already-resolved session. The session fact is ignored for every other
+/// signal and for a signal-zero probe.
+///
+/// # Errors
+///
+/// Returns [`AuthorizationError::NotPermitted`] when none of the core rules
+/// admits the exact immutable credential pair.
+pub fn authorize_signal_core<'a, N: UserNamespaceView>(
+    actor: &'a Credential<N>,
+    target: &'a Credential<N>,
+    operation: SignalSecurityOperation,
+    same_thread_group: bool,
+    same_session: bool,
+) -> Result<SignalCoreAuthorization<'a, N>, AuthorizationError> {
+    let actor_ids = actor.ids();
+    let target_ids = target.ids();
+    let credential_match = [actor_ids.ruid, actor_ids.euid]
+        .into_iter()
+        .any(|uid| uid == target_ids.ruid || uid == target_ids.suid);
+    let sigcont_same_session = operation
+        .signal
+        .is_some_and(|signal| signal.get() == SIGCONT)
+        && same_session;
+    let reason = if same_thread_group {
+        SignalCoreAuthorizationReason::SameThreadGroup
+    } else if credential_match {
+        SignalCoreAuthorizationReason::CredentialMatch
+    } else if ns_capable(actor, target.user_ns(), CAP_KILL) {
+        SignalCoreAuthorizationReason::Capability
+    } else if sigcont_same_session {
+        SignalCoreAuthorizationReason::SigcontSameSession
+    } else {
+        return Err(AuthorizationError::NotPermitted);
+    };
+    Ok(SignalCoreAuthorization {
+        actor,
+        target,
+        operation,
+        reason,
+        same_thread_group,
+        sigcont_same_session,
+    })
+}
+
+/// Complete immutable input to one stacked signal policy hook.
+///
+/// `O` is an embedding-owned identity for the exact live thread, process, or
+/// durable zombie selected before dispatch. The context can only be built from
+/// a successful [`authorize_signal_core`] token, preserving the Linux ordering
+/// between core signal permission and policy-module authorization.
+pub struct SignalSecurityContext<'a, N: UserNamespaceView, O: ?Sized> {
+    authorization: SignalCoreAuthorization<'a, N>,
+    target_object: &'a O,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> SignalSecurityContext<'a, N, O> {
+    /// Binds a successful core authorization to one exact target object.
+    pub const fn new(authorization: SignalCoreAuthorization<'a, N>, target_object: &'a O) -> Self {
+        Self {
+            authorization,
+            target_object,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.authorization.actor
+    }
+
+    /// Borrows the exact immutable target credential.
+    pub const fn target(&self) -> &'a Credential<N> {
+        self.authorization.target
+    }
+
+    /// Borrows the target credential's owning user namespace.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.authorization.target.user_ns()
+    }
+
+    /// Borrows the embedding-defined exact target object identity.
+    pub const fn target_object(&self) -> &'a O {
+        self.target_object
+    }
+
+    /// Returns the frozen userspace signal operation.
+    pub const fn operation(&self) -> SignalSecurityOperation {
+        self.authorization.operation
+    }
+
+    /// Returns the Linux core rule which admitted the request.
+    pub const fn core_reason(&self) -> SignalCoreAuthorizationReason {
+        self.authorization.reason
+    }
+
+    /// Returns the already-resolved same-thread-group fact.
+    pub const fn same_thread_group(&self) -> bool {
+        self.authorization.same_thread_group
+    }
+
+    /// Returns the already-resolved `SIGCONT` same-session fact.
+    pub const fn sigcont_same_session(&self) -> bool {
+        self.authorization.sigcont_same_session
+    }
+}
+
 fn valid_rlimit_nice(rlimit_nice: u64) -> Option<u64> {
     (rlimit_nice <= 40).then_some(rlimit_nice)
 }
@@ -371,7 +677,7 @@ mod tests {
 
     use alloc::{string::ToString, sync::Arc, vec};
 
-    use linux_raw_sys::general::{CAP_CHOWN, CAP_SYS_NICE, CAP_SYS_PTRACE};
+    use linux_raw_sys::general::{CAP_CHOWN, CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGTERM};
 
     use super::*;
     use crate::{
@@ -833,6 +1139,169 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn signal_core_authorization_covers_probe_identity_capability_and_group_rules() {
+        let namespace = MockNamespace::root();
+        let root = root_credential(namespace);
+        let actor = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let unrelated = credential_with_identity_and_caps(&root, 2000, &[], &[]);
+        let probe = SignalSecurityOperation::probe(
+            SignalSecuritySource::Kill,
+            SignalDeliveryScope::ThreadGroup,
+        );
+
+        assert_eq!(
+            authorize_signal_core(&actor, &unrelated, probe, false, false).err(),
+            Some(AuthorizationError::NotPermitted)
+        );
+        let same_group = authorize_signal_core(&actor, &unrelated, probe, true, false).unwrap();
+        assert_eq!(
+            same_group.reason(),
+            SignalCoreAuthorizationReason::SameThreadGroup
+        );
+        assert!(same_group.same_thread_group());
+
+        let mut saved_ids = unrelated.ids();
+        saved_ids.suid = actor.ids().euid;
+        let saved_match = Credential::try_from_transition(
+            &unrelated,
+            saved_ids,
+            unrelated.groups().clone(),
+            unrelated.capabilities(),
+            unrelated.no_new_privs(),
+            unrelated.user_ns().clone(),
+            CredentialTransitionMode::Normal,
+        )
+        .unwrap();
+        assert_eq!(
+            authorize_signal_core(&actor, &saved_match, probe, false, false)
+                .unwrap()
+                .reason(),
+            SignalCoreAuthorizationReason::CredentialMatch
+        );
+
+        let capable = credential_with_identity_and_caps(&root, 3000, &[CAP_KILL], &[CAP_KILL]);
+        assert_eq!(
+            authorize_signal_core(&capable, &unrelated, probe, false, false)
+                .unwrap()
+                .reason(),
+            SignalCoreAuthorizationReason::Capability
+        );
+    }
+
+    #[test]
+    fn signal_core_uses_same_session_only_for_sigcont() {
+        let namespace = MockNamespace::root();
+        let root = root_credential(namespace);
+        let actor = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let target = credential_with_identity_and_caps(&root, 2000, &[], &[]);
+
+        let sigcont = SignalSecurityOperation::send(
+            SignalNumber::try_new(SIGCONT).unwrap(),
+            SignalSecuritySource::Queued { code: -1 },
+            SignalDeliveryScope::ThreadGroup,
+        );
+        let authorization = authorize_signal_core(&actor, &target, sigcont, false, true).unwrap();
+        assert_eq!(
+            authorization.reason(),
+            SignalCoreAuthorizationReason::SigcontSameSession
+        );
+        assert!(authorization.sigcont_same_session());
+
+        let ordinary = SignalSecurityOperation::send(
+            SignalNumber::try_new(SIGTERM).unwrap(),
+            SignalSecuritySource::Kill,
+            SignalDeliveryScope::ThreadGroup,
+        );
+        assert_eq!(
+            authorize_signal_core(&actor, &target, ordinary, false, true).err(),
+            Some(AuthorizationError::NotPermitted)
+        );
+        assert_eq!(
+            authorize_signal_core(
+                &actor,
+                &target,
+                SignalSecurityOperation::probe(
+                    SignalSecuritySource::Kill,
+                    SignalDeliveryScope::ThreadGroup,
+                ),
+                false,
+                true,
+            )
+            .err(),
+            Some(AuthorizationError::NotPermitted)
+        );
+    }
+
+    #[test]
+    fn signal_context_binds_exact_credentials_operation_owner_and_object() {
+        let namespace = MockNamespace::root();
+        let root = root_credential(namespace.clone());
+        let actor = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let target = credential_with_identity_and_caps(&root, 2000, &[], &[]);
+        let operation = SignalSecurityOperation::send(
+            SignalNumber::try_new(SIGTERM).unwrap(),
+            SignalSecuritySource::PidFd { code: -6 },
+            SignalDeliveryScope::Thread,
+        );
+        let authorization = authorize_signal_core(&actor, &target, operation, true, false).unwrap();
+        let object = DummyHandle {
+            cookie: "pidfd-target",
+        };
+        let context = SignalSecurityContext::new(authorization, &object);
+
+        assert!(core::ptr::eq(context.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(context.target(), target.as_ref()));
+        assert!(Arc::ptr_eq(context.target_owner_user_ns(), &namespace));
+        assert!(core::ptr::eq(context.target_object(), &object));
+        assert_eq!(context.target_object().cookie, "pidfd-target");
+        assert_eq!(context.operation(), operation);
+        assert_eq!(
+            context.core_reason(),
+            SignalCoreAuthorizationReason::SameThreadGroup
+        );
+        assert!(context.same_thread_group());
+        assert!(!context.sigcont_same_session());
+    }
+
+    #[test]
+    fn signal_send_construction_rejects_zero_and_preserves_nonzero() {
+        assert_eq!(
+            SignalSecurityOperation::try_send(
+                0,
+                SignalSecuritySource::Thread,
+                SignalDeliveryScope::Thread,
+            ),
+            None
+        );
+        let signal = SignalSecurityOperation::try_send(
+            15,
+            SignalSecuritySource::Thread,
+            SignalDeliveryScope::Thread,
+        )
+        .unwrap();
+        assert_eq!(signal.signal(), SignalNumber::try_new(15));
+        assert_eq!(signal.source(), SignalSecuritySource::Thread);
+        assert_eq!(signal.delivery_scope(), SignalDeliveryScope::Thread);
+    }
+
+    #[test]
+    fn signal_number_bounds_are_exact() {
+        assert_eq!(SignalNumber::try_new(0), None);
+        assert_eq!(SignalNumber::try_new(1).unwrap().get(), 1);
+        assert_eq!(SignalNumber::try_new(64).unwrap().get(), 64);
+        assert_eq!(SignalNumber::try_new(65), None);
+        assert_eq!(SignalNumber::try_new(u32::MAX), None);
+        assert_eq!(
+            SignalSecurityOperation::try_send(
+                65,
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            None
+        );
     }
 
     #[test]

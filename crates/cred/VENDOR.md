@@ -45,8 +45,8 @@ The Credential v2 contract was checked on 2026-07-11 against:
 - Linux `dd3210c47e8d3ac6b4e9141fc68acc03b38c0ba3`, especially
   `include/linux/cred.h`, `kernel/cred.c`, `include/linux/uidgid.h`,
   `include/linux/user_namespace.h`, `kernel/user_namespace.c`,
-  `security/commoncap.c`, `security/security.c`, `include/linux/lsm_hooks.h`,
-  and `include/linux/lsm_hook_defs.h`; and
+  `kernel/signal.c`, `security/commoncap.c`, `security/security.c`,
+  `include/linux/lsm_hooks.h`, and `include/linux/lsm_hook_defs.h`; and
 - FreeBSD `86691d52a6d3796ad36ba474cf0a9493f6d99202`, especially
   `sys/sys/ucred.h`, `sys/kern/kern_prot.c`, and
   `sys/security/mac/mac_framework.c`.

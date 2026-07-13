@@ -22,6 +22,9 @@
   descendants, and immediate-child owner authority, never upward or sideways.
 - Parse Linux file-capability revisions 1, 2, and 3 with exact size,
   endianness, flag, mask, and namespaced-root validation.
+- Apply Linux signal permission to one exact immutable actor/target pair,
+  including UID matching, `CAP_KILL`, same-thread-group admission, and the
+  `SIGCONT` same-session exception before stacked policy dispatch.
 
 ## 0.1.0 extraction changes
 
@@ -51,6 +54,9 @@
 - Replace kernel-object-specific ptrace/scheduler contexts and caller-supplied
   ownership booleans with immutable generic contexts; retain opaque object
   identity for stacked hooks while extracting pure commoncap rules.
+- Normalize signal-zero versus nonzero requests, source class, and delivery
+  scope into field-private values; return an opaque successful core token that
+  cannot be rebound to a different credential before a consumer hook runs.
 - Declare the `allocator_api` nightly requirement without inventing a `kspin`
   dependency; synchronization remains a consumer decision.
 
