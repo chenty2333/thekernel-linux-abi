@@ -18,6 +18,10 @@
   requiring a kernel adapter to reconstruct that policy.
 - Add namespace-capability decisions over immutable caller-provided namespace
   topology without owning a process registry.
+- Add a bounded `CapabilityNumber`, normalized ordinary/no-audit/set-ID
+  operation metadata, and a field-private successful commoncap context which
+  binds the exact actor and target namespace before stacked deny-first policy
+  dispatch without consulting a current task.
 - Add a lock-neutral user-namespace domain and map state for bounded hierarchy,
   creator ownership, one-write UID/GID publication from borrowed immutable
   replacements, snapshot-stable empty maps, and irreversible `setgroups`
@@ -43,6 +47,11 @@
   a bounded validated Linux signal number, and an opaque core-authorization
   proof which retains the exact immutable actor/target pair through policy
   context construction.
+- Add successful-only fork and user-namespace credential-publication contexts
+  over exact source/published credentials and an opaque consumer-owned target.
+  Derive the target namespace from the published credential and keep every
+  fallible preparation, authorization, visibility transaction, registry, and
+  callback scheduling decision in the embedding kernel.
 - Add policy-neutral inode-permission and file-open contexts over an exact
   actor, independently selected DAC snapshot, target-owner namespace, and
   opaque caller-owned object; normalize non-empty read/write/execute access,

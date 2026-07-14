@@ -36,6 +36,11 @@
   and occurs before a consumer publishes state.
 - Separate pure credential/capability invariants and topology authorization
   from process state, locks, global registries, syscalls, and errno mapping.
+- Replace raw capable options and unvalidated numbers with a typed operation,
+  bounded `CapabilityNumber`, and field-private successful commoncap context.
+  Bind the caller-supplied immutable actor and target namespace without
+  `current()` lookup so an embedding registry can run commoncap first and then
+  stop stacked module dispatch at the first denial.
 - Move immutable namespace hierarchy/owner facts and UID/GID/setgroups
   publication state into a lock-neutral core. Publication borrows a fully
   built replacement and clones it into an unused slot, so no caller or prior
@@ -60,6 +65,11 @@
 - Normalize signal-zero versus nonzero requests, source class, and delivery
   scope into field-private values; return an opaque successful core token that
   cannot be rebound to a different credential before a consumer hook runs.
+- Add infallible fork and user-namespace credential-publication contexts which
+  borrow the exact source/published core values and one opaque consumer target.
+  Derive the target namespace from the published credential while leaving
+  pre-publication module-state preparation/authorization, visibility ordering,
+  callback dispatch, and concurrency discipline in the embedding kernel.
 - Add field-private inode-permission and file-open values which bind the exact
   actor separately from the DAC snapshot actually selected for the operation,
   retain target-owner namespace and opaque object identity, reject empty or
@@ -134,8 +144,8 @@
 - credential-slot synchronization, generation handling, and task attachment;
 - executable leases, xattr lookup, credential writer/publication locks, and
   application of dumpability, MM-owner, ptrace, and parent-death effects;
-- security-hook registry storage, dispatch, boot freeze, notification phases,
-  and concrete kernel object wrappers;
+- security-hook registry storage, dispatch, boot freeze, publication-phase
+  enforcement, notification scheduling, and concrete kernel object wrappers;
 - VFS object/location identity, DAC and protected-hardlink adapters,
   open/link/rename transactions, process/signal/scheduler/IPC authorization
   adapters, MM, and syscall/usercopy glue; and

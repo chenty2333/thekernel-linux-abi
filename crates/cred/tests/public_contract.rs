@@ -1,22 +1,23 @@
 use std::{string::String, sync::Arc};
 
 use thekernel_linux_cred::{
-    CAPABILITY_WORDS, CredError, Credential, ExecCredentialInput, ExecDumpability, ExecFileOwner,
-    ExecImageReadability, ExecMountPrivilege, ExecTraceState, ExecUserNamespaceView,
-    FileOpenAccess, FileOpenContext, FileOpenOperation, FsCredentialSnapshot, IdMap,
-    InodeChmodIntent, InodeChownIntent, InodeCreateContext, InodeCreateMode, InodeLinkContext,
-    InodeMkdirContext, InodeMknodContext, InodeMknodKind, InodeMknodOperation,
-    InodePermissionAccess, InodePermissionContext, InodePostSetattrContext, InodeRenameContext,
-    InodeRmdirContext, InodeSetattrContext, InodeSetattrIntent, InodeSetattrMode,
-    InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext, InodeUnlinkContext,
-    InodeXattrContext, InodeXattrOperation, Kgid, Kuid, PtraceAccessContext, PtraceAccessKind,
-    PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
+    CAPABILITY_WORDS, CapabilityNumber, CapabilitySecurityOperation, CredError, Credential,
+    CredentialPublicationContext, CredentialPublicationOperation, ExecCredentialInput,
+    ExecDumpability, ExecFileOwner, ExecImageReadability, ExecMountPrivilege, ExecTraceState,
+    ExecUserNamespaceView, FileOpenAccess, FileOpenContext, FileOpenOperation,
+    FsCredentialSnapshot, IdMap, InodeChmodIntent, InodeChownIntent, InodeCreateContext,
+    InodeCreateMode, InodeLinkContext, InodeMkdirContext, InodeMknodContext, InodeMknodKind,
+    InodeMknodOperation, InodePermissionAccess, InodePermissionContext, InodePostSetattrContext,
+    InodeRenameContext, InodeRmdirContext, InodeSetattrContext, InodeSetattrIntent,
+    InodeSetattrMode, InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext,
+    InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, Kgid, Kuid, PtraceAccessContext,
+    PtraceAccessKind, PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
     SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
     SignalSecuritySource, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
-    XATTR_NAME_MAX, XattrSetFlags, XattrValueClass, authorize_signal_core,
-    commoncap_exec_transition, commoncap_ptrace_access, commoncap_ptrace_traceme,
-    commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
+    XATTR_NAME_MAX, XattrSetFlags, XattrValueClass, authorize_capability_core,
+    authorize_signal_core, commoncap_exec_transition, commoncap_ptrace_access,
+    commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
 };
 
 struct TestNamespace {
@@ -286,6 +287,69 @@ fn ptrace_scheduler_and_signal_contexts_compile_from_root_exports() {
     assert!(Arc::ptr_eq(signal.target_owner_user_ns(), &namespace));
     assert_eq!(signal.target_object().identity, "exact-security-target");
     assert_eq!(signal.operation(), signal_operation);
+}
+
+#[test]
+fn capable_and_credential_publication_contracts_are_publicly_composable() {
+    let root_namespace = TestNamespace::initial("capable-root");
+    let root = Credential::try_root(root_namespace.clone()).unwrap();
+    let capability = CapabilityNumber::try_new(0).unwrap();
+    assert_eq!(capability.get(), 0);
+    assert!(CapabilityNumber::try_new(CapabilityNumber::MAX).is_some());
+    assert_eq!(CapabilityNumber::try_new(CapabilityNumber::MAX + 1), None);
+
+    let capable = authorize_capability_core(
+        &root,
+        &root_namespace,
+        capability,
+        CapabilitySecurityOperation::UseWithoutAudit,
+    )
+    .unwrap();
+    assert!(std::ptr::eq(capable.actor(), root.as_ref()));
+    assert!(Arc::ptr_eq(capable.target_user_ns(), &root_namespace));
+    assert_eq!(capable.capability(), capability);
+    assert_eq!(
+        capable.operation(),
+        CapabilitySecurityOperation::UseWithoutAudit
+    );
+
+    let child_namespace = TestNamespace::child(&root_namespace, "capable-child", root.ids().euid);
+    let child = Credential::try_with_user_namespace(&root, child_namespace.clone()).unwrap();
+    assert_eq!(
+        authorize_capability_core(
+            &child,
+            &root_namespace,
+            capability,
+            CapabilitySecurityOperation::Use,
+        )
+        .err(),
+        Some(thekernel_linux_cred::AuthorizationError::NotPermitted)
+    );
+
+    let fork_target = NonCopyObject {
+        identity: String::from("published-fork-child"),
+    };
+    let fork = CredentialPublicationContext::fork(&root, &root, &fork_target);
+    assert!(std::ptr::eq(fork.source_credential(), root.as_ref()));
+    assert!(std::ptr::eq(fork.published_credential(), root.as_ref()));
+    assert!(Arc::ptr_eq(fork.source_user_ns(), &root_namespace));
+    assert!(Arc::ptr_eq(fork.target_user_ns(), &root_namespace));
+    assert!(std::ptr::eq(fork.target_object(), &fork_target));
+    assert_eq!(fork.operation(), CredentialPublicationOperation::Fork);
+
+    let userns_target = NonCopyObject {
+        identity: String::from("published-userns-child"),
+    };
+    let userns = CredentialPublicationContext::user_namespace(&root, &child, &userns_target);
+    assert!(std::ptr::eq(userns.source_credential(), root.as_ref()));
+    assert!(std::ptr::eq(userns.published_credential(), child.as_ref()));
+    assert!(Arc::ptr_eq(userns.source_user_ns(), &root_namespace));
+    assert!(Arc::ptr_eq(userns.target_user_ns(), &child_namespace));
+    assert!(std::ptr::eq(userns.target_object(), &userns_target));
+    assert_eq!(
+        userns.operation(),
+        CredentialPublicationOperation::UserNamespace
+    );
 }
 
 #[test]

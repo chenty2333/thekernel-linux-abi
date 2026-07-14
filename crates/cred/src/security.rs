@@ -13,11 +13,13 @@ use core::{
 };
 
 use linux_raw_sys::general::{
-    CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT, XATTR_NAME_MAX as LINUX_XATTR_NAME_MAX,
+    CAP_KILL, CAP_LAST_CAP, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT,
+    XATTR_NAME_MAX as LINUX_XATTR_NAME_MAX,
 };
 
 use crate::{
-    CAPABILITY_WORDS, Credential, FsCredentialSnapshot, Kgid, Kuid, UserNamespaceView, ns_capable,
+    CAPABILITY_WORDS, CapabilitySets, Credential, FsCredentialSnapshot, Kgid, Kuid,
+    UserNamespaceView, ns_capable,
 };
 
 /// Policy-neutral authorization failures returned by commoncap helpers.
@@ -1818,6 +1820,268 @@ impl<'a, N: UserNamespaceView, O: ?Sized> FileOpenContext<'a, N, O> {
     }
 }
 
+/// Valid Linux capability number accepted by a security-policy context.
+///
+/// Keeping the raw value behind this type prevents an invalid capability from
+/// reaching namespace-owner shortcuts or stacked policy dispatch.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityNumber(u32);
+
+impl CapabilityNumber {
+    /// Highest capability supported by the pinned Linux ABI.
+    pub const MAX: u32 = CAP_LAST_CAP;
+
+    /// Validates one raw Linux capability number.
+    pub const fn try_new(raw: u32) -> Option<Self> {
+        if CapabilitySets::cap_mask(raw).is_some() {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the validated raw Linux capability number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Normalized operation metadata for one Linux `capable` policy hook.
+///
+/// These variants replace Linux's raw `CAP_OPT_*` bits. Commoncap currently
+/// applies the same namespace/effective-set rule to all three, while stacked
+/// modules may use the frozen audit and set-ID intent.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum CapabilitySecurityOperation {
+    /// Ordinary capability use corresponding to `CAP_OPT_NONE`.
+    Use,
+    /// Capability use corresponding to `CAP_OPT_NOAUDIT`.
+    UseWithoutAudit,
+    /// A set-ID or setgroups check corresponding to `CAP_OPT_INSETID`.
+    SetId,
+}
+
+/// Successful commoncap authorization for one exact capability request.
+///
+/// The caller supplies the immutable actor credential and target namespace;
+/// this type never looks up `current`. Its fields are private, so stacked
+/// policy dispatch can only receive a context returned by
+/// [`authorize_capability_core`]. A commoncap denial therefore happens before
+/// every consumer module, and later modules may only narrow the decision by
+/// stopping at their first denial.
+///
+/// External policy code cannot forge a successful context:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use thekernel_linux_cred::{
+///     CapabilityNumber, CapabilitySecurityContext, CapabilitySecurityOperation,
+///     Credential, UserNamespaceView,
+/// };
+///
+/// fn forge<'a, N: UserNamespaceView>(
+///     actor: &'a Credential<N>,
+///     target_user_ns: &'a Arc<N>,
+/// ) -> CapabilitySecurityContext<'a, N> {
+///     CapabilitySecurityContext {
+///         actor,
+///         target_user_ns,
+///         capability: CapabilityNumber::try_new(0).unwrap(),
+///         operation: CapabilitySecurityOperation::Use,
+///     }
+/// }
+/// ```
+///
+/// The authorization cannot be rebound to a later actor or namespace:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use thekernel_linux_cred::{
+///     CapabilityNumber, CapabilitySecurityContext, CapabilitySecurityOperation,
+///     Credential, UserNamespaceView, authorize_capability_core,
+/// };
+///
+/// fn cannot_escape<'a, N: UserNamespaceView>(
+///     actor: &'a Credential<N>,
+///     target: &'a Arc<N>,
+/// ) -> CapabilitySecurityContext<'static, N> {
+///     authorize_capability_core(
+///         actor,
+///         target,
+///         CapabilityNumber::try_new(0).unwrap(),
+///         CapabilitySecurityOperation::Use,
+///     )
+///     .unwrap()
+/// }
+/// ```
+pub struct CapabilitySecurityContext<'a, N: UserNamespaceView> {
+    actor: &'a Credential<N>,
+    target_user_ns: &'a Arc<N>,
+    capability: CapabilityNumber,
+    operation: CapabilitySecurityOperation,
+}
+
+impl<'a, N: UserNamespaceView> CapabilitySecurityContext<'a, N> {
+    /// Borrows the exact immutable actor credential admitted by commoncap.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact user namespace governing the requested capability.
+    pub const fn target_user_ns(&self) -> &'a Arc<N> {
+        self.target_user_ns
+    }
+
+    /// Returns the validated requested capability.
+    pub const fn capability(&self) -> CapabilityNumber {
+        self.capability
+    }
+
+    /// Returns the frozen capability-check operation.
+    pub const fn operation(&self) -> CapabilitySecurityOperation {
+        self.operation
+    }
+}
+
+/// Applies Linux commoncap before stacked capable-policy hooks.
+///
+/// The returned field-private context is the proof that commoncap admitted the
+/// exact actor, target namespace, capability, and operation. An embedding
+/// registry passes that same context through modules in declaration order and
+/// must stop at the first denial; no module may turn a prior denial into an
+/// admission.
+///
+/// # Errors
+///
+/// Returns [`AuthorizationError::NotPermitted`] when the actor lacks the
+/// requested effective capability over `target_user_ns`.
+pub fn authorize_capability_core<'a, N: UserNamespaceView>(
+    actor: &'a Credential<N>,
+    target_user_ns: &'a Arc<N>,
+    capability: CapabilityNumber,
+    operation: CapabilitySecurityOperation,
+) -> Result<CapabilitySecurityContext<'a, N>, AuthorizationError> {
+    if !ns_capable(actor, target_user_ns, capability.get()) {
+        return Err(AuthorizationError::NotPermitted);
+    }
+    Ok(CapabilitySecurityContext {
+        actor,
+        target_user_ns,
+        capability,
+        operation,
+    })
+}
+
+/// Credential lifecycle event which has already become externally visible.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum CredentialPublicationOperation {
+    /// A separately prepared child credential became visible through fork.
+    Fork,
+    /// A child credential rooted in a newly created user namespace became visible.
+    UserNamespace,
+}
+
+/// Immutable input to an infallible credential-publication notification.
+///
+/// `O` is an embedding-defined identity for the exact child or publication
+/// target which became visible. The context binds it to the immutable source
+/// and published credentials; the target namespace is derived from the latter
+/// and cannot be supplied independently. Constructors perform no lookup,
+/// allocation, or fallible work.
+///
+/// An embedding kernel must prepare and authorize module state before making
+/// the target visible. Only after successful publication may it construct this
+/// context and invoke infallible module callbacks in frozen order. Those
+/// callbacks return no error and cannot roll back or retroactively fail the
+/// already-visible fork or user-namespace child. Shared-thread clones which do
+/// not create a distinct credential publication are not represented here.
+///
+/// The notification cannot outlive the consumer-owned publication target:
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::{
+///     Credential, CredentialPublicationContext, UserNamespaceView,
+/// };
+///
+/// fn target_cannot_escape<N: UserNamespaceView>(
+///     source: &'static Credential<N>,
+///     published: &'static Credential<N>,
+/// ) -> CredentialPublicationContext<'static, N, [u8]> {
+///     let target = vec![1_u8, 2, 3];
+///     CredentialPublicationContext::fork(source, published, target.as_slice())
+/// }
+/// ```
+#[must_use = "a visible credential publication must be delivered to notification hooks"]
+pub struct CredentialPublicationContext<'a, N: UserNamespaceView, O: ?Sized> {
+    source_credential: &'a Credential<N>,
+    published_credential: &'a Credential<N>,
+    target_object: &'a O,
+    operation: CredentialPublicationOperation,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> CredentialPublicationContext<'a, N, O> {
+    /// Binds a successfully published fork child to its exact source and target.
+    pub const fn fork(
+        source_credential: &'a Credential<N>,
+        published_credential: &'a Credential<N>,
+        target_object: &'a O,
+    ) -> Self {
+        Self {
+            source_credential,
+            published_credential,
+            target_object,
+            operation: CredentialPublicationOperation::Fork,
+        }
+    }
+
+    /// Binds a successfully published user-namespace child to its exact source
+    /// and target.
+    pub const fn user_namespace(
+        source_credential: &'a Credential<N>,
+        published_credential: &'a Credential<N>,
+        target_object: &'a O,
+    ) -> Self {
+        Self {
+            source_credential,
+            published_credential,
+            target_object,
+            operation: CredentialPublicationOperation::UserNamespace,
+        }
+    }
+
+    /// Borrows the immutable credential from which publication was prepared.
+    pub const fn source_credential(&self) -> &'a Credential<N> {
+        self.source_credential
+    }
+
+    /// Borrows the exact immutable credential which became visible.
+    pub const fn published_credential(&self) -> &'a Credential<N> {
+        self.published_credential
+    }
+
+    /// Borrows the source credential's owning user namespace.
+    pub const fn source_user_ns(&self) -> &'a Arc<N> {
+        self.source_credential.user_ns()
+    }
+
+    /// Borrows the namespace governing the published credential.
+    pub const fn target_user_ns(&self) -> &'a Arc<N> {
+        self.published_credential.user_ns()
+    }
+
+    /// Borrows the embedding-defined exact published target identity.
+    pub const fn target_object(&self) -> &'a O {
+        self.target_object
+    }
+
+    /// Returns the frozen publication operation.
+    pub const fn operation(&self) -> CredentialPublicationOperation {
+        self.operation
+    }
+}
+
 /// Ptrace operation class presented to security policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PtraceAccessKind {
@@ -2464,7 +2728,9 @@ mod tests {
 
     use alloc::{string::ToString, sync::Arc, vec};
 
-    use linux_raw_sys::general::{CAP_CHOWN, CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGTERM};
+    use linux_raw_sys::general::{
+        CAP_CHOWN, CAP_KILL, CAP_LAST_CAP, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGTERM,
+    };
 
     use super::*;
     use crate::{
@@ -3143,6 +3409,107 @@ mod tests {
                 PtraceCredentialKind::Fs,
             )),
             Err(AuthorizationError::NotPermitted)
+        );
+    }
+
+    #[test]
+    fn capability_authorization_is_typed_commoncap_first_and_namespace_directed() {
+        assert_eq!(CapabilityNumber::MAX, CAP_LAST_CAP);
+        assert_eq!(CapabilityNumber::try_new(0).unwrap().get(), 0);
+        assert_eq!(
+            CapabilityNumber::try_new(CapabilityNumber::MAX)
+                .unwrap()
+                .get(),
+            CapabilityNumber::MAX
+        );
+        assert_eq!(CapabilityNumber::try_new(CapabilityNumber::MAX + 1), None);
+        assert_eq!(CapabilityNumber::try_new(u32::MAX), None);
+
+        let root_namespace = MockNamespace::root();
+        let root = root_credential(root_namespace.clone());
+        let capability = CapabilityNumber::try_new(CAP_CHOWN).unwrap();
+        let admitted = authorize_capability_core(
+            &root,
+            &root_namespace,
+            capability,
+            CapabilitySecurityOperation::UseWithoutAudit,
+        )
+        .unwrap();
+        assert!(core::ptr::eq(admitted.actor(), root.as_ref()));
+        assert!(Arc::ptr_eq(admitted.target_user_ns(), &root_namespace));
+        assert_eq!(admitted.capability(), capability);
+        assert_eq!(
+            admitted.operation(),
+            CapabilitySecurityOperation::UseWithoutAudit
+        );
+
+        let restricted = credential_with_caps(&root, &[], &[]);
+        assert_eq!(
+            authorize_capability_core(
+                &restricted,
+                &root_namespace,
+                capability,
+                CapabilitySecurityOperation::Use,
+            )
+            .err(),
+            Some(AuthorizationError::NotPermitted)
+        );
+
+        let child_namespace =
+            MockNamespace::child(&root_namespace, Kuid::INITIAL_ROOT, Some(kuid(1000)));
+        let child = Credential::try_with_user_namespace(&root, child_namespace.clone()).unwrap();
+        let setid = authorize_capability_core(
+            &child,
+            &child_namespace,
+            capability,
+            CapabilitySecurityOperation::SetId,
+        )
+        .unwrap();
+        assert_eq!(setid.operation(), CapabilitySecurityOperation::SetId);
+        assert_eq!(
+            authorize_capability_core(
+                &child,
+                &root_namespace,
+                capability,
+                CapabilitySecurityOperation::Use,
+            )
+            .err(),
+            Some(AuthorizationError::NotPermitted)
+        );
+    }
+
+    #[test]
+    fn credential_publication_contexts_bind_target_and_notification_kind() {
+        let root_namespace = MockNamespace::root();
+        let root = root_credential(root_namespace.clone());
+        let fork_target = DummyHandle {
+            cookie: "fork-child",
+        };
+        let fork = CredentialPublicationContext::fork(&root, &root, &fork_target);
+        assert!(core::ptr::eq(fork.source_credential(), root.as_ref()));
+        assert!(core::ptr::eq(fork.published_credential(), root.as_ref()));
+        assert!(Arc::ptr_eq(fork.source_user_ns(), &root_namespace));
+        assert!(Arc::ptr_eq(fork.target_user_ns(), &root_namespace));
+        assert!(core::ptr::eq(fork.target_object(), &fork_target));
+        assert_eq!(fork.target_object().cookie, "fork-child");
+        assert_eq!(fork.operation(), CredentialPublicationOperation::Fork);
+
+        let child_namespace =
+            MockNamespace::child(&root_namespace, Kuid::INITIAL_ROOT, Some(kuid(1000)));
+        let child = Credential::try_with_user_namespace(&root, child_namespace.clone()).unwrap();
+        let userns_target = DummyHandle {
+            cookie: "userns-child",
+        };
+        let userns = CredentialPublicationContext::user_namespace(&root, &child, &userns_target);
+        assert!(core::ptr::eq(userns.source_credential(), root.as_ref()));
+        assert!(core::ptr::eq(userns.published_credential(), child.as_ref()));
+        assert!(Arc::ptr_eq(userns.source_user_ns(), &root_namespace));
+        assert!(Arc::ptr_eq(userns.target_user_ns(), &child_namespace));
+        assert!(core::ptr::eq(userns.target_object(), &userns_target));
+        assert_eq!(userns.target_object().cookie, "userns-child");
+        assert_eq!(
+            userns.operation(),
+            CredentialPublicationOperation::UserNamespace
         );
     }
 

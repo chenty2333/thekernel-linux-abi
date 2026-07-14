@@ -34,7 +34,12 @@ parsing of Linux file-capability revisions 1, 2, and 3, and pure exec
 credential derivation into an exact-old-bound immutable proposal. Namespace
 synchronization, lifetime admission, procfs identity, signal accounting, xattr
 storage, executable leases, credential/process/MM publication, security-hook
-registry/dispatch, and subsystem adapters remain outside this crate. Typed
+registry/dispatch, and subsystem adapters remain outside this crate. A typed
+capable context freezes the exact actor, target namespace, validated capability,
+and normalized Linux option class only after commoncap admission; it introduces
+no current-task lookup or registry edge. Successful-only fork/user-namespace
+publication contexts similarly expose exact borrowed core facts and an opaque
+consumer target without owning visibility or notification dispatch. Typed
 ptrace, traceme, and scheduler contexts keep exact caller-owned object payloads
 opaque while the crate supplies only commoncap policy. Typed inode-permission,
 file-open, and named-entry contexts likewise retain an exact actor,

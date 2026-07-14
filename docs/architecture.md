@@ -31,7 +31,13 @@ signal, MM, security-hook registry/dispatch, executable lease, exec publication
 transaction, syscall, or errno type. Ptrace, traceme, and scheduler commoncap
 policy consumes typed immutable contexts whose kernel object payload is an
 opaque caller-owned generic; it introduces no process/MM trait or orphan-rule
-edge. Inode-permission and file-open policy contexts follow the same leaf
+edge. Capable policy similarly consumes a validated number and normalized
+ordinary/no-audit/set-ID operation over an explicit actor/target namespace;
+only commoncap success creates the context which stacked modules may further
+deny. Fork and user-namespace lifecycle notifications use an infallible
+successful-publication context over exact source/published credentials and an
+opaque consumer target, while visibility ordering and callback dispatch remain
+consumer-owned. Inode-permission and file-open policy contexts follow the same leaf
 boundary: they bind the exact actor, independently selected DAC snapshot,
 target-owner namespace, and opaque caller-owned object to normalized access or
 open facts. File-open normalization distinguishes ordinary data access and

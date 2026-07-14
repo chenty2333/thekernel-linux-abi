@@ -733,6 +733,10 @@ pub fn credential_cap_is_subset<N: UserNamespaceView>(
 /// Effective capabilities apply in the actor's own namespace and descendants.
 /// The kernel-global owner of an immediate child additionally owns every
 /// capability in that child and its descendants.
+///
+/// This is the pure topology predicate. Security-hook adapters should use
+/// [`crate::authorize_capability_core`] to bind a validated capability and
+/// operation to the exact immutable inputs before stacked deny-first dispatch.
 pub fn ns_capable<N: UserNamespaceView>(
     actor: &Credential<N>,
     target_user_ns: &Arc<N>,

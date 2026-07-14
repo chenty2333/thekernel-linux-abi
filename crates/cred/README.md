@@ -15,9 +15,15 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 - typed ptrace, traceme, and scheduler authorization contexts over immutable
   credentials and caller-owned opaque object identities, with policy-neutral
   commoncap decisions and no caller-supplied ownership shortcut;
+- a validated capability number, normalized audited/no-audit/set-ID operation,
+  and field-private commoncap authorization context bound to the exact actor
+  and target user namespace before stacked deny-first dispatch;
 - typed signal source, delivery-scope, and validated-number values plus an
   opaque core-authorization proof bound to the exact actor/target credentials
   and caller-owned target identity;
+- infallible fork and user-namespace credential-publication contexts which bind
+  exact source/published credentials to an opaque consumer-owned target after
+  successful visibility publication;
 - typed inode-permission and file-open contexts which bind the exact actor,
   separately selected DAC snapshot, target-owner namespace, caller-owned
   object identity, and normalized non-empty access/open facts, including
@@ -56,6 +62,27 @@ and clones it into an empty slot, so the guarded operation neither retires nor
 destroys map ownership. In particular,
 `thekernel-linux-cred` does not depend on the process, VFS, signal, FD, MM,
 usercopy, `kspin`, or other kernel mechanism crates.
+
+Capability authorization never samples a current task. A caller validates the
+raw number as `CapabilityNumber`, selects a typed `CapabilitySecurityOperation`,
+and passes the exact actor and target namespace to
+`authorize_capability_core`. Only successful commoncap authorization produces a
+field-private `CapabilitySecurityContext`; a consumer then walks its frozen
+module registry in declaration order and stops at the first denial. The three
+operation variants preserve Linux's ordinary, no-audit, and set-ID check intent
+without exposing raw `CAP_OPT_*` bits.
+
+`CredentialPublicationContext` is a successful-only lifecycle notification for
+a separately prepared fork child or a child credential rooted in a new user
+namespace. It binds the immutable source and published credential to an opaque
+consumer target, and derives the target namespace from the published
+credential rather than accepting a second namespace claim. Construction and
+callbacks are infallible: module-state allocation, preparation, validation, and
+authorization must finish before publication. After the target is visible, a
+notification callback may observe the exact facts but cannot reject or roll
+back the event. The embedding kernel owns the publication token, visibility
+linearization point, registry order, callback concurrency rules, and any
+preallocated deferred-work handoff.
 
 Inode attribute security keeps the Linux hook point separate from the later
 core and backend preparation. `InodeSetattrIntent` selects a typed chmod or
