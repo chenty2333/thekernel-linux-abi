@@ -313,8 +313,8 @@ pub struct ExecPtraceRevalidation {
 }
 
 impl ExecPtraceRevalidation {
-    /// Reports whether suppression-free derivation observed set-ID intent or a
-    /// permitted-capability gain.
+    /// Reports whether suppression-free derivation observed a pre-downgrade
+    /// effective-ID/group-membership change or a permitted-capability gain.
     pub const fn privilege_sensitive(self) -> bool {
         self.privilege_sensitive
     }
@@ -472,10 +472,14 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
         }
     }
 
-    // Preserve this fact across a later unsafe downgrade. Linux uses the
-    // proposed effective IDs versus the old real IDs for secure-exec and
-    // ambient-capability decisions.
-    let is_setid = ids.euid != old_ids.ruid || ids.egid != old_ids.rgid;
+    // Freeze Linux commoncap's pre-downgrade identity predicates separately.
+    // `id_changed` controls unsafe-exec downgrades and ambient clearing: a new
+    // effective UID differs from the old effective UID, or the proposed
+    // effective GID is neither the old filesystem GID nor supplementary.
+    // Secure-exec additionally compares the resulting IDs with the old real
+    // IDs, so the two predicates are intentionally not interchangeable.
+    let id_changed =
+        ids.euid != old_ids.euid || (ids.egid != old_ids.fsgid && !old.groups().contains(ids.egid));
 
     // nosuid removes the file-capability record. no_new_privs instead allows
     // derivation and then intersects any gain with the old permitted set.
@@ -526,7 +530,7 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
     }
 
     let permitted_gained_before_unsafe = any_bits_outside(permitted_without_ambient, old_permitted);
-    let privilege_sensitive = is_setid || permitted_gained_before_unsafe;
+    let privilege_sensitive = id_changed || permitted_gained_before_unsafe;
     if privilege_sensitive && (old.no_new_privs() || input.trace_state.suppresses_privilege()) {
         if old.no_new_privs() || !old.has_effective_capability_in_own_user_ns(CAP_SETUID) {
             ids.euid = ids.ruid;
@@ -542,7 +546,12 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
     ids.sgid = ids.egid;
     ids.fsgid = ids.egid;
 
-    let mut ambient = if has_fcap || is_setid {
+    // Linux performs this secure-exec comparison after unsafe downgrade has
+    // selected the final effective IDs. Keep it separate from the frozen
+    // pre-downgrade `id_changed` predicate above.
+    let differs_from_real_ids = ids.euid != old_ids.ruid || ids.egid != old_ids.rgid;
+
+    let mut ambient = if has_fcap || id_changed {
         [0; CAPABILITY_WORDS]
     } else {
         old_ambient
@@ -572,7 +581,7 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
         any_bits_outside(capabilities.permitted(), capabilities.ambient());
     let non_root_file_privilege =
         root_kuid != Some(ids.ruid) && (file_effective || capabilities_beyond_ambient);
-    let secure_exec = is_setid || non_root_file_privilege;
+    let secure_exec = id_changed || differs_from_real_ids || non_root_file_privilege;
 
     let pre_exec_ids_mismatched = old_ids.euid != old_ids.ruid || old_ids.egid != old_ids.rgid;
     let dumpability = if input.image_readability.is_unreadable()
@@ -1069,6 +1078,100 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_non_effective_fcap_downgrade_to_real_ids_is_not_secure() {
+        for no_new_privs in [false, true] {
+            let old = unprivileged_credential();
+            let inherited = bit(CAP_CHOWN);
+            let mut ids = old.ids();
+            ids.euid = kuid(2000);
+            ids.suid = kuid(2000);
+            ids.fsuid = kuid(2000);
+            let old = with_state(
+                &old,
+                ids,
+                capabilities(
+                    [0; CAPABILITY_WORDS],
+                    [0; CAPABILITY_WORDS],
+                    inherited,
+                    CAPABILITY_VALID_MASK,
+                    [0; CAPABILITY_WORDS],
+                    0,
+                ),
+                no_new_privs,
+            );
+            let trace_state = if no_new_privs {
+                ExecTraceState::NotSuppressingPrivilege
+            } else {
+                ExecTraceState::SuppressingPrivilege
+            };
+
+            let proposal = derive_exec_credential(
+                &old,
+                input(
+                    0o755,
+                    ordinary_input().owner(),
+                    ExecMountPrivilege::Honor,
+                    trace_state,
+                    ExecImageReadability::Readable,
+                    Some(file_caps(
+                        [0; CAPABILITY_WORDS],
+                        inherited,
+                        false,
+                        Kuid::INITIAL_ROOT,
+                    )),
+                ),
+            )
+            .unwrap();
+
+            let proposed = proposal.proposed();
+            assert_eq!(proposed.ids().euid, old.ids().ruid);
+            assert_eq!(proposed.ids().suid, old.ids().ruid);
+            assert_eq!(proposed.ids().fsuid, old.ids().ruid);
+            assert_eq!(proposed.capabilities().permitted(), [0; CAPABILITY_WORDS]);
+            assert_eq!(proposed.capabilities().effective(), [0; CAPABILITY_WORDS]);
+            assert_eq!(proposed.capabilities().ambient(), [0; CAPABILITY_WORDS]);
+            assert!(proposal.revalidation().privilege_sensitive());
+            assert_eq!(proposal.revalidation().prepared_trace_state(), trace_state);
+            assert!(!proposal.effects().secure_exec());
+            assert!(!proposal.effects().aux_identity().is_secure());
+            assert_eq!(
+                proposal.effects().dumpability(),
+                ExecDumpability::NotDumpable
+            );
+            assert!(proposal.effects().clear_pdeath_signal());
+        }
+    }
+
+    #[test]
+    fn ptrace_does_not_downgrade_an_unchanged_nonroot_effective_uid() {
+        let old = unprivileged_credential();
+        let mut ids = old.ids();
+        ids.euid = kuid(2000);
+        ids.suid = kuid(2000);
+        ids.fsuid = kuid(2000);
+        let old = with_state(&old, ids, old.capabilities(), false);
+
+        let proposal = derive_exec_credential(
+            &old,
+            input(
+                0o755,
+                ordinary_input().owner(),
+                ExecMountPrivilege::Honor,
+                ExecTraceState::SuppressingPrivilege,
+                ExecImageReadability::Readable,
+                None,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(proposal.proposed().ids().euid, kuid(2000));
+        assert_eq!(proposal.proposed().ids().suid, kuid(2000));
+        assert_eq!(proposal.proposed().ids().fsuid, kuid(2000));
+        assert!(!proposal.revalidation().privilege_sensitive());
+        assert!(proposal.effects().secure_exec());
+    }
+
+    #[test]
     fn already_effective_root_with_file_caps_does_not_regain_full_bounding_set() {
         let old = unprivileged_credential();
         let retained = bit(CAP_CHOWN);
@@ -1272,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn setgid_to_supplementary_group_is_still_setid_and_clears_ambient() {
+    fn setgid_to_supplementary_group_is_secure_without_clearing_ambient() {
         let old = unprivileged_credential();
         let ambient = bit(CAP_CHOWN);
         let supplemental = kgid(2000);
@@ -1296,6 +1399,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proposal.proposed().ids().egid, supplemental);
+        assert_eq!(proposal.proposed().capabilities().ambient(), ambient);
+        assert_eq!(proposal.proposed().capabilities().permitted(), ambient);
+        assert_eq!(proposal.proposed().capabilities().effective(), ambient);
+        assert!(!proposal.revalidation().privilege_sensitive());
+        assert!(proposal.effects().secure_exec());
+    }
+
+    #[test]
+    fn setgid_to_filesystem_group_is_secure_without_clearing_ambient() {
+        let old = unprivileged_credential();
+        let ambient = bit(CAP_CHOWN);
+        let filesystem_group = kgid(2000);
+        let mut ids = old.ids();
+        ids.fsgid = filesystem_group;
+        let old = with_state(
+            &old,
+            ids,
+            capabilities(ambient, ambient, ambient, CAPABILITY_VALID_MASK, ambient, 0),
+            false,
+        );
+        assert_eq!(old.ids().fsgid, filesystem_group);
+        assert!(!old.groups().contains(filesystem_group));
+
+        let proposal = derive_exec_credential(
+            &old,
+            input(
+                0o2755,
+                Some(ExecFileOwner::new(Kuid::INITIAL_ROOT, filesystem_group)),
+                ExecMountPrivilege::Honor,
+                ExecTraceState::NotSuppressingPrivilege,
+                ExecImageReadability::Readable,
+                None,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(proposal.proposed().ids().egid, filesystem_group);
+        assert_eq!(proposal.proposed().capabilities().ambient(), ambient);
+        assert_eq!(proposal.proposed().capabilities().permitted(), ambient);
+        assert_eq!(proposal.proposed().capabilities().effective(), ambient);
+        assert!(!proposal.revalidation().privilege_sensitive());
+        assert!(proposal.effects().secure_exec());
+    }
+
+    #[test]
+    fn setuid_to_real_uid_clears_ambient_and_remains_privilege_sensitive() {
+        let old = unprivileged_credential();
+        let ambient = bit(CAP_CHOWN);
+        let mut ids = old.ids();
+        ids.euid = kuid(2000);
+        ids.suid = kuid(2000);
+        ids.fsuid = kuid(2000);
+        let old = with_state(
+            &old,
+            ids,
+            capabilities(ambient, ambient, ambient, CAPABILITY_VALID_MASK, ambient, 0),
+            false,
+        );
+
+        let proposal = derive_exec_credential(
+            &old,
+            input(
+                0o4755,
+                Some(ExecFileOwner::new(old.ids().ruid, old.ids().rgid)),
+                ExecMountPrivilege::Honor,
+                ExecTraceState::NotSuppressingPrivilege,
+                ExecImageReadability::Readable,
+                None,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(proposal.proposed().ids().euid, old.ids().ruid);
         assert_eq!(
             proposal.proposed().capabilities().ambient(),
             [0; CAPABILITY_WORDS]
@@ -1304,11 +1480,9 @@ mod tests {
             proposal.proposed().capabilities().permitted(),
             [0; CAPABILITY_WORDS]
         );
-        assert_eq!(
-            proposal.proposed().capabilities().effective(),
-            [0; CAPABILITY_WORDS]
-        );
+        assert!(proposal.revalidation().privilege_sensitive());
         assert!(proposal.effects().secure_exec());
+        assert!(proposal.effects().aux_identity().is_secure());
     }
 
     #[test]

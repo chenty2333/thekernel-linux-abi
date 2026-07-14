@@ -48,6 +48,9 @@
 - Produce a complete immutable credential through checked `CapabilitySets`
   and crate-private `ExecClearsKeepCaps`, then bind exec release to the exact
   old `Arc` while returning process/MM side effects only as typed values.
+- Preserve Linux commoncap's separate identity predicates: effective-ID/group
+  change controls unsafe downgrade and ambient clearing, while secure-exec
+  additionally compares the final effective IDs with the prior real IDs.
 - Restrict the raw transition constructor and exec-only transition mode to the
   crate; ordinary consumers receive a dedicated exact-old-bound proposal that
   cannot replace the user namespace or select an exec relaxation.

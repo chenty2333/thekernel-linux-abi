@@ -32,6 +32,9 @@
   releases its validated proposed `Arc` only after a pointer-identity check,
   and carries typed dumpability, aux-identity, ptrace-revalidation, and
   commoncap decisions without owning process or MM publication.
+- Keep commoncap's pre-downgrade `id_changed` predicate distinct from final
+  secure-exec state, including unchanged pre-existing effective identities,
+  setgid to a supplementary group, and set-ID transitions back to a real ID.
 - Add typed ptrace/traceme contexts with opaque caller-owned object payloads,
   typed scheduler operations whose ownership relation is derived internally,
   and policy-neutral commoncap authorization errors preserving `EPERM` versus
