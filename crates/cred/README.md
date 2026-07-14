@@ -40,6 +40,9 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 - a typed inode-xattr context over borrowed raw names of 1 through 255 bytes
   and opaque value bytes, validated create/replace flags, and an exact-byte
   `security.capability` value class without an xattr store or provider type;
+- field-private socket security contexts matching Linux v6.18's create,
+  post-create, pair, address, listen/accept, message, name, option, shutdown,
+  and Unix-domain leaf roles over immutable actors and borrowed opaque objects;
 - immutable credential and capability-set values whose invariants are checked
   before publication by a consumer;
 - ordinary transitions represented by an opaque proposal bound to the exact
@@ -51,15 +54,16 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 The crate owns a concrete namespace *policy core*, but not the embedding
 namespace wrapper, synchronization, lifetime admission, procfs identity, or
 signal queue/accounting extension. It also does not own a credential publication
-slot, process, VFS object, signal queue, address space, security-hook registry
-or dispatch, executable lease, exec publication transaction, xattr store,
-VFS identity, open transaction, syscall, or errno type. In particular, the
-generic inode/file contexts neither look up an object nor decide whether a
-normal `O_CREAT` or unnamed `O_TMPFILE` transaction succeeded. A kernel adapter
-selects the lock, prebuilds immutable replacement maps outside it, and attaches
-the remaining objects. Map publication borrows that caller-owned replacement
-and clones it into an empty slot, so the guarded operation neither retires nor
-destroys map ownership. In particular,
+slot, process, VFS object, signal queue, address space, socket transport,
+security-hook registry or dispatch, executable lease, exec publication
+transaction, xattr store, VFS identity, open transaction, syscall, or errno
+type. In particular, the generic inode/file contexts neither look up an object
+nor decide whether a normal `O_CREAT` or unnamed `O_TMPFILE` transaction
+succeeded, and socket contexts neither resolve an fd nor operate a transport.
+A kernel adapter selects the lock, prebuilds immutable replacement maps outside
+it, and attaches the remaining objects. Map publication borrows that
+caller-owned replacement and clones it into an empty slot, so the guarded
+operation neither retires nor destroys map ownership. In particular,
 `thekernel-linux-cred` does not depend on the process, VFS, signal, FD, MM,
 usercopy, `kspin`, or other kernel mechanism crates.
 
@@ -165,6 +169,27 @@ independently selected DAC snapshot, target-owner namespace, and opaque target
 object. Namespace visibility and authority, DAC admission, lookup, mount
 writability, value/list size limits, xattr storage, provider transactions,
 pre/post hook dispatch, and errno mapping remain in the embedding consumer.
+
+Socket security follows the Linux v6.18 leaf topology without importing a
+socket implementation. `SocketCreateSpec` preserves raw family/protocol and
+kernel-origin facts but accepts only a base socket type after descriptor flags
+have been validated and removed. The same spec is retained across
+`SocketCreateContext` and `SocketPostCreateContext`; pair and accept contexts
+keep both endpoint roles independently typed. Bind/connect borrow an exact
+prepared address plus its hook-visible length. Listen accepts a nonnegative
+`SocketListenBacklog` only after the consumer has applied its network-namespace
+cap, while shutdown deliberately retains raw `how`.
+
+Message contexts borrow a consumer-prepared opaque message snapshot and retain
+the hook-visible size. The prepared send snapshot must itself freeze the
+normalized/raw `msghdr` flags because Linux's `socket_sendmsg` leaf has no
+separate flags argument. `SocketReceiveMessageContext` additionally retains
+the separate raw flags present in the `socket_recvmsg` leaf prototype. Local
+and peer name hooks remain distinct, as do get-option and set-option. Unix
+stream connect preserves connecting, listening, and newly accepted roles;
+Unix may-send preserves sending and receiving roles. Address import, fd/OFD
+pinning, backlog policy, transport locking, module registry state, dispatch,
+and errno mapping all remain consumer-owned.
 
 `FileOpenAccess::NoData` describes the persistent mode-3 file description, not
 its earlier Linux `ACC_MODE` permission admission. It therefore reports neither

@@ -63,7 +63,11 @@ file-open payload deliberately has no `O_PATH` variant:
 the pinned Linux `do_dentry_open()` path completes `FMODE_PATH` setup and
 returns before `security_file_open`. They do not extract concrete inode/file
 types, object lookup, registry/dispatch, or open-transaction ownership from the
-kernel.
+kernel. Socket security contexts likewise borrow consumer-owned socket,
+address, and prepared-message snapshots while retaining only the normalized or
+raw scalar facts visible at each Linux leaf. They do not extract fd lookup,
+transport operations, network namespace policy, socket locking, or hook
+registry state.
 
 ## RFC 0001 research snapshots
 
@@ -84,11 +88,30 @@ Linux is GPL-2.0-only and FreeBSD is BSD-licensed. This package independently
 implements observable semantics and general architecture in Rust; it does not
 copy their source.
 
+## Linux v6.18 socket-hook research snapshot
+
+The socket security leaf topology was checked on 2026-07-15 against Linux
+v6.18 commit `7d0a66e4bb9081d75c82ec4957c50034cb0ea449`, especially:
+
+- `include/linux/lsm_hook_defs.h` for the exact `socket_*`,
+  `unix_stream_connect`, and `unix_may_send` leaf prototypes;
+- `security/security.c` for wrapper-to-leaf dispatch;
+- `net/socket.c` for socket-type flag removal, pre/post-create ordering,
+  socket-pair/accept roles, network-namespace backlog clamping, prepared
+  message sizes and flags, name/option ordering, and raw shutdown `how`; and
+- `net/unix/af_unix.c` for connecting/listening/accepted stream roles and
+  sending/receiving datagram roles.
+
+Linux is GPL-2.0-only. This package independently expresses the observable
+hook topology as field-private Rust values and borrowed opaque generics; it
+does not copy Linux implementation code or expose Linux internal structures.
+
 ## Independent-leaf boundary
 
 `thekernel-linux-cred` has no dependency edge to process, VFS, signal, FD, MM,
-usercopy, `kspin`, or a syscall/errno package. Consumers own namespace locks,
-lifetime/resource admission and extensions, credential slots, security-hook
-registries, VFS object identity and open transactions, exec/MM effects, and
-cross-subsystem publication. Future MM policy may depend on this leaf; this
-leaf must not depend back on MM or another consumer.
+network transport, usercopy, `kspin`, or a syscall/errno package. Consumers own
+namespace locks, lifetime/resource admission and extensions, credential slots,
+security-hook registries, VFS/socket object identity and transactions, exec/MM
+effects, and cross-subsystem publication. Future MM or network policy may
+depend on this leaf; this leaf must not depend back on MM, network transport,
+or another consumer.

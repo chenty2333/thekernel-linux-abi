@@ -1,9 +1,9 @@
 //! Allocation-aware credential values for Linux ABI kernels.
 //!
 //! This crate contains no syscall glue and owns no process, signal, VFS,
-//! file-descriptor, memory-management, or usercopy state. Kernel adapters map
-//! [`CredError`] into their local errno type and explicitly own namespace
-//! synchronization, lifetime admission, and subsystem extensions.
+//! file-descriptor, socket-transport, memory-management, or usercopy state.
+//! Kernel adapters map [`CredError`] into their local errno type and explicitly
+//! own namespace synchronization, lifetime admission, and subsystem extensions.
 
 #![no_std]
 #![feature(allocator_api)]
@@ -18,6 +18,7 @@ mod file_capability;
 mod idmap;
 mod namespace;
 mod security;
+mod socket_security;
 
 pub(crate) use credential::CredentialTransitionMode;
 pub use credential::{
@@ -61,4 +62,11 @@ pub use security::{
     SignalSecuritySource, XATTR_NAME_MAX, XattrSetFlags, XattrValueClass,
     authorize_capability_core, authorize_signal_core, commoncap_ptrace_access,
     commoncap_ptrace_traceme, commoncap_scheduler,
+};
+pub use socket_security::{
+    SocketAcceptContext, SocketBindContext, SocketConnectContext, SocketCreateContext,
+    SocketCreateSpec, SocketGetOptionContext, SocketGetPeerNameContext, SocketGetSockNameContext,
+    SocketListenBacklog, SocketListenContext, SocketOption, SocketPairContext,
+    SocketPostCreateContext, SocketReceiveMessageContext, SocketSendMessageContext,
+    SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext, UnixStreamConnectContext,
 };
