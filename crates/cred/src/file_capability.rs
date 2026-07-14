@@ -15,8 +15,10 @@ const VFS_CAP_REVISION_1_SIZE: usize = 12;
 const VFS_CAP_REVISION_2_SIZE: usize = 20;
 const VFS_CAP_REVISION_3_SIZE: usize = 24;
 
-/// Linux xattr name carrying executable file capabilities.
-pub const SECURITY_CAPABILITY_XATTR_NAME: &str = "security.capability";
+/// Exact Linux xattr name bytes carrying executable file capabilities.
+///
+/// The terminating NUL used by the syscall ABI is not part of this value.
+pub const SECURITY_CAPABILITY_XATTR_NAME: &[u8] = b"security.capability";
 
 /// Strictly validated Linux executable file capabilities.
 ///

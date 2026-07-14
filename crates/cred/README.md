@@ -31,8 +31,8 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
   caller-owned source, parent, prospective-entry, and existing-entry
   identities, consumer-prepared final mode bits, checked FIFO/socket versus
   character/block device-number facts, and the exact borrowed symlink target;
-- a typed inode-xattr context over borrowed non-empty names and opaque value
-  bytes, validated create/replace flags, and a name-derived
+- a typed inode-xattr context over borrowed raw names of 1 through 255 bytes
+  and opaque value bytes, validated create/replace flags, and an exact-byte
   `security.capability` value class without an xattr store or provider type;
 - immutable credential and capability-set values whose invariants are checked
   before publication by a consumer;
@@ -124,18 +124,20 @@ notification remain outside this independent credential leaf.
 
 `InodeXattrOperation` preserves the four get, list, set, and remove hook
 families without flattening absent payloads into empty values. Named operations
-reject an empty name. Set operations borrow the exact opaque value bytes and
+borrow exact bytes, impose no UTF-8 requirement, and accept Linux's full
+1-through-255-byte name domain after the syscall terminator is removed, while
+rejecting embedded NUL. Set operations borrow the exact opaque value bytes and
 carry `XattrSetFlags`, which accepts only zero, create, or replace and rejects
 the contradictory create-plus-replace combination and unknown bits. The set
 constructor derives `XattrValueClass::SecurityCapability` only for the exact
-`security.capability` name; this is a policy-facing wire-value classification,
-not a parsed `FileCapabilities`, provider object, or VFS type.
+`b"security.capability"` bytes; this is a policy-facing wire-value
+classification, not a parsed `FileCapabilities`, provider object, or VFS type.
 
 `InodeXattrContext` binds that borrowed operation to the exact actor,
 independently selected DAC snapshot, target-owner namespace, and opaque target
 object. Namespace visibility and authority, DAC admission, lookup, mount
-writability, size limits, xattr storage, provider transactions, pre/post hook
-dispatch, and errno mapping remain in the embedding consumer.
+writability, value/list size limits, xattr storage, provider transactions,
+pre/post hook dispatch, and errno mapping remain in the embedding consumer.
 
 `FileOpenAccess::NoData` describes the persistent mode-3 file description, not
 its earlier Linux `ACC_MODE` permission admission. It therefore reports neither

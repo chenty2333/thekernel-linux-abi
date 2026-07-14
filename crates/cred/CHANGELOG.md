@@ -88,12 +88,13 @@
   explicit reverse-then-forward consumer dispatch with first-denial
   short-circuiting.
 - Add a typed inode-xattr contract with distinct get, list, set, and remove
-  operations over borrowed non-empty names and exact opaque set-value bytes.
-  Validate zero/create/replace set flags while rejecting their contradictory
-  combination and unknown bits. Classify the exact `security.capability` set
-  value without exposing parsed capability, kernel, VFS, store, or provider
-  types, and bind the operation to the actor, selected DAC snapshot,
-  target-owner namespace, and opaque target identity.
+  operations over borrowed raw names and exact opaque set-value bytes. Accept
+  Linux's full 1-through-255-byte name domain without requiring UTF-8 while
+  rejecting embedded NUL, and validate zero/create/replace set flags while
+  rejecting their contradictory combination and unknown bits. Classify the
+  exact byte name `security.capability` without exposing parsed capability,
+  kernel, VFS, store, or provider types, and bind the operation to the actor,
+  selected DAC snapshot, target-owner namespace, and opaque target identity.
 - Remove the pre-release `try_with_user_ns` and `fs_dac_credentials`
   compatibility aliases before the 0.1 API freeze; consumers use
   `try_with_user_namespace` and `fs_credential_snapshot` exclusively.

@@ -56,7 +56,7 @@ pub use security::{
     InodeXattrOperation, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
     PtraceTracemeContext, SchedulerSecurityContext, SchedulerSecurityOperation,
     SignalCoreAuthorization, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
-    SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, XattrSetFlags,
-    XattrValueClass, authorize_signal_core, commoncap_ptrace_access, commoncap_ptrace_traceme,
-    commoncap_scheduler,
+    SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, XATTR_NAME_MAX,
+    XattrSetFlags, XattrValueClass, authorize_signal_core, commoncap_ptrace_access,
+    commoncap_ptrace_traceme, commoncap_scheduler,
 };

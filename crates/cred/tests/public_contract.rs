@@ -14,9 +14,9 @@ use thekernel_linux_cred::{
     SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
     SignalSecuritySource, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
-    XattrSetFlags, XattrValueClass, authorize_signal_core, commoncap_exec_transition,
-    commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential,
-    parse_file_capabilities,
+    XATTR_NAME_MAX, XattrSetFlags, XattrValueClass, authorize_signal_core,
+    commoncap_exec_transition, commoncap_ptrace_access, commoncap_ptrace_traceme,
+    commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
 };
 
 struct TestNamespace {
@@ -199,7 +199,7 @@ fn ordinary_transition_proposal_is_bound_to_the_exact_old_arc() {
 
 #[test]
 fn file_capability_parser_and_exec_proposal_are_publicly_composable() {
-    assert_eq!(SECURITY_CAPABILITY_XATTR_NAME, "security.capability");
+    assert_eq!(SECURITY_CAPABILITY_XATTR_NAME, b"security.capability");
     let file_capabilities = parsed_file_capabilities();
     assert_eq!(file_capabilities.permitted()[0], 1);
     assert_eq!(file_capabilities.inheritable(), [0; CAPABILITY_WORDS]);
@@ -717,22 +717,42 @@ fn inode_xattr_public_contract_validates_operations_and_preserves_roles() {
     assert_eq!(XattrSetFlags::try_from_bits(0x4), None);
     assert_eq!(XattrSetFlags::try_from_bits(u32::MAX), None);
 
-    assert_eq!(InodeXattrOperation::get(""), None);
+    assert_eq!(XATTR_NAME_MAX, 255);
+    assert_eq!(InodeXattrOperation::get(b""), None);
     assert_eq!(
-        InodeXattrOperation::set("", b"value", XattrSetFlags::NONE),
+        InodeXattrOperation::set(b"", b"value", XattrSetFlags::NONE),
         None
     );
-    assert_eq!(InodeXattrOperation::remove(""), None);
+    assert_eq!(InodeXattrOperation::remove(b""), None);
+    assert_eq!(InodeXattrOperation::get(b"user.\0hidden"), None);
+    assert_eq!(
+        InodeXattrOperation::set(b"user.\0hidden", b"value", XattrSetFlags::NONE),
+        None
+    );
+    assert_eq!(InodeXattrOperation::remove(b"user.\0hidden"), None);
 
-    let get = InodeXattrOperation::get("user.example").unwrap();
+    let maximum_name = [0xff; XATTR_NAME_MAX];
+    let get = InodeXattrOperation::get(maximum_name.as_slice()).unwrap();
+    assert!(std::ptr::eq(get.name().unwrap(), maximum_name.as_slice()));
+    assert!(
+        InodeXattrOperation::set(maximum_name.as_slice(), b"value", XattrSetFlags::NONE).is_some()
+    );
+    assert!(InodeXattrOperation::remove(maximum_name.as_slice()).is_some());
+
+    let oversized_name = [b'x'; XATTR_NAME_MAX + 1];
+    assert_eq!(InodeXattrOperation::get(oversized_name.as_slice()), None);
+    assert_eq!(
+        InodeXattrOperation::set(oversized_name.as_slice(), b"value", XattrSetFlags::NONE),
+        None
+    );
+    assert_eq!(InodeXattrOperation::remove(oversized_name.as_slice()), None);
+
+    let get = InodeXattrOperation::get(b"user.example").unwrap();
     assert!(matches!(
         get,
-        InodeXattrOperation::Get {
-            name: "user.example",
-            ..
-        }
+        InodeXattrOperation::Get { name, .. } if name == b"user.example"
     ));
-    assert_eq!(get.name(), Some("user.example"));
+    assert_eq!(get.name(), Some(b"user.example".as_slice()));
     assert_eq!(get.value(), None);
     assert_eq!(get.set_flags(), None);
     assert_eq!(get.value_class(), None);
@@ -742,24 +762,32 @@ fn inode_xattr_public_contract_validates_operations_and_preserves_roles() {
     assert_eq!(list.name(), None);
     assert_eq!(list.value(), None);
 
-    let remove = InodeXattrOperation::remove("trusted.example").unwrap();
+    let remove = InodeXattrOperation::remove(b"trusted.example").unwrap();
     assert!(matches!(
         remove,
-        InodeXattrOperation::Remove {
-            name: "trusted.example",
-            ..
-        }
+        InodeXattrOperation::Remove { name, .. } if name == b"trusted.example"
     ));
-    assert_eq!(remove.name(), Some("trusted.example"));
+    assert_eq!(remove.name(), Some(b"trusted.example".as_slice()));
     assert_eq!(remove.value(), None);
 
     let ordinary_value = [0xff, 0x00];
+    let mut non_utf8_name = b"user.".to_vec();
+    non_utf8_name.push(0xff);
+    assert!(std::str::from_utf8(non_utf8_name.as_slice()).is_err());
     let ordinary = InodeXattrOperation::set(
-        "user.example",
+        non_utf8_name.as_slice(),
         ordinary_value.as_slice(),
         XattrSetFlags::CREATE,
     )
     .unwrap();
+    assert!(std::ptr::eq(
+        ordinary.name().unwrap(),
+        non_utf8_name.as_slice()
+    ));
+    assert_eq!(ordinary.value_class(), Some(XattrValueClass::Opaque));
+
+    let near_capability = b"security.capability\xff";
+    let ordinary = InodeXattrOperation::set(near_capability, &[], XattrSetFlags::NONE).unwrap();
     assert_eq!(ordinary.value_class(), Some(XattrValueClass::Opaque));
 
     let actor_namespace = TestNamespace::initial("xattr-actor");
@@ -769,10 +797,11 @@ fn inode_xattr_public_contract_validates_operations_and_preserves_roles() {
     let target = NonCopyObject {
         identity: String::from("exact-xattr-target"),
     };
-    let name = String::from(SECURITY_CAPABILITY_XATTR_NAME);
+    let name = SECURITY_CAPABILITY_XATTR_NAME.to_vec();
     let value = vec![0x01, 0x00, 0x00, 0x02];
     let operation =
-        InodeXattrOperation::set(name.as_str(), value.as_slice(), XattrSetFlags::REPLACE).unwrap();
+        InodeXattrOperation::set(name.as_slice(), value.as_slice(), XattrSetFlags::REPLACE)
+            .unwrap();
     assert!(matches!(
         operation,
         InodeXattrOperation::Set {
@@ -800,7 +829,7 @@ fn inode_xattr_public_contract_validates_operations_and_preserves_roles() {
     assert_eq!(context.target_object().identity, "exact-xattr-target");
     assert!(std::ptr::eq(
         context.operation().name().unwrap(),
-        name.as_str()
+        name.as_slice()
     ));
     assert!(std::ptr::eq(
         context.operation().value().unwrap(),

@@ -12,7 +12,9 @@ use core::{
     ops::{BitOr, BitOrAssign},
 };
 
-use linux_raw_sys::general::{CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT};
+use linux_raw_sys::general::{
+    CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT, XATTR_NAME_MAX as LINUX_XATTR_NAME_MAX,
+};
 
 use crate::{
     CAPABILITY_WORDS, Credential, FsCredentialSnapshot, Kgid, Kuid, UserNamespaceView, ns_capable,
@@ -1326,6 +1328,13 @@ impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> InodeMknodContext<'a, N, P,
     }
 }
 
+/// Maximum number of bytes in one Linux extended-attribute name.
+///
+/// This excludes the terminating NUL used at the syscall boundary. Attribute
+/// names contain no embedded NUL and are otherwise opaque bytes which do not
+/// have to be valid UTF-8.
+pub const XATTR_NAME_MAX: usize = LINUX_XATTR_NAME_MAX as usize;
+
 /// Validated Linux-compatible flags for one extended-attribute set operation.
 ///
 /// Zero permits either creating a missing attribute or replacing an existing
@@ -1386,7 +1395,7 @@ pub enum XattrValueClass {
 }
 
 impl XattrValueClass {
-    fn for_name(name: &str) -> Self {
+    fn for_name(name: &[u8]) -> Self {
         if name == crate::SECURITY_CAPABILITY_XATTR_NAME {
             Self::SecurityCapability
         } else {
@@ -1397,22 +1406,34 @@ impl XattrValueClass {
 
 /// Borrowed, operation-specific input to one inode xattr policy hook.
 ///
-/// Names and values remain caller-owned wire payloads. The constructors reject
-/// an empty name and preserve Linux's distinct get, list, set, and remove hook
-/// shapes without importing pathname lookup, xattr storage, provider dispatch,
-/// or errno mapping. [`Self::set`] derives the value class from the exact name,
-/// so a caller cannot label another attribute as `security.capability` or hide
-/// that name behind [`XattrValueClass::Opaque`].
+/// Names and values remain caller-owned wire payloads. Names are exact bytes,
+/// with no UTF-8 requirement. The syscall terminator is not part of the slice,
+/// and embedded NUL is rejected. The constructors require a length in
+/// `1..=`[`XATTR_NAME_MAX`] and preserve Linux's distinct get, list, set, and
+/// remove hook shapes without importing pathname lookup, xattr storage,
+/// provider dispatch, or errno mapping. [`Self::set`] derives the value class
+/// from the exact name bytes, so a caller cannot label another attribute as
+/// `security.capability` or hide that name behind [`XattrValueClass::Opaque`].
 ///
-/// The operation cannot outlive either borrowed payload:
+/// The operation cannot outlive the borrowed name:
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeXattrOperation;
+///
+/// fn name_cannot_escape() -> InodeXattrOperation<'static> {
+///     let name = b"user.example".to_vec();
+///     InodeXattrOperation::get(name.as_slice()).unwrap()
+/// }
+/// ```
+///
+/// A set operation cannot outlive its value either:
 ///
 /// ```compile_fail
 /// use thekernel_linux_cred::{InodeXattrOperation, XattrSetFlags};
 ///
-/// fn cannot_escape() -> InodeXattrOperation<'static> {
-///     let name = String::from("user.example");
+/// fn value_cannot_escape() -> InodeXattrOperation<'static> {
 ///     let value = vec![1_u8, 2, 3];
-///     InodeXattrOperation::set(name.as_str(), value.as_slice(), XattrSetFlags::NONE)
+///     InodeXattrOperation::set(b"user.example", value.as_slice(), XattrSetFlags::NONE)
 ///         .unwrap()
 /// }
 /// ```
@@ -1423,7 +1444,7 @@ impl XattrValueClass {
 /// // Named variants are non-exhaustive so external code cannot bypass name
 /// // validation or forge the name-derived value class.
 /// let _ = InodeXattrOperation::Set {
-///     name: "",
+///     name: b"",
 ///     value: &[],
 ///     flags: XattrSetFlags::NONE,
 ///     value_class: XattrValueClass::SecurityCapability,
@@ -1435,16 +1456,16 @@ pub enum InodeXattrOperation<'a> {
     /// Read one exact named attribute.
     #[non_exhaustive]
     Get {
-        /// Exact non-empty attribute name selected by the consumer.
-        name: &'a str,
+        /// Exact bounded attribute-name bytes selected by the consumer.
+        name: &'a [u8],
     },
     /// Enumerate the names visible on the exact target object.
     List,
     /// Create or replace one exact named attribute value.
     #[non_exhaustive]
     Set {
-        /// Exact non-empty attribute name selected by the consumer.
-        name: &'a str,
+        /// Exact bounded attribute-name bytes selected by the consumer.
+        name: &'a [u8],
         /// Exact opaque value bytes proposed for publication.
         value: &'a [u8],
         /// Validated create/replace condition.
@@ -1455,15 +1476,15 @@ pub enum InodeXattrOperation<'a> {
     /// Remove one exact named attribute.
     #[non_exhaustive]
     Remove {
-        /// Exact non-empty attribute name selected by the consumer.
-        name: &'a str,
+        /// Exact bounded attribute-name bytes selected by the consumer.
+        name: &'a [u8],
     },
 }
 
 impl<'a> InodeXattrOperation<'a> {
     /// Constructs one named-attribute read operation.
-    pub fn get(name: &'a str) -> Option<Self> {
-        if name.is_empty() {
+    pub fn get(name: &'a [u8]) -> Option<Self> {
+        if !valid_xattr_name(name) {
             None
         } else {
             Some(Self::Get { name })
@@ -1476,8 +1497,8 @@ impl<'a> InodeXattrOperation<'a> {
     }
 
     /// Constructs one named-attribute set operation over exact borrowed bytes.
-    pub fn set(name: &'a str, value: &'a [u8], flags: XattrSetFlags) -> Option<Self> {
-        if name.is_empty() {
+    pub fn set(name: &'a [u8], value: &'a [u8], flags: XattrSetFlags) -> Option<Self> {
+        if !valid_xattr_name(name) {
             None
         } else {
             Some(Self::Set {
@@ -1490,8 +1511,8 @@ impl<'a> InodeXattrOperation<'a> {
     }
 
     /// Constructs one named-attribute removal operation.
-    pub fn remove(name: &'a str) -> Option<Self> {
-        if name.is_empty() {
+    pub fn remove(name: &'a [u8]) -> Option<Self> {
+        if !valid_xattr_name(name) {
             None
         } else {
             Some(Self::Remove { name })
@@ -1499,7 +1520,7 @@ impl<'a> InodeXattrOperation<'a> {
     }
 
     /// Borrows the exact name for a named operation, or `None` for list.
-    pub const fn name(self) -> Option<&'a str> {
+    pub const fn name(self) -> Option<&'a [u8]> {
         match self {
             Self::Get { name } | Self::Set { name, .. } | Self::Remove { name } => Some(name),
             Self::List => None,
@@ -1529,6 +1550,10 @@ impl<'a> InodeXattrOperation<'a> {
             _ => None,
         }
     }
+}
+
+fn valid_xattr_name(name: &[u8]) -> bool {
+    !name.is_empty() && name.len() <= XATTR_NAME_MAX && !name.contains(&0)
 }
 
 /// Complete immutable input to one inode xattr policy hook.
@@ -2616,12 +2641,39 @@ mod tests {
 
     #[test]
     fn inode_xattr_operations_validate_names_and_classify_set_values() {
-        assert_eq!(InodeXattrOperation::get(""), None);
+        assert_eq!(InodeXattrOperation::get(b""), None);
         assert_eq!(
-            InodeXattrOperation::set("", b"value", XattrSetFlags::NONE),
+            InodeXattrOperation::set(b"", b"value", XattrSetFlags::NONE),
             None
         );
-        assert_eq!(InodeXattrOperation::remove(""), None);
+        assert_eq!(InodeXattrOperation::remove(b""), None);
+        assert_eq!(InodeXattrOperation::get(b"user.\0hidden"), None);
+        assert_eq!(
+            InodeXattrOperation::set(b"user.\0hidden", b"value", XattrSetFlags::NONE),
+            None
+        );
+        assert_eq!(InodeXattrOperation::remove(b"user.\0hidden"), None);
+
+        let maximum_name = [0xff; XATTR_NAME_MAX];
+        assert_eq!(
+            InodeXattrOperation::get(maximum_name.as_slice())
+                .unwrap()
+                .name(),
+            Some(maximum_name.as_slice())
+        );
+        assert!(
+            InodeXattrOperation::set(maximum_name.as_slice(), b"value", XattrSetFlags::NONE)
+                .is_some()
+        );
+        assert!(InodeXattrOperation::remove(maximum_name.as_slice()).is_some());
+
+        let oversized_name = [b'x'; XATTR_NAME_MAX + 1];
+        assert_eq!(InodeXattrOperation::get(oversized_name.as_slice()), None);
+        assert_eq!(
+            InodeXattrOperation::set(oversized_name.as_slice(), b"value", XattrSetFlags::NONE),
+            None
+        );
+        assert_eq!(InodeXattrOperation::remove(oversized_name.as_slice()), None);
 
         let value = [1_u8, 2, 3];
         let capability = InodeXattrOperation::set(
@@ -2637,9 +2689,15 @@ mod tests {
         assert_eq!(capability.value(), Some(value.as_slice()));
         assert_eq!(capability.set_flags(), Some(XattrSetFlags::CREATE));
 
-        let opaque = InodeXattrOperation::set("user.test", &[], XattrSetFlags::NONE).unwrap();
+        let non_utf8_name = b"user.\xff";
+        let opaque = InodeXattrOperation::set(non_utf8_name, &[], XattrSetFlags::NONE).unwrap();
         assert_eq!(opaque.value_class(), Some(XattrValueClass::Opaque));
+        assert_eq!(opaque.name(), Some(non_utf8_name.as_slice()));
         assert_eq!(opaque.value(), Some([].as_slice()));
+
+        let near_capability = b"security.capability\xff";
+        let opaque = InodeXattrOperation::set(near_capability, &[], XattrSetFlags::NONE).unwrap();
+        assert_eq!(opaque.value_class(), Some(XattrValueClass::Opaque));
         assert_eq!(InodeXattrOperation::list().name(), None);
     }
 

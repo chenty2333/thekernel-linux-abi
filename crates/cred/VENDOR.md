@@ -49,10 +49,11 @@ flags: the consumer owns Linux's one-way ordinary/no-replace/whiteout dispatch
 and reverse-then-forward exchange dispatch. Target decoding, protected-hardlink
 and `may_delete` admission, raw rename-flag validation, cross-filesystem checks,
 and publication remain with the consumer. The inode-xattr leaf similarly
-borrows exact names and set-value bytes, validates create/replace flags, and
-classifies the `security.capability` wire value without importing a provider,
-store, or parsed kernel capability type; lookup, admission, storage, dispatch,
-and publication remain with the consumer. The
+borrows exact name bytes with no UTF-8 requirement plus exact set-value bytes,
+enforces Linux's NUL-free 1-through-255-byte name domain, validates
+create/replace flags, and classifies the exact `security.capability` bytes
+without importing a provider, store, or parsed kernel capability type; lookup,
+admission, storage, dispatch, and publication remain with the consumer. The
 file-open payload deliberately has no `O_PATH` variant:
 the pinned Linux `do_dentry_open()` path completes `FMODE_PATH` setup and
 returns before `security_file_open`. They do not extract concrete inode/file

@@ -113,13 +113,14 @@
   flag-combination validation, path hooks, admission, lookup, transaction,
   backend mutation, and notification outside this crate.
 - Add one typed inode-xattr leaf context whose operation preserves Linux's
-  distinct get, list, set, and remove shapes. Borrow exact non-empty names and
-  opaque set-value bytes, validate only zero/create/replace set flags, and
-  derive a `security.capability` wire-value class from the exact name without
-  importing a parsed capability, xattr-store, VFS, kernel, or provider type.
-  Keep namespace policy, DAC admission, mount and size checks, lookup, storage,
-  registry dispatch, post-set notification, publication, and errno mapping in
-  the embedding consumer.
+  distinct get, list, set, and remove shapes. Borrow exact raw name bytes and
+  opaque set-value bytes, accept Linux's 1-through-255-byte name domain without
+  imposing UTF-8 while rejecting embedded NUL, validate zero/create/replace set
+  flags, and derive a `security.capability` wire-value class from exact bytes
+  without importing a parsed capability, xattr-store, VFS, kernel, or provider
+  type. Keep namespace policy, DAC admission, mount and value/list size checks,
+  lookup, storage, registry dispatch, post-set notification, publication, and
+  errno mapping in the embedding consumer.
 - Remove duplicate pre-release namespace-entry and filesystem-snapshot
   spellings before freezing 0.1, leaving one canonical consumer path for each
   operation.
