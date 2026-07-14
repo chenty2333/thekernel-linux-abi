@@ -52,6 +52,48 @@
   because Linux returns its path-only description before `security_file_open`.
   Preserve mode 3's `MAY_WRITE` open admission so a no-data description can
   still record a successful unnamed `O_TMPFILE` creation.
+- Add typed chmod/chown inode-setattr intent and hook-point proposal values.
+  Preserve omitted UID/GID fields independently from explicitly requested
+  current values, reject non-mode bits, and represent selected file-privilege
+  cleanup without raw iattr flags. Add distinct fallible pre-setattr and
+  infallible post-setattr contexts over caller-owned old and committed object
+  snapshots, while leaving DAC preparation, locking, backend mutation,
+  registry preflight/dispatch, and errno mapping to the embedding kernel.
+- Add separate field-private contexts for Linux-style regular-file
+  `inode_create`, directory `inode_mkdir`, and FIFO/character/block/socket
+  `inode_mknod` hooks. Bind caller-owned parent and prospective named-entry
+  objects to the actor, independently selected DAC snapshot,
+  destination-owner namespace, consumer-prepared final low `0o7777` mode, and
+  checked device-number pairing without admitting symlink, hard-link, or
+  unnamed `O_TMPFILE` operations.
+- Add a separate field-private `inode_symlink` context which freezes the exact
+  actor, DAC snapshot, destination-owner namespace, parent, prospective entry,
+  and opaque borrowed target payload without imposing target encoding or
+  inventing mode/device facts that Linux does not pass to this hook.
+- Add a separate field-private `inode_link` context which freezes the exact
+  actor, independently selected DAC snapshot, filesystem-owner namespace,
+  existing source object, destination parent, and prospective entry without
+  importing protected-hardlink policy, cross-filesystem checks, lookup,
+  transaction, or publication mechanisms.
+- Add distinct field-private `inode_unlink` and `inode_rmdir` contexts which
+  bind the exact actor, selected DAC snapshot, filesystem-owner namespace,
+  parent directory, and opaque existing victim entry without collapsing the
+  two Linux hooks into a caller-provided directory flag or importing
+  `may_delete`, lookup, backend, notification, or publication mechanisms.
+- Add a field-private `inode_rename` leaf context which binds the exact actor,
+  selected DAC snapshot, filesystem-owner namespace, and four independently
+  typed old-parent, old-entry, new-parent, and new-entry identities. Keep the
+  leaf payload flag-free like Linux's LSM hook: ordinary, no-replace, and
+  whiteout use one forward context, while exchange ordering remains an
+  explicit reverse-then-forward consumer dispatch with first-denial
+  short-circuiting.
+- Add a typed inode-xattr contract with distinct get, list, set, and remove
+  operations over borrowed non-empty names and exact opaque set-value bytes.
+  Validate zero/create/replace set flags while rejecting their contradictory
+  combination and unknown bits. Classify the exact `security.capability` set
+  value without exposing parsed capability, kernel, VFS, store, or provider
+  types, and bind the operation to the actor, selected DAC snapshot,
+  target-owner namespace, and opaque target identity.
 - Remove the pre-release `try_with_user_ns` and `fs_dac_credentials`
   compatibility aliases before the 0.1 API freeze; consumers use
   `try_with_user_namespace` and `fs_credential_snapshot` exclusively.

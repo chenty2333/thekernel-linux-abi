@@ -1,4 +1,5 @@
-//! Linux-visible pathname and discretionary-access policy over a generic VFS.
+//! Linux-visible pathname, discretionary-access, and setattr policy over a
+//! generic VFS.
 //!
 //! This crate owns no filesystem tree and never selects a current task. A
 //! kernel supplies stable location handles, one immutable credential snapshot,
@@ -11,15 +12,21 @@
 mod context;
 mod dac;
 mod path;
+mod setattr;
 mod transaction;
 
 pub use context::{PathContext, PathContextError};
 pub use dac::{
-    Access, CreateAttributes, DacCapability, DacCredentials, DacError, NodeKind, NodeMetadata,
-    check_dac, check_directory_mutation, check_sticky_mutation, initial_create_attributes,
+    Access, CreateAttributes, DacCapability, DacCredentials, DacError, HardlinkCredentials,
+    NodeKind, NodeMetadata, check_dac, check_directory_mutation, check_hardlink_source,
+    check_sticky_mutation, initial_create_attributes,
 };
 pub use path::{
     LimitKind, Openat2Policy, PathLimitError, PathLimits, ResolveFlags, ResolveFlagsError,
     TopologyEvent, TraversalAction, WalkBudget, WalkError,
+};
+pub use setattr::{
+    ChmodRequest, ChmodSetattrPlan, ChownRequest, ChownSetattrPlan, PreparedSetattr, SetattrError,
+    plan_chmod, plan_chown,
 };
 pub use transaction::{MutationBackend, MutationTransaction};

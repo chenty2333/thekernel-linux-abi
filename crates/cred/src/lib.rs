@@ -47,10 +47,16 @@ pub use namespace::{
     UserNamespaceMapState,
 };
 pub use security::{
-    AuthorizationError, FileOpenAccess, FileOpenContext, FileOpenOperation, InodePermissionAccess,
-    InodePermissionContext, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
+    AuthorizationError, FileOpenAccess, FileOpenContext, FileOpenOperation, InodeChmodIntent,
+    InodeChownIntent, InodeCreateContext, InodeCreateMode, InodeLinkContext, InodeMkdirContext,
+    InodeMknodContext, InodeMknodKind, InodeMknodOperation, InodePermissionAccess,
+    InodePermissionContext, InodePostSetattrContext, InodeRenameContext, InodeRmdirContext,
+    InodeSetattrContext, InodeSetattrIntent, InodeSetattrMode, InodeSetattrPrivilegeCleanup,
+    InodeSetattrProposal, InodeSymlinkContext, InodeUnlinkContext, InodeXattrContext,
+    InodeXattrOperation, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
     PtraceTracemeContext, SchedulerSecurityContext, SchedulerSecurityOperation,
     SignalCoreAuthorization, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
-    SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, authorize_signal_core,
-    commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler,
+    SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, XattrSetFlags,
+    XattrValueClass, authorize_signal_core, commoncap_ptrace_access, commoncap_ptrace_traceme,
+    commoncap_scheduler,
 };

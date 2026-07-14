@@ -4,13 +4,19 @@ use thekernel_linux_cred::{
     CAPABILITY_WORDS, CredError, Credential, ExecCredentialInput, ExecDumpability, ExecFileOwner,
     ExecImageReadability, ExecMountPrivilege, ExecTraceState, ExecUserNamespaceView,
     FileOpenAccess, FileOpenContext, FileOpenOperation, FsCredentialSnapshot, IdMap,
-    InodePermissionAccess, InodePermissionContext, Kgid, Kuid, PtraceAccessContext,
-    PtraceAccessKind, PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
+    InodeChmodIntent, InodeChownIntent, InodeCreateContext, InodeCreateMode, InodeLinkContext,
+    InodeMkdirContext, InodeMknodContext, InodeMknodKind, InodeMknodOperation,
+    InodePermissionAccess, InodePermissionContext, InodePostSetattrContext, InodeRenameContext,
+    InodeRmdirContext, InodeSetattrContext, InodeSetattrIntent, InodeSetattrMode,
+    InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext, InodeUnlinkContext,
+    InodeXattrContext, InodeXattrOperation, Kgid, Kuid, PtraceAccessContext, PtraceAccessKind,
+    PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
     SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
     SignalSecuritySource, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
-    authorize_signal_core, commoncap_exec_transition, commoncap_ptrace_access,
-    commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
+    XattrSetFlags, XattrValueClass, authorize_signal_core, commoncap_exec_transition,
+    commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential,
+    parse_file_capabilities,
 };
 
 struct TestNamespace {
@@ -321,6 +327,492 @@ fn inode_permission_public_contract_binds_distinct_frozen_inputs() {
     assert_eq!(
         InodePermissionAccess::try_from_bits(InodePermissionAccess::ALL.bits() | (1 << 7)),
         None
+    );
+}
+
+#[test]
+fn inode_setattr_public_contract_preserves_omission_and_hook_point_effects() {
+    let actor_namespace = TestNamespace::initial("setattr-actor");
+    let target_owner_namespace = TestNamespace::initial("setattr-owner");
+    let actor = Credential::try_root(actor_namespace).unwrap();
+    let dac_credential = overridden_dac_credential(&actor, 2400);
+    let old_object = NonCopyObject {
+        identity: String::from("exact-old-setattr-inode"),
+    };
+    let committed_object = NonCopyObject {
+        identity: String::from("exact-committed-setattr-inode"),
+    };
+
+    assert_eq!(InodeSetattrMode::try_from_bits(0).unwrap().bits(), 0);
+    assert_eq!(
+        InodeSetattrMode::try_from_bits(0o7777).unwrap().bits(),
+        0o7777
+    );
+    assert_eq!(InodeSetattrMode::try_from_bits(0o100000 | 0o644), None);
+
+    let chmod_intent = InodeChmodIntent::new(InodeSetattrMode::try_from_bits(0o2750).unwrap());
+    let chmod = InodeSetattrProposal::chmod(chmod_intent);
+    assert_eq!(chmod.intent(), InodeSetattrIntent::Chmod(chmod_intent));
+    assert_eq!(chmod.mode(), Some(chmod_intent.mode()));
+    assert_eq!(chmod.user(), None);
+    assert_eq!(chmod.group(), None);
+    assert_eq!(
+        chmod.privilege_cleanup(),
+        InodeSetattrPrivilegeCleanup::Preserve
+    );
+
+    let omitted = InodeChownIntent::new(None, None);
+    let omitted_proposal = InodeSetattrProposal::chown(
+        omitted,
+        Some(InodeSetattrMode::try_from_bits(0o755).unwrap()),
+        InodeSetattrPrivilegeCleanup::Kill,
+    );
+    assert_eq!(
+        omitted_proposal.intent(),
+        InodeSetattrIntent::Chown(omitted)
+    );
+    assert_eq!(omitted_proposal.user(), None);
+    assert_eq!(omitted_proposal.group(), None);
+    assert_eq!(
+        omitted_proposal.privilege_cleanup(),
+        InodeSetattrPrivilegeCleanup::Kill
+    );
+
+    let requested_user = Kuid::from_raw(2401).unwrap();
+    let requested_group = Kgid::from_raw(2402).unwrap();
+    let explicit = InodeChownIntent::new(Some(requested_user), Some(requested_group));
+    let explicit_proposal =
+        InodeSetattrProposal::chown(explicit, None, InodeSetattrPrivilegeCleanup::Preserve);
+    assert_ne!(explicit, omitted);
+    assert_eq!(explicit.user(), Some(requested_user));
+    assert_eq!(explicit.group(), Some(requested_group));
+    assert_eq!(explicit_proposal.user(), Some(requested_user));
+    assert_eq!(explicit_proposal.group(), Some(requested_group));
+
+    let pre = InodeSetattrContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &old_object,
+        omitted_proposal,
+    );
+    assert!(std::ptr::eq(pre.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(pre.dac_credential(), &dac_credential));
+    assert_ne!(pre.dac_credential().uid(), actor.ids().fsuid);
+    assert!(Arc::ptr_eq(
+        pre.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(pre.target_object(), &old_object));
+    assert_eq!(pre.target_object().identity, "exact-old-setattr-inode");
+    assert_eq!(pre.proposal(), omitted_proposal);
+    assert_eq!(pre.intent(), InodeSetattrIntent::Chown(omitted));
+
+    let post = InodePostSetattrContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &committed_object,
+        omitted_proposal,
+    );
+    assert!(std::ptr::eq(post.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(post.dac_credential(), &dac_credential));
+    assert!(Arc::ptr_eq(
+        post.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(post.committed_object(), &committed_object));
+    assert_eq!(
+        post.committed_object().identity,
+        "exact-committed-setattr-inode"
+    );
+    assert_eq!(post.proposal(), omitted_proposal);
+    assert_eq!(post.intent(), InodeSetattrIntent::Chown(omitted));
+}
+
+#[test]
+fn named_inode_creation_public_contract_preserves_linux_hook_roles() {
+    let actor_namespace = TestNamespace::initial("actor");
+    let target_owner_namespace = TestNamespace::initial("named-create-owner");
+    let actor = Credential::try_root(actor_namespace).unwrap();
+    let dac_credential = overridden_dac_credential(&actor, 3000);
+    let parent = NonCopyObject {
+        identity: String::from("exact-parent-directory"),
+    };
+    let new_entry = NonCopyObject {
+        identity: String::from("exact-prospective-named-entry"),
+    };
+
+    assert_eq!(InodeCreateMode::try_from_bits(0).unwrap().bits(), 0);
+    assert_eq!(
+        InodeCreateMode::try_from_bits(0o7777).unwrap().bits(),
+        0o7777
+    );
+    assert_eq!(InodeCreateMode::try_from_bits(0o100000 | 0o644), None);
+
+    let file_mode = InodeCreateMode::try_from_bits(0o640).unwrap();
+    let create = InodeCreateContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &parent,
+        &new_entry,
+        file_mode,
+    );
+    assert!(std::ptr::eq(create.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(create.dac_credential(), &dac_credential));
+    assert!(Arc::ptr_eq(
+        create.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(create.parent_object(), &parent));
+    assert!(std::ptr::eq(create.new_entry_object(), &new_entry));
+    assert_eq!(create.parent_object().identity, "exact-parent-directory");
+    assert_eq!(
+        create.new_entry_object().identity,
+        "exact-prospective-named-entry"
+    );
+    assert_eq!(create.mode(), file_mode);
+
+    let directory_mode = InodeCreateMode::try_from_bits(0o2750).unwrap();
+    let mkdir = InodeMkdirContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &parent,
+        &new_entry,
+        directory_mode,
+    );
+    assert!(std::ptr::eq(mkdir.parent_object(), &parent));
+    assert!(std::ptr::eq(mkdir.new_entry_object(), &new_entry));
+    assert_eq!(mkdir.mode(), directory_mode);
+
+    let special_mode = InodeCreateMode::try_from_bits(0o620).unwrap();
+    assert_eq!(
+        InodeMknodOperation::new(InodeMknodKind::Fifo, special_mode, Some(1)),
+        None
+    );
+    assert_eq!(
+        InodeMknodOperation::new(InodeMknodKind::CharacterDevice, special_mode, None),
+        None
+    );
+    let operation =
+        InodeMknodOperation::new(InodeMknodKind::CharacterDevice, special_mode, Some(0x0501))
+            .unwrap();
+    let mknod = InodeMknodContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &parent,
+        &new_entry,
+        operation,
+    );
+    assert!(std::ptr::eq(mknod.parent_object(), &parent));
+    assert!(std::ptr::eq(mknod.new_entry_object(), &new_entry));
+    assert_eq!(mknod.operation().kind(), InodeMknodKind::CharacterDevice);
+    assert_eq!(mknod.operation().mode(), special_mode);
+    assert_eq!(mknod.operation().rdev(), Some(0x0501));
+
+    assert!(InodeMknodOperation::new(InodeMknodKind::Fifo, special_mode, None).is_some());
+    assert!(InodeMknodOperation::new(InodeMknodKind::Socket, special_mode, None).is_some());
+    assert!(InodeMknodOperation::new(InodeMknodKind::BlockDevice, special_mode, Some(0)).is_some());
+
+    let target = vec![0xff, b'/', b't', b'a', b'r', b'g', b'e', b't'];
+    let symlink = InodeSymlinkContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &parent,
+        &new_entry,
+        target.as_slice(),
+    );
+    assert!(std::ptr::eq(symlink.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(symlink.dac_credential(), &dac_credential));
+    assert!(Arc::ptr_eq(
+        symlink.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(symlink.parent_object(), &parent));
+    assert!(std::ptr::eq(symlink.new_entry_object(), &new_entry));
+    assert!(std::ptr::eq(symlink.symlink_target(), target.as_slice()));
+    assert_eq!(symlink.symlink_target(), target.as_slice());
+}
+
+#[test]
+fn inode_link_public_contract_preserves_source_and_destination_roles() {
+    let actor_namespace = TestNamespace::initial("actor");
+    let target_owner_namespace = TestNamespace::initial("hard-link-owner");
+    let actor = Credential::try_root(actor_namespace).unwrap();
+    let dac_credential = overridden_dac_credential(&actor, 3100);
+    let source = NonCopyObject {
+        identity: String::from("exact-source-inode"),
+    };
+    let parent = NonCopyObject {
+        identity: String::from("exact-destination-parent"),
+    };
+    let new_entry = NonCopyObject {
+        identity: String::from("exact-prospective-hard-link-entry"),
+    };
+    let context = InodeLinkContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &source,
+        &parent,
+        &new_entry,
+    );
+
+    assert!(std::ptr::eq(context.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(context.dac_credential(), &dac_credential));
+    assert_ne!(context.dac_credential().uid(), actor.ids().fsuid);
+    assert!(Arc::ptr_eq(
+        context.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(context.source_object(), &source));
+    assert!(std::ptr::eq(context.parent_object(), &parent));
+    assert!(std::ptr::eq(context.new_entry_object(), &new_entry));
+    assert_eq!(context.source_object().identity, "exact-source-inode");
+    assert_eq!(context.parent_object().identity, "exact-destination-parent");
+    assert_eq!(
+        context.new_entry_object().identity,
+        "exact-prospective-hard-link-entry"
+    );
+}
+
+#[test]
+fn inode_removal_public_contracts_preserve_parent_and_existing_entry_roles() {
+    let actor_namespace = TestNamespace::initial("actor");
+    let target_owner_namespace = TestNamespace::initial("removal-owner");
+    let actor = Credential::try_root(actor_namespace).unwrap();
+    let dac_credential = overridden_dac_credential(&actor, 3200);
+    let parent = NonCopyObject {
+        identity: String::from("exact-removal-parent"),
+    };
+    let target_entry = NonCopyObject {
+        identity: String::from("exact-existing-victim-entry"),
+    };
+
+    let unlink = InodeUnlinkContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &parent,
+        &target_entry,
+    );
+    assert!(std::ptr::eq(unlink.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(unlink.dac_credential(), &dac_credential));
+    assert_ne!(unlink.dac_credential().uid(), actor.ids().fsuid);
+    assert!(Arc::ptr_eq(
+        unlink.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(unlink.parent_object(), &parent));
+    assert!(std::ptr::eq(unlink.target_entry_object(), &target_entry));
+
+    let rmdir = InodeRmdirContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &parent,
+        &target_entry,
+    );
+    assert!(std::ptr::eq(rmdir.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(rmdir.dac_credential(), &dac_credential));
+    assert!(Arc::ptr_eq(
+        rmdir.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(rmdir.parent_object(), &parent));
+    assert!(std::ptr::eq(rmdir.target_entry_object(), &target_entry));
+    assert_eq!(
+        rmdir.target_entry_object().identity,
+        "exact-existing-victim-entry"
+    );
+}
+
+#[test]
+fn inode_rename_public_contract_preserves_four_ordered_object_roles() {
+    let actor_namespace = TestNamespace::initial("actor");
+    let target_owner_namespace = TestNamespace::initial("rename-owner");
+    let actor = Credential::try_root(actor_namespace).unwrap();
+    let dac_credential = overridden_dac_credential(&actor, 3300);
+    let old_parent = NonCopyObject {
+        identity: String::from("exact-old-parent"),
+    };
+    let old_entry = NonCopyObject {
+        identity: String::from("exact-old-entry-and-source"),
+    };
+    let new_parent = NonCopyObject {
+        identity: String::from("exact-new-parent"),
+    };
+    let new_entry = NonCopyObject {
+        identity: String::from("exact-new-entry-and-target-state"),
+    };
+
+    let forward = InodeRenameContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &old_parent,
+        &old_entry,
+        &new_parent,
+        &new_entry,
+    );
+    assert!(std::ptr::eq(forward.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(forward.dac_credential(), &dac_credential));
+    assert_ne!(forward.dac_credential().uid(), actor.ids().fsuid);
+    assert!(Arc::ptr_eq(
+        forward.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(forward.old_parent_object(), &old_parent));
+    assert!(std::ptr::eq(forward.old_entry_object(), &old_entry));
+    assert!(std::ptr::eq(forward.new_parent_object(), &new_parent));
+    assert!(std::ptr::eq(forward.new_entry_object(), &new_entry));
+    assert_eq!(forward.old_parent_object().identity, "exact-old-parent");
+    assert_eq!(
+        forward.old_entry_object().identity,
+        "exact-old-entry-and-source"
+    );
+    assert_eq!(forward.new_parent_object().identity, "exact-new-parent");
+    assert_eq!(
+        forward.new_entry_object().identity,
+        "exact-new-entry-and-target-state"
+    );
+
+    // An exchange adapter constructs and dispatches this reverse direction
+    // before dispatching `forward`; the leaf payload itself has no flags.
+    let reverse = InodeRenameContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &new_parent,
+        &new_entry,
+        &old_parent,
+        &old_entry,
+    );
+    assert!(std::ptr::eq(reverse.old_parent_object(), &new_parent));
+    assert!(std::ptr::eq(reverse.old_entry_object(), &new_entry));
+    assert!(std::ptr::eq(reverse.new_parent_object(), &old_parent));
+    assert!(std::ptr::eq(reverse.new_entry_object(), &old_entry));
+}
+
+#[test]
+fn inode_xattr_public_contract_validates_operations_and_preserves_roles() {
+    assert_eq!(XattrSetFlags::try_from_bits(0), Some(XattrSetFlags::NONE));
+    assert_eq!(
+        XattrSetFlags::try_from_bits(0x1),
+        Some(XattrSetFlags::CREATE)
+    );
+    assert_eq!(
+        XattrSetFlags::try_from_bits(0x2),
+        Some(XattrSetFlags::REPLACE)
+    );
+    assert_eq!(
+        XattrSetFlags::CREATE.bits() | XattrSetFlags::REPLACE.bits(),
+        0x3
+    );
+    assert_eq!(XattrSetFlags::try_from_bits(0x3), None);
+    assert_eq!(XattrSetFlags::try_from_bits(0x4), None);
+    assert_eq!(XattrSetFlags::try_from_bits(u32::MAX), None);
+
+    assert_eq!(InodeXattrOperation::get(""), None);
+    assert_eq!(
+        InodeXattrOperation::set("", b"value", XattrSetFlags::NONE),
+        None
+    );
+    assert_eq!(InodeXattrOperation::remove(""), None);
+
+    let get = InodeXattrOperation::get("user.example").unwrap();
+    assert!(matches!(
+        get,
+        InodeXattrOperation::Get {
+            name: "user.example",
+            ..
+        }
+    ));
+    assert_eq!(get.name(), Some("user.example"));
+    assert_eq!(get.value(), None);
+    assert_eq!(get.set_flags(), None);
+    assert_eq!(get.value_class(), None);
+
+    let list = InodeXattrOperation::list();
+    assert!(matches!(list, InodeXattrOperation::List));
+    assert_eq!(list.name(), None);
+    assert_eq!(list.value(), None);
+
+    let remove = InodeXattrOperation::remove("trusted.example").unwrap();
+    assert!(matches!(
+        remove,
+        InodeXattrOperation::Remove {
+            name: "trusted.example",
+            ..
+        }
+    ));
+    assert_eq!(remove.name(), Some("trusted.example"));
+    assert_eq!(remove.value(), None);
+
+    let ordinary_value = [0xff, 0x00];
+    let ordinary = InodeXattrOperation::set(
+        "user.example",
+        ordinary_value.as_slice(),
+        XattrSetFlags::CREATE,
+    )
+    .unwrap();
+    assert_eq!(ordinary.value_class(), Some(XattrValueClass::Opaque));
+
+    let actor_namespace = TestNamespace::initial("xattr-actor");
+    let target_owner_namespace = TestNamespace::initial("xattr-owner");
+    let actor = Credential::try_root(actor_namespace).unwrap();
+    let dac_credential = overridden_dac_credential(&actor, 3400);
+    let target = NonCopyObject {
+        identity: String::from("exact-xattr-target"),
+    };
+    let name = String::from(SECURITY_CAPABILITY_XATTR_NAME);
+    let value = vec![0x01, 0x00, 0x00, 0x02];
+    let operation =
+        InodeXattrOperation::set(name.as_str(), value.as_slice(), XattrSetFlags::REPLACE).unwrap();
+    assert!(matches!(
+        operation,
+        InodeXattrOperation::Set {
+            flags: XattrSetFlags::REPLACE,
+            value_class: XattrValueClass::SecurityCapability,
+            ..
+        }
+    ));
+
+    let context = InodeXattrContext::new(
+        &actor,
+        &dac_credential,
+        &target_owner_namespace,
+        &target,
+        operation,
+    );
+    assert!(std::ptr::eq(context.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(context.dac_credential(), &dac_credential));
+    assert_ne!(context.dac_credential().uid(), actor.ids().fsuid);
+    assert!(Arc::ptr_eq(
+        context.target_owner_user_ns(),
+        &target_owner_namespace
+    ));
+    assert!(std::ptr::eq(context.target_object(), &target));
+    assert_eq!(context.target_object().identity, "exact-xattr-target");
+    assert!(std::ptr::eq(
+        context.operation().name().unwrap(),
+        name.as_str()
+    ));
+    assert!(std::ptr::eq(
+        context.operation().value().unwrap(),
+        value.as_slice()
+    ));
+    assert_eq!(
+        context.operation().set_flags(),
+        Some(XattrSetFlags::REPLACE)
+    );
+    assert_eq!(
+        context.operation().value_class(),
+        Some(XattrValueClass::SecurityCapability)
     );
 }
 

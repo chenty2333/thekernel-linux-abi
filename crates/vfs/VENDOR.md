@@ -28,6 +28,17 @@ Observable behavior and ownership ideas were checked on 2026-07-12 against:
 - Fuchsia/Zircon `8fe57fc696e6ccd1d8f7f48959116d17db467eaa`; and
 - Asterinas `37411049265056135a5e18c8c75a0c3d16b18579`.
 
+Protected-hardlink ordering was additionally checked on 2026-07-14 against
+Linux v6.15 `dd3210c47e8d3ac6b4e9141fc68acc03b38c0ba3`, especially
+`safe_hardlink_source()`, `may_linkat()`, and `filename_linkat()` in
+`fs/namei.c`, plus `inode_owner_or_capable()` in `fs/inode.c`.
+
+Chmod/chown setattr ordering was additionally checked on 2026-07-14 against
+Linux `3b029c035b34bbc693405ddf759f0e9b920c27f1`, especially
+`setattr_should_drop_sgid()`, `setattr_prepare()`, `may_setattr()`, and
+`notify_change()` in `fs/attr.c`, plus `chmod_common()` and `chown_common()` in
+`fs/open.c`.
+
 Linux is GPL-2.0-only and FreeBSD is BSD-licensed. This package reimplements
 observable contracts and general architecture in Rust; it does not copy their
 source. Fuchsia/Zircon and Asterinas were used only for broader handle,

@@ -36,10 +36,24 @@ synchronization, lifetime admission, procfs identity, signal accounting, xattr
 storage, executable leases, credential/process/MM publication, security-hook
 registry/dispatch, and subsystem adapters remain outside this crate. Typed
 ptrace, traceme, and scheduler contexts keep exact caller-owned object payloads
-opaque while the crate supplies only commoncap policy. Typed inode-permission
-and file-open contexts likewise retain an exact actor, independently selected
-DAC snapshot, target-owner namespace, opaque VFS identity, and normalized
-operation facts. The file-open payload deliberately has no `O_PATH` variant:
+opaque while the crate supplies only commoncap policy. Typed inode-permission,
+file-open, and named-entry contexts likewise retain an exact actor,
+independently selected DAC snapshot, target-owner namespace, and opaque VFS
+identities. Named-entry contexts preserve Linux's separate
+create/mkdir/mknod/symlink/link/unlink/rmdir/rename hook roles; the symlink
+context additionally borrows the exact opaque target payload, the link context
+borrows the exact existing source object, removal contexts borrow an opaque
+existing victim entry separately from its parent, and rename retains all four
+ordered old-parent/entry and new-parent/entry roles. The rename leaf accepts no
+flags: the consumer owns Linux's one-way ordinary/no-replace/whiteout dispatch
+and reverse-then-forward exchange dispatch. Target decoding, protected-hardlink
+and `may_delete` admission, raw rename-flag validation, cross-filesystem checks,
+and publication remain with the consumer. The inode-xattr leaf similarly
+borrows exact names and set-value bytes, validates create/replace flags, and
+classifies the `security.capability` wire value without importing a provider,
+store, or parsed kernel capability type; lookup, admission, storage, dispatch,
+and publication remain with the consumer. The
+file-open payload deliberately has no `O_PATH` variant:
 the pinned Linux `do_dentry_open()` path completes `FMODE_PATH` setup and
 returns before `security_file_open`. They do not extract concrete inode/file
 types, object lookup, registry/dispatch, or open-transaction ownership from the
@@ -52,8 +66,10 @@ The Credential v2 contract was checked on 2026-07-11 against:
 - Linux `dd3210c47e8d3ac6b4e9141fc68acc03b38c0ba3`, especially
   `include/linux/cred.h`, `kernel/cred.c`, `include/linux/uidgid.h`,
   `include/linux/user_namespace.h`, `kernel/user_namespace.c`,
-  `kernel/signal.c`, `fs/open.c`, `security/commoncap.c`, `security/security.c`,
-  `include/linux/lsm_hooks.h`, and `include/linux/lsm_hook_defs.h`; and
+  `kernel/signal.c`, `fs/open.c`, `fs/namei.c`, `security/commoncap.c`,
+  `security/security.c`, `include/linux/lsm_hooks.h`, and
+  `include/linux/lsm_hook_defs.h`, `include/linux/security.h`, and
+  `include/uapi/linux/fs.h`; and
 - FreeBSD `86691d52a6d3796ad36ba474cf0a9493f6d99202`, especially
   `sys/sys/ucred.h`, `sys/kern/kern_prot.c`, and
   `sys/security/mac/mac_framework.c`.

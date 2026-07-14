@@ -22,6 +22,18 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
   separately selected DAC snapshot, target-owner namespace, caller-owned
   object identity, and normalized non-empty access/open facts, including
   Linux's reserved ioctl-oriented no-data access mode 3;
+- distinct fallible pre-setattr and infallible post-setattr contexts over a
+  typed chmod/chown intent, omission-preserving ownership fields, normalized
+  hook-point mode, and typed file-privilege cleanup without importing raw
+  iattr masks, core DAC preparation, backend mutation, or registry dispatch;
+- distinct typed `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink`,
+  `inode_link`, `inode_unlink`, `inode_rmdir`, and `inode_rename` contexts over
+  caller-owned source, parent, prospective-entry, and existing-entry
+  identities, consumer-prepared final mode bits, checked FIFO/socket versus
+  character/block device-number facts, and the exact borrowed symlink target;
+- a typed inode-xattr context over borrowed non-empty names and opaque value
+  bytes, validated create/replace flags, and a name-derived
+  `security.capability` value class without an xattr store or provider type;
 - immutable credential and capability-set values whose invariants are checked
   before publication by a consumer;
 - ordinary transitions represented by an opaque proposal bound to the exact
@@ -44,6 +56,86 @@ and clones it into an empty slot, so the guarded operation neither retires nor
 destroys map ownership. In particular,
 `thekernel-linux-cred` does not depend on the process, VFS, signal, FD, MM,
 usercopy, `kspin`, or other kernel mechanism crates.
+
+Inode attribute security keeps the Linux hook point separate from the later
+core and backend preparation. `InodeSetattrIntent` selects a typed chmod or
+chown family. Chmod carries a checked low-`0o7777` requested mode. Chown carries
+independent `Option<Kuid>` and `Option<Kgid>` values so an omitted field is
+never collapsed into an explicitly requested current owner; both fields may be
+omitted while a non-directory request still carries set-ID or file-privilege
+cleanup. `InodeSetattrProposal` is the frozen iattr-equivalent input observed by
+the fallible hook: its optional mode and owner fields have not yet passed the
+consumer's Linux-style `setattr_prepare`, and `Kill` records selected privilege
+cleanup rather than claiming that cleanup already succeeded.
+
+`InodeSetattrContext` binds that proposal to the exact old object snapshot,
+immutable actor, independently selected DAC snapshot, and object-owner
+namespace. `InodePostSetattrContext` is a separate type for an infallible
+notification after successful backend publication and binds the admitted
+proposal to the consumer's exact committed object/outcome snapshot. This crate
+does not make post dispatch infallible by itself: the embedding registry must
+preflight module state before mutation and carry its own linear admission token
+through publication. Writable-mount ordering, inode/metadata locking,
+`may_setattr`, owner/capability/SGID checks, privilege cleanup, provider
+transactions, backend updates, and errno mapping remain consumer-owned.
+
+Named-entry security follows Linux's hook topology rather than collapsing
+every namespace addition into one umbrella operation. `InodeCreateContext`
+represents only a named regular file, `InodeMkdirContext` only a named
+directory, and `InodeMknodContext` FIFO, character-device, block-device, or
+socket nodes.
+`InodeCreateMode` carries the consumer-prepared final low `0o7777` mode bits;
+the context kind supplies the file type. This normalized fact follows Linux's
+hook-family topology without claiming byte-for-byte identity with each raw
+Linux `umode_t` payload. Character and block operations require a
+caller-normalized `rdev`, while FIFO and socket operations forbid one.
+`InodeSymlinkContext` instead carries the exact opaque target payload which the
+consumer will store; it deliberately has no mode or device number because
+Linux's `inode_symlink` hook has neither. `InodeLinkContext` is a separate hard-
+link contract which freezes the exact existing source object in addition to the
+destination parent and prospective entry. It carries no new inode mode, device
+number, or symlink target. The consumer remains responsible for source
+eligibility (including protected-hardlink ownership/`CAP_FOWNER` policy),
+cross-filesystem rejection, destination revalidation, and publishing a new name
+for that same source. Unnamed `O_TMPFILE` creation is not a named inode-create
+event.
+
+Removal likewise keeps Linux's hook topology explicit. `InodeUnlinkContext`
+and `InodeRmdirContext` each bind the frozen actor and DAC snapshot to a
+distinct parent object and opaque existing-entry object; the latter is where a
+consumer binds the final name to the exact victim inode snapshot. The two
+contexts do not accept a caller-selected `is_dir` flag and carry no invented
+mode, link-count, last-link, mountpoint, notification, or backend-emptiness
+facts. Writable-mount and `may_delete`-style admission, path-level hooks,
+backend support, publication, timestamps, and errno mapping remain with the
+embedding VFS transaction.
+
+`InodeRenameContext` binds all four ordered Linux LSM leaf roles separately:
+old parent, old source entry, new parent, and new destination entry. It does
+not carry rename flags. In the pinned Linux topology, the
+`security_inode_rename` wrapper sees `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, and
+`RENAME_WHITEOUT`, while an `inode_rename` LSM leaf receives only those four
+objects. Ordinary, no-replace, and whiteout operations therefore dispatch one
+forward leaf context. An exchange adapter must explicitly dispatch a reverse
+context first, short-circuit on its denial, and then dispatch the forward
+context. Raw flag decoding and validation, path-level hooks, target
+presence/absence rules, DAC/sticky and ancestry checks, backend mutation, and
+notification remain outside this independent credential leaf.
+
+`InodeXattrOperation` preserves the four get, list, set, and remove hook
+families without flattening absent payloads into empty values. Named operations
+reject an empty name. Set operations borrow the exact opaque value bytes and
+carry `XattrSetFlags`, which accepts only zero, create, or replace and rejects
+the contradictory create-plus-replace combination and unknown bits. The set
+constructor derives `XattrValueClass::SecurityCapability` only for the exact
+`security.capability` name; this is a policy-facing wire-value classification,
+not a parsed `FileCapabilities`, provider object, or VFS type.
+
+`InodeXattrContext` binds that borrowed operation to the exact actor,
+independently selected DAC snapshot, target-owner namespace, and opaque target
+object. Namespace visibility and authority, DAC admission, lookup, mount
+writability, size limits, xattr storage, provider transactions, pre/post hook
+dispatch, and errno mapping remain in the embedding consumer.
 
 `FileOpenAccess::NoData` describes the persistent mode-3 file description, not
 its earlier Linux `ACC_MODE` permission admission. It therefore reports neither

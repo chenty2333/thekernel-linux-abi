@@ -1,9 +1,11 @@
 /// Backend contract for one fallible, generation-revalidated VFS mutation.
 ///
-/// Authorization and pathwalk complete before [`reserve`](Self::reserve).
-/// `publish` must make the name/tree change visible at most once. Rollback is
-/// infallible and is invoked for every prepared transaction that does not
-/// report successful publication.
+/// Pathwalk and preliminary admission complete before [`reserve`](Self::reserve).
+/// After generation revalidation, [`admit`](Self::admit) performs any final
+/// policy check which depends on the exact revalidated destination. `publish`
+/// must make the name/tree change visible at most once. Rollback is infallible
+/// and is invoked for every prepared transaction that does not report
+/// successful publication.
 ///
 /// Rollback releases only the private reservation or hidden admission owned by
 /// this transaction. It never promises to reverse a namespace change. A
@@ -14,7 +16,7 @@
 /// committed outcome rather than convert a secondary cleanup failure into an
 /// apparently retryable publication error.
 pub trait MutationBackend {
-    /// Mutation request after pathname and authorization validation.
+    /// Mutation request after pathname and preliminary admission.
     type Request;
     /// Private reservation containing all fallible resources and generations.
     type Reservation;
@@ -23,13 +25,23 @@ pub trait MutationBackend {
     /// Backend error mapped to Linux errno by the adapter.
     type Error;
 
-    /// Reserves fallible metadata and accounting without publishing a node.
+    /// Reserves initial private metadata and accounting without publication.
     fn reserve(&self, request: Self::Request) -> Result<Self::Reservation, Self::Error>;
 
-    /// Revalidates parent/name generations immediately before publication.
+    /// Revalidates parent/name generations before final admission and
+    /// publication.
     fn revalidate(&self, reservation: &Self::Reservation) -> Result<(), Self::Error>;
 
-    /// Publishes exactly once.
+    /// Performs final policy admission over the revalidated reservation.
+    ///
+    /// This phase may enrich private prepared state needed by publication, but
+    /// must not make any namespace or tree mutation visible. The default is a
+    /// policy-neutral no-op for backends whose admission is already complete.
+    fn admit(&self, _reservation: &mut Self::Reservation) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Makes the transaction's single, at-most-once publication attempt.
     ///
     /// On error, the *private reservation* remains releasable by
     /// [`rollback`](Self::rollback); rollback does not undo filesystem
@@ -56,7 +68,7 @@ pub struct MutationTransaction<'a, B: MutationBackend> {
 }
 
 impl<'a, B: MutationBackend> MutationTransaction<'a, B> {
-    /// Prepares all fallible mutation state without publishing it.
+    /// Reserves private mutation state without publishing it.
     pub fn prepare(backend: &'a B, request: B::Request) -> Result<Self, B::Error> {
         Ok(Self {
             backend,
@@ -65,14 +77,16 @@ impl<'a, B: MutationBackend> MutationTransaction<'a, B> {
         })
     }
 
-    /// Revalidates and publishes the mutation once.
+    /// Revalidates, performs final admission, and makes the single publication
+    /// attempt.
     ///
     /// Any failure leaves the reservation owned by `self`, so `Drop` releases
-    /// that private admission before the error reaches the syscall adapter.
-    /// This cleanup does not imply compensation of a lower filesystem's
-    /// partially committed namespace operation.
+    /// that private reservation and any hidden admission before the error
+    /// reaches the syscall adapter. This cleanup does not imply compensation
+    /// of a lower filesystem's partially committed namespace operation.
     pub fn commit(mut self) -> Result<B::Output, B::Error> {
         self.backend.revalidate(&self.reservation)?;
+        self.backend.admit(&mut self.reservation)?;
         let output = self.backend.publish(&mut self.reservation)?;
         self.completed = true;
         Ok(output)
@@ -103,12 +117,14 @@ mod tests {
     enum Error {
         Reserve,
         Revalidate,
+        Admit,
         Publish,
     }
 
     struct Backend {
         fail: Option<Error>,
         reserved: Cell<usize>,
+        admitted: Cell<usize>,
         published: Cell<usize>,
         rolled_back: Cell<usize>,
     }
@@ -118,6 +134,7 @@ mod tests {
             Self {
                 fail,
                 reserved: Cell::new(0),
+                admitted: Cell::new(0),
                 published: Cell::new(0),
                 rolled_back: Cell::new(0),
             }
@@ -146,6 +163,15 @@ mod tests {
             }
         }
 
+        fn admit(&self, reservation: &mut Self::Reservation) -> Result<(), Self::Error> {
+            if self.fail == Some(Error::Admit) {
+                return Err(Error::Admit);
+            }
+            *reservation += 1;
+            self.admitted.set(self.admitted.get() + 1);
+            Ok(())
+        }
+
         fn publish(
             &self,
             reservation: &mut Self::Reservation,
@@ -164,13 +190,17 @@ mod tests {
 
     #[test]
     fn every_post_reserve_failure_rolls_back_once() {
-        for failure in [Error::Revalidate, Error::Publish] {
+        for failure in [Error::Revalidate, Error::Admit, Error::Publish] {
             let backend = Backend::new(Some(failure));
             assert_eq!(
                 MutationTransaction::prepare(&backend, ()).and_then(MutationTransaction::commit),
                 Err(failure)
             );
             assert_eq!(backend.reserved.get(), 1);
+            assert_eq!(
+                backend.admitted.get(),
+                usize::from(failure == Error::Publish)
+            );
             assert_eq!(backend.published.get(), 0);
             assert_eq!(backend.rolled_back.get(), 1);
         }
@@ -181,8 +211,9 @@ mod tests {
         let backend = Backend::new(None);
         assert_eq!(
             MutationTransaction::prepare(&backend, ()).and_then(MutationTransaction::commit),
-            Ok(7)
+            Ok(8)
         );
+        assert_eq!(backend.admitted.get(), 1);
         assert_eq!(backend.published.get(), 1);
         assert_eq!(backend.rolled_back.get(), 0);
     }

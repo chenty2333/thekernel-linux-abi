@@ -14,7 +14,9 @@ use core::{
 
 use linux_raw_sys::general::{CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT};
 
-use crate::{CAPABILITY_WORDS, Credential, FsCredentialSnapshot, UserNamespaceView, ns_capable};
+use crate::{
+    CAPABILITY_WORDS, Credential, FsCredentialSnapshot, Kgid, Kuid, UserNamespaceView, ns_capable,
+};
 
 /// Policy-neutral authorization failures returned by commoncap helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +180,1414 @@ impl<'a, N: UserNamespaceView, O: ?Sized> InodePermissionContext<'a, N, O> {
     /// Returns the normalized non-empty access request.
     pub const fn access(&self) -> InodePermissionAccess {
         self.access
+    }
+}
+
+/// Normalized permission and special-mode bits presented at the inode-setattr
+/// hook point.
+///
+/// This value contains only the low `0o7777` bits. The embedding object's
+/// opaque identity carries its inode kind, while the consumer remains
+/// responsible for preserving any filesystem-internal file-type bits. For a
+/// chmod request this is the requested hook-point mode, before a later
+/// Linux-style `setattr_prepare` step may clear SGID.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeSetattrMode;
+///
+/// // Raw tuple construction is not part of the public contract.
+/// let _ = InodeSetattrMode(0o644);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodeSetattrMode(u16);
+
+impl InodeSetattrMode {
+    const ALL_BITS: u16 = 0o7777;
+
+    /// Constructs a mode from normalized permission and special bits.
+    ///
+    /// Mode zero is valid. A file-type or any other unknown bit is rejected.
+    pub const fn try_from_bits(bits: u16) -> Option<Self> {
+        if bits & !Self::ALL_BITS != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    /// Returns the normalized permission and special-mode bits.
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// File-privilege cleanup visible at the inode-setattr hook point.
+///
+/// This is the semantic equivalent of whether a prepared Linux attribute
+/// request still carries `ATTR_KILL_PRIV`; it is not a raw attribute bit or a
+/// claim that cleanup has already succeeded. The consumer performs any
+/// fallible cleanup after the pre-hook and before metadata publication under
+/// its own transaction discipline.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum InodeSetattrPrivilegeCleanup {
+    /// Preserve file privilege metadata during this attribute request.
+    Preserve,
+    /// Remove privilege metadata as part of the admitted attribute request.
+    Kill,
+}
+
+/// Normalized chmod request before inode-setattr policy and core preparation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodeChmodIntent {
+    mode: InodeSetattrMode,
+}
+
+impl InodeChmodIntent {
+    /// Constructs a chmod intent from its normalized requested mode.
+    pub const fn new(mode: InodeSetattrMode) -> Self {
+        Self { mode }
+    }
+
+    /// Returns the requested hook-point mode.
+    pub const fn mode(self) -> InodeSetattrMode {
+        self.mode
+    }
+}
+
+/// Normalized chown request which preserves omitted UID and GID fields.
+///
+/// `None` means that the corresponding userspace field was the all-ones
+/// omission sentinel. It is deliberately not folded into the inode's current
+/// owner: Linux authorizes only fields actually present in the attribute
+/// request, while an explicitly requested current value remains present.
+/// Both fields may be omitted because a non-directory chown operation can
+/// still request set-ID and privilege cleanup.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodeChownIntent {
+    user: Option<Kuid>,
+    group: Option<Kgid>,
+}
+
+impl InodeChownIntent {
+    /// Constructs an omission-aware chown intent.
+    pub const fn new(user: Option<Kuid>, group: Option<Kgid>) -> Self {
+        Self { user, group }
+    }
+
+    /// Returns the requested kernel-global user ID, or `None` when omitted.
+    pub const fn user(self) -> Option<Kuid> {
+        self.user
+    }
+
+    /// Returns the requested kernel-global group ID, or `None` when omitted.
+    pub const fn group(self) -> Option<Kgid> {
+        self.group
+    }
+}
+
+/// Leaf-typed inode attribute request selected by the embedding adapter.
+///
+/// The variants identify Linux-visible operation families without raw iattr
+/// masks or caller-provided booleans. Future time-setting support can add a
+/// separate typed variant without changing the chmod/chown payloads.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum InodeSetattrIntent {
+    /// Change permission and special-mode bits.
+    Chmod(InodeChmodIntent),
+    /// Change zero, one, or both ownership fields with omission preserved.
+    Chown(InodeChownIntent),
+}
+
+/// Normalized iattr-equivalent proposal observed by an inode-setattr hook.
+///
+/// The proposal is the consumer-frozen hook-point input, not the final result
+/// of `setattr_prepare` or the backend. Its private construction keeps intent,
+/// optional mode/owner fields, and privilege cleanup coherent:
+/// [`Self::chmod`] always carries the requested mode, no owner fields, and no
+/// privilege cleanup; [`Self::chown`] copies the omission-aware owner fields
+/// from its intent and accepts only the implicit mode and cleanup selected by
+/// the consumer from the same old-inode snapshot.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::{InodeSetattrIntent, InodeSetattrProposal};
+///
+/// // External consumers cannot forge mismatched intent/proposal fields.
+/// let _ = InodeSetattrProposal {
+///     intent: todo!(),
+///     mode: None,
+///     user: None,
+///     group: None,
+///     privilege_cleanup: todo!(),
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodeSetattrProposal {
+    intent: InodeSetattrIntent,
+    mode: Option<InodeSetattrMode>,
+    user: Option<Kuid>,
+    group: Option<Kgid>,
+    privilege_cleanup: InodeSetattrPrivilegeCleanup,
+}
+
+impl InodeSetattrProposal {
+    /// Constructs the only valid chmod hook-point proposal shape.
+    pub const fn chmod(intent: InodeChmodIntent) -> Self {
+        Self {
+            intent: InodeSetattrIntent::Chmod(intent),
+            mode: Some(intent.mode()),
+            user: None,
+            group: None,
+            privilege_cleanup: InodeSetattrPrivilegeCleanup::Preserve,
+        }
+    }
+
+    /// Constructs a chown hook-point proposal.
+    ///
+    /// `mode` is the optional implicit set-ID cleanup computed from the exact
+    /// old inode snapshot. `privilege_cleanup` records whether file privilege
+    /// metadata remains selected for later cleanup. Neither effect has been
+    /// published merely by constructing this value.
+    pub const fn chown(
+        intent: InodeChownIntent,
+        mode: Option<InodeSetattrMode>,
+        privilege_cleanup: InodeSetattrPrivilegeCleanup,
+    ) -> Self {
+        Self {
+            intent: InodeSetattrIntent::Chown(intent),
+            mode,
+            user: intent.user(),
+            group: intent.group(),
+            privilege_cleanup,
+        }
+    }
+
+    /// Returns the leaf-typed request which produced this proposal.
+    pub const fn intent(self) -> InodeSetattrIntent {
+        self.intent
+    }
+
+    /// Returns the hook-point mode field, if present.
+    pub const fn mode(self) -> Option<InodeSetattrMode> {
+        self.mode
+    }
+
+    /// Returns the hook-point user field, preserving omission as `None`.
+    pub const fn user(self) -> Option<Kuid> {
+        self.user
+    }
+
+    /// Returns the hook-point group field, preserving omission as `None`.
+    pub const fn group(self) -> Option<Kgid> {
+        self.group
+    }
+
+    /// Returns the selected file-privilege cleanup effect.
+    pub const fn privilege_cleanup(self) -> InodeSetattrPrivilegeCleanup {
+        self.privilege_cleanup
+    }
+}
+
+/// Immutable facts shared privately by the pre- and post-setattr contexts.
+///
+/// The two public context types deliberately remain distinct even though they
+/// retain the same categories of facts: one belongs to a fallible admission
+/// point and the other can only describe a successful publication.
+struct InodeSetattrFacts<'a, N: UserNamespaceView, O: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    target_object: &'a O,
+    proposal: InodeSetattrProposal,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> InodeSetattrFacts<'a, N, O> {
+    const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        target_object: &'a O,
+        proposal: InodeSetattrProposal,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            target_object,
+            proposal,
+        }
+    }
+}
+
+/// Complete immutable input to one fallible inode-setattr policy hook.
+///
+/// `O` is the embedding kernel's exact pinned old-inode identity and metadata
+/// snapshot. The caller freezes that object, the actor and selected DAC view,
+/// the object's owner namespace, and one coherent hook-point proposal under
+/// its own inode/metadata transaction. This context performs no DAC check,
+/// lookup, `setattr_prepare`, privilege cleanup, backend mutation, registry
+/// dispatch, or errno mapping.
+pub struct InodeSetattrContext<'a, N: UserNamespaceView, O: ?Sized> {
+    facts: InodeSetattrFacts<'a, N, O>,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> InodeSetattrContext<'a, N, O> {
+    /// Binds one exact actor, old object, owner namespace, and proposal.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        target_object: &'a O,
+        proposal: InodeSetattrProposal,
+    ) -> Self {
+        Self {
+            facts: InodeSetattrFacts::new(
+                actor,
+                dac_credential,
+                target_owner_user_ns,
+                target_object,
+                proposal,
+            ),
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.facts.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for this operation.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.facts.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the affected inode.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.facts.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact old-inode object snapshot.
+    pub const fn target_object(&self) -> &'a O {
+        self.facts.target_object
+    }
+
+    /// Returns the normalized hook-point proposal.
+    pub const fn proposal(&self) -> InodeSetattrProposal {
+        self.facts.proposal
+    }
+
+    /// Returns the leaf-typed request which produced the proposal.
+    pub const fn intent(&self) -> InodeSetattrIntent {
+        self.facts.proposal.intent()
+    }
+}
+
+/// Immutable input to one infallible post-setattr notification.
+///
+/// This type is intentionally not interchangeable with
+/// [`InodeSetattrContext`]. The embedding consumer constructs it only after
+/// the backend has reported successful publication, using the same frozen
+/// actor, DAC view, owner namespace, and proposal which passed the fallible
+/// hook. `O` is the consumer's exact committed object/outcome snapshot. A
+/// registry that needs a no-failure post phase should preflight module state
+/// before publication and carry its own linear admission token; this leaf type
+/// owns neither that token nor dispatch.
+pub struct InodePostSetattrContext<'a, N: UserNamespaceView, O: ?Sized> {
+    facts: InodeSetattrFacts<'a, N, O>,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> InodePostSetattrContext<'a, N, O> {
+    /// Binds one successfully committed object to the admitted proposal.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        committed_object: &'a O,
+        proposal: InodeSetattrProposal,
+    ) -> Self {
+        Self {
+            facts: InodeSetattrFacts::new(
+                actor,
+                dac_credential,
+                target_owner_user_ns,
+                committed_object,
+                proposal,
+            ),
+        }
+    }
+
+    /// Borrows the exact immutable actor credential retained from admission.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.facts.actor
+    }
+
+    /// Borrows the exact filesystem identity selected during admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.facts.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the affected inode.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.facts.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined successfully committed object snapshot.
+    pub const fn committed_object(&self) -> &'a O {
+        self.facts.target_object
+    }
+
+    /// Returns the exact proposal admitted before publication.
+    pub const fn proposal(&self) -> InodeSetattrProposal {
+        self.facts.proposal
+    }
+
+    /// Returns the leaf-typed request which produced the admitted proposal.
+    pub const fn intent(&self) -> InodeSetattrIntent {
+        self.facts.proposal.intent()
+    }
+}
+
+/// Consumer-prepared final permission and special-mode bits for one named
+/// inode creation.
+///
+/// The object kind selects the Linux-style `inode_create`, `inode_mkdir`, or
+/// `inode_mknod` hook family, while the embedding adapter supplies the final
+/// low `0o7777` permission and special bits which its creation transaction will
+/// publish. This is a normalized policy fact, not a byte-for-byte copy of the
+/// raw Linux `umode_t` hook payload. File-type bits, open flags, and unnamed
+/// temporary-file state are deliberately not representable.
+///
+/// Mode zero is valid. Fields remain private so a consumer cannot bypass the
+/// normalized-bit invariant.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeCreateMode;
+///
+/// // Raw tuple construction is not part of the public contract.
+/// let _ = InodeCreateMode(0o644);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodeCreateMode(u16);
+
+impl InodeCreateMode {
+    const ALL_BITS: u16 = 0o7777;
+
+    /// Constructs a mode from normalized permission and special bits.
+    ///
+    /// Returns `None` when a file-type or any other unknown bit is present.
+    /// This validates only the bit domain; completing umask, set-ID, ownership,
+    /// and other creation-mode preparation remains an adapter precondition.
+    pub const fn try_from_bits(bits: u16) -> Option<Self> {
+        if bits & !Self::ALL_BITS != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    /// Returns the normalized permission and special-mode bits.
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// Complete immutable input to one regular-file `inode_create` policy hook.
+///
+/// `P` is the embedding kernel's caller-owned opaque parent-directory identity
+/// and `E` is its opaque prospective named-entry identity. Keeping the two
+/// payloads distinct preserves Linux's `dir`/`dentry` roles without importing
+/// a VFS type. The caller completes DAC admission, freezes the final mode, and
+/// ensures that the prospective destination remains eligible for creation
+/// under its VFS transaction or locking discipline. This context does not
+/// represent directory creation, special-node creation, symlinks, hard links,
+/// or unnamed temporary files.
+pub struct InodeCreateContext<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    parent_object: &'a P,
+    new_entry_object: &'a E,
+    mode: InodeCreateMode,
+}
+
+impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> InodeCreateContext<'a, N, P, E> {
+    /// Binds one exact actor, destination, prospective entry, and final mode.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        parent_object: &'a P,
+        new_entry_object: &'a E,
+        mode: InodeCreateMode,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            parent_object,
+            new_entry_object,
+            mode,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the destination filesystem.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact parent-directory identity.
+    pub const fn parent_object(&self) -> &'a P {
+        self.parent_object
+    }
+
+    /// Borrows the embedding-defined prospective named-entry identity.
+    pub const fn new_entry_object(&self) -> &'a E {
+        self.new_entry_object
+    }
+
+    /// Returns the final normalized regular-file creation mode.
+    pub const fn mode(&self) -> InodeCreateMode {
+        self.mode
+    }
+}
+
+/// Complete immutable input to one directory `inode_mkdir` policy hook.
+///
+/// The parent and prospective entry are caller-owned opaque identities. The
+/// final mode is frozen after the embedding consumer's creation-mode
+/// preparation. Symlink and hard-link operations use different hook topologies
+/// and are deliberately outside this context.
+pub struct InodeMkdirContext<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    parent_object: &'a P,
+    new_entry_object: &'a E,
+    mode: InodeCreateMode,
+}
+
+impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> InodeMkdirContext<'a, N, P, E> {
+    /// Binds one exact actor, destination, prospective entry, and final mode.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        parent_object: &'a P,
+        new_entry_object: &'a E,
+        mode: InodeCreateMode,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            parent_object,
+            new_entry_object,
+            mode,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the destination filesystem.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact parent-directory identity.
+    pub const fn parent_object(&self) -> &'a P {
+        self.parent_object
+    }
+
+    /// Borrows the embedding-defined prospective named-entry identity.
+    pub const fn new_entry_object(&self) -> &'a E {
+        self.new_entry_object
+    }
+
+    /// Returns the final normalized directory creation mode.
+    pub const fn mode(&self) -> InodeCreateMode {
+        self.mode
+    }
+}
+
+/// Node kind presented to one Linux-style `inode_mknod` policy hook.
+///
+/// Regular files and directories have distinct hook contexts. Symlinks and
+/// hard links are namespace-link operations rather than `mknod` kinds.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeMknodKind;
+///
+/// // Symlinks use the distinct InodeSymlinkContext contract.
+/// let _ = InodeMknodKind::Symlink;
+/// ```
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeMknodKind;
+///
+/// // Hard links use the distinct InodeLinkContext contract.
+/// let _ = InodeMknodKind::HardLink;
+/// ```
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeMknodKind;
+///
+/// // Named regular files use the inode_create contract.
+/// let _ = InodeMknodKind::RegularFile;
+/// ```
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeMknodKind;
+///
+/// // Directories use the inode_mkdir contract.
+/// let _ = InodeMknodKind::Directory;
+/// ```
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodeMknodKind;
+///
+/// // O_TMPFILE is unnamed and never enters a named mknod hook.
+/// let _ = InodeMknodKind::UnnamedTemporaryFile;
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum InodeMknodKind {
+    /// A named FIFO.
+    Fifo,
+    /// A character device node.
+    CharacterDevice,
+    /// A block device node.
+    BlockDevice,
+    /// A named Unix-domain socket inode.
+    Socket,
+}
+
+impl InodeMknodKind {
+    const fn requires_device(self) -> bool {
+        matches!(self, Self::CharacterDevice | Self::BlockDevice)
+    }
+}
+
+/// Normalized, already-validated facts for one `inode_mknod` policy hook.
+///
+/// `rdev` is the embedding kernel's caller-normalized device number. It is
+/// mandatory for character and block devices and forbidden for FIFO and socket
+/// nodes. The field-private constructor prevents those combinations from being
+/// forged. Linux ABI encoding and generic-VFS device types remain adapter
+/// responsibilities.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::{InodeCreateMode, InodeMknodKind, InodeMknodOperation};
+///
+/// // External code cannot forge an invalid kind/device combination.
+/// let _ = InodeMknodOperation {
+///     kind: InodeMknodKind::Fifo,
+///     mode: InodeCreateMode::try_from_bits(0o600).unwrap(),
+///     rdev: Some(1),
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodeMknodOperation {
+    kind: InodeMknodKind,
+    mode: InodeCreateMode,
+    rdev: Option<u64>,
+}
+
+impl InodeMknodOperation {
+    /// Constructs one normalized special-node creation operation.
+    ///
+    /// Returns `None` unless character and block nodes have an `rdev` and FIFO
+    /// and socket nodes do not.
+    pub const fn new(
+        kind: InodeMknodKind,
+        mode: InodeCreateMode,
+        rdev: Option<u64>,
+    ) -> Option<Self> {
+        if kind.requires_device() != rdev.is_some() {
+            None
+        } else {
+            Some(Self { kind, mode, rdev })
+        }
+    }
+
+    /// Returns the normalized special-node kind.
+    pub const fn kind(self) -> InodeMknodKind {
+        self.kind
+    }
+
+    /// Returns the final normalized creation mode.
+    pub const fn mode(self) -> InodeCreateMode {
+        self.mode
+    }
+
+    /// Returns the normalized device number for character or block nodes.
+    pub const fn rdev(self) -> Option<u64> {
+        self.rdev
+    }
+}
+
+/// Complete immutable input to one `inode_mknod` policy hook.
+///
+/// The context binds an already-validated operation to distinct opaque parent
+/// and prospective named-entry identities. It owns no lookup, VFS object,
+/// device-number encoding, hook registry, dispatch, transaction, or
+/// publication mechanism.
+pub struct InodeMknodContext<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    parent_object: &'a P,
+    new_entry_object: &'a E,
+    operation: InodeMknodOperation,
+}
+
+/// Complete immutable input to one `inode_symlink` policy hook.
+///
+/// `P` and `E` preserve the embedding kernel's distinct parent-directory and
+/// prospective named-entry identities. `T` is the exact caller-owned target
+/// payload which the admitted filesystem transaction will store. Keeping the
+/// target opaque lets byte-oriented consumers retain Linux pathname bytes
+/// without imposing an encoding, allocation, or path-resolution policy on this
+/// crate.
+///
+/// The caller completes pathname decoding, destination DAC admission, and
+/// absence revalidation before dispatch. It must keep the destination eligible
+/// and publish the same target under its VFS transaction or locking discipline.
+/// Unlike `inode_create`, `inode_mkdir`, and `inode_mknod`, Linux's symlink hook
+/// carries no creation mode or device number.
+pub struct InodeSymlinkContext<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized, T: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    parent_object: &'a P,
+    new_entry_object: &'a E,
+    symlink_target: &'a T,
+}
+
+/// Complete immutable input to one `inode_link` policy hook.
+///
+/// `S` is the embedding kernel's exact caller-owned source-inode identity,
+/// while `P` and `E` preserve the distinct destination parent-directory and
+/// prospective named-entry identities. Keeping all three payloads opaque and
+/// separate mirrors Linux's source/directory/new-entry hook topology without
+/// importing a VFS type or permitting this leaf to perform a lookup.
+///
+/// The caller completes source eligibility (including protected-hardlink and
+/// ownership/capability policy), destination DAC admission, cross-filesystem
+/// rejection, and absence revalidation before dispatch. It must keep the
+/// source and destination eligible and publish a new name for the same source
+/// object under its VFS transaction or locking discipline. A hard link stores
+/// neither a symlink target nor a new inode mode or device number, so none of
+/// those facts are representable here.
+pub struct InodeLinkContext<'a, N: UserNamespaceView, S: ?Sized, P: ?Sized, E: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    source_object: &'a S,
+    parent_object: &'a P,
+    new_entry_object: &'a E,
+}
+
+/// Complete immutable input to one `inode_unlink` policy hook.
+///
+/// `P` is the embedding kernel's exact parent-directory identity and `E` is
+/// its exact existing named-entry identity. The entry payload is deliberately
+/// distinct from the parent and is expected to bind the final name to the
+/// victim inode snapshot selected by the caller. This mirrors Linux's
+/// `dir`/`dentry` hook topology without importing a VFS or permitting this
+/// leaf crate to repeat lookup.
+///
+/// The caller completes writable-mount, parent write/search, sticky-directory,
+/// victim-type, backend-support, and other `may_delete`-style admission before
+/// dispatch. It must keep the same parent, name, and victim eligible and remove
+/// that exact entry under its VFS transaction or locking discipline. Path-level
+/// hooks, mountpoint policy, delegation, link-count updates, notifications, and
+/// errno mapping remain consumer responsibilities. Directory removal uses the
+/// distinct [`InodeRmdirContext`] contract rather than a caller-provided flag.
+pub struct InodeUnlinkContext<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    parent_object: &'a P,
+    target_entry_object: &'a E,
+}
+
+/// Complete immutable input to one `inode_rmdir` policy hook.
+///
+/// The opaque parent and existing-entry payloads preserve Linux's distinct
+/// `dir` and `dentry` roles. The existing entry is caller-owned and should bind
+/// the exact final name to the exact directory snapshot selected for removal;
+/// this crate owns no lookup, directory enumeration, or namespace mutation.
+///
+/// The caller completes writable-mount, parent write/search, sticky-directory,
+/// victim-is-directory, backend-support, mountpoint, and other pre-hook
+/// admission while keeping the selected objects stable through dispatch and
+/// publication. Backend directory-emptiness checks, path-level hooks,
+/// delegation, timestamps, notifications, and errno mapping remain outside
+/// this context. Non-directory removal uses [`InodeUnlinkContext`].
+pub struct InodeRmdirContext<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    parent_object: &'a P,
+    target_entry_object: &'a E,
+}
+
+/// Complete immutable input to one LSM `inode_rename` leaf hook.
+///
+/// `OP`, `OE`, `NP`, and `NE` preserve the four distinct object roles in
+/// Linux's `old_dir`, `old_dentry`, `new_dir`, and `new_dentry` hook
+/// signature. The old entry binds the exact source name and inode selected by
+/// the caller. The new entry binds the exact destination name and either its
+/// prospective absence or its existing target inode, according to the
+/// embedding VFS transaction. All four identities remain opaque so this leaf
+/// neither performs lookup nor invents a concrete VFS representation.
+///
+/// Linux's `security_inode_rename` wrapper receives rename flags, but the
+/// actual `inode_rename` LSM leaf does not. Ordinary, `RENAME_NOREPLACE`, and
+/// `RENAME_WHITEOUT` operations therefore present the same single forward
+/// leaf context. For `RENAME_EXCHANGE`, the embedding dispatcher must first
+/// present a separately constructed reverse context and stop on its denial,
+/// then present the forward context. Flag decoding, combination validation,
+/// path-level hooks, private-inode bypass, and that ordered dispatch remain
+/// outside this type rather than being flattened into a boolean or raw mask.
+///
+/// The caller also owns writable-mount, source/destination DAC and sticky
+/// admission, cross-filesystem and ancestry checks, backend support,
+/// transaction stability, mutation, notification, and errno mapping.
+///
+/// The context borrows every frozen input and cannot outlive even one of the
+/// four object-role identities:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use thekernel_linux_cred::{
+///     Credential, FsCredentialSnapshot, InodeRenameContext, UserNamespaceView,
+/// };
+///
+/// fn cannot_escape_new_entry<'a, N, OP, OE, NP>(
+///     actor: &'a Credential<N>,
+///     dac: &'a FsCredentialSnapshot,
+///     owner: &'a Arc<N>,
+///     old_parent: &'a OP,
+///     old_entry: &'a OE,
+///     new_parent: &'a NP,
+/// ) -> InodeRenameContext<'a, N, OP, OE, NP, u8>
+/// where
+///     N: UserNamespaceView,
+/// {
+///     let new_entry = 7_u8;
+///     InodeRenameContext::new(
+///         actor,
+///         dac,
+///         owner,
+///         old_parent,
+///         old_entry,
+///         new_parent,
+///         &new_entry,
+///     )
+/// }
+/// ```
+pub struct InodeRenameContext<
+    'a,
+    N: UserNamespaceView,
+    OP: ?Sized,
+    OE: ?Sized,
+    NP: ?Sized,
+    NE: ?Sized,
+> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    old_parent_object: &'a OP,
+    old_entry_object: &'a OE,
+    new_parent_object: &'a NP,
+    new_entry_object: &'a NE,
+}
+
+impl<'a, N: UserNamespaceView, S: ?Sized, P: ?Sized, E: ?Sized> InodeLinkContext<'a, N, S, P, E> {
+    /// Binds one exact actor, source object, and prospective destination.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        source_object: &'a S,
+        parent_object: &'a P,
+        new_entry_object: &'a E,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            source_object,
+            parent_object,
+            new_entry_object,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the affected filesystem objects.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact source-inode identity.
+    pub const fn source_object(&self) -> &'a S {
+        self.source_object
+    }
+
+    /// Borrows the embedding-defined exact destination parent identity.
+    pub const fn parent_object(&self) -> &'a P {
+        self.parent_object
+    }
+
+    /// Borrows the embedding-defined prospective named-entry identity.
+    pub const fn new_entry_object(&self) -> &'a E {
+        self.new_entry_object
+    }
+}
+
+impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> InodeUnlinkContext<'a, N, P, E> {
+    /// Binds one exact actor, parent directory, and existing victim entry.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        parent_object: &'a P,
+        target_entry_object: &'a E,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            parent_object,
+            target_entry_object,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the affected filesystem objects.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact parent-directory identity.
+    pub const fn parent_object(&self) -> &'a P {
+        self.parent_object
+    }
+
+    /// Borrows the embedding-defined exact existing victim-entry identity.
+    pub const fn target_entry_object(&self) -> &'a E {
+        self.target_entry_object
+    }
+}
+
+impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> InodeRmdirContext<'a, N, P, E> {
+    /// Binds one exact actor, parent directory, and existing directory entry.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        parent_object: &'a P,
+        target_entry_object: &'a E,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            parent_object,
+            target_entry_object,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the affected filesystem objects.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact parent-directory identity.
+    pub const fn parent_object(&self) -> &'a P {
+        self.parent_object
+    }
+
+    /// Borrows the embedding-defined exact existing directory-entry identity.
+    pub const fn target_entry_object(&self) -> &'a E {
+        self.target_entry_object
+    }
+}
+
+impl<'a, N: UserNamespaceView, OP: ?Sized, OE: ?Sized, NP: ?Sized, NE: ?Sized>
+    InodeRenameContext<'a, N, OP, OE, NP, NE>
+{
+    /// Binds one exact actor and the four ordered rename object roles.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        old_parent_object: &'a OP,
+        old_entry_object: &'a OE,
+        new_parent_object: &'a NP,
+        new_entry_object: &'a NE,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            old_parent_object,
+            old_entry_object,
+            new_parent_object,
+            new_entry_object,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the affected filesystem objects.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact old parent-directory identity.
+    pub const fn old_parent_object(&self) -> &'a OP {
+        self.old_parent_object
+    }
+
+    /// Borrows the embedding-defined exact old source-entry identity.
+    pub const fn old_entry_object(&self) -> &'a OE {
+        self.old_entry_object
+    }
+
+    /// Borrows the embedding-defined exact new parent-directory identity.
+    pub const fn new_parent_object(&self) -> &'a NP {
+        self.new_parent_object
+    }
+
+    /// Borrows the embedding-defined exact new destination-entry identity.
+    pub const fn new_entry_object(&self) -> &'a NE {
+        self.new_entry_object
+    }
+}
+
+impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized, T: ?Sized>
+    InodeSymlinkContext<'a, N, P, E, T>
+{
+    /// Binds one exact actor, destination, prospective entry, and target.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        parent_object: &'a P,
+        new_entry_object: &'a E,
+        symlink_target: &'a T,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            parent_object,
+            new_entry_object,
+            symlink_target,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the destination filesystem.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact parent-directory identity.
+    pub const fn parent_object(&self) -> &'a P {
+        self.parent_object
+    }
+
+    /// Borrows the embedding-defined prospective named-entry identity.
+    pub const fn new_entry_object(&self) -> &'a E {
+        self.new_entry_object
+    }
+
+    /// Borrows the exact target payload which publication will store.
+    pub const fn symlink_target(&self) -> &'a T {
+        self.symlink_target
+    }
+}
+
+impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> InodeMknodContext<'a, N, P, E> {
+    /// Binds one exact actor, destination, prospective entry, and operation.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        parent_object: &'a P,
+        new_entry_object: &'a E,
+        operation: InodeMknodOperation,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            parent_object,
+            new_entry_object,
+            operation,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for DAC admission.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the destination filesystem.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact parent-directory identity.
+    pub const fn parent_object(&self) -> &'a P {
+        self.parent_object
+    }
+
+    /// Borrows the embedding-defined prospective named-entry identity.
+    pub const fn new_entry_object(&self) -> &'a E {
+        self.new_entry_object
+    }
+
+    /// Returns the normalized special-node creation operation.
+    pub const fn operation(&self) -> InodeMknodOperation {
+        self.operation
+    }
+}
+
+/// Validated Linux-compatible flags for one extended-attribute set operation.
+///
+/// Zero permits either creating a missing attribute or replacing an existing
+/// one. [`Self::CREATE`] and [`Self::REPLACE`] select exactly one of those
+/// conditions. Linux rejects their combination, so this type deliberately has
+/// no bitwise-union implementation. Unknown bits are rejected as well.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::XattrSetFlags;
+///
+/// // Raw tuple construction is not part of the public contract.
+/// let _ = XattrSetFlags(0);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct XattrSetFlags(u32);
+
+impl XattrSetFlags {
+    const CREATE_BIT: u32 = 0x1;
+    const REPLACE_BIT: u32 = 0x2;
+
+    /// Create a missing attribute or replace an existing one.
+    pub const NONE: Self = Self(0);
+    /// Require that the named attribute does not already exist.
+    pub const CREATE: Self = Self(Self::CREATE_BIT);
+    /// Require that the named attribute already exists.
+    pub const REPLACE: Self = Self(Self::REPLACE_BIT);
+
+    /// Constructs flags from the raw Linux-compatible bit domain.
+    ///
+    /// Accepts only zero, `CREATE`, or `REPLACE`. The contradictory
+    /// `CREATE | REPLACE` combination and every unknown bit return `None`.
+    pub const fn try_from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            0 | Self::CREATE_BIT | Self::REPLACE_BIT => Some(Self(bits)),
+            _ => None,
+        }
+    }
+
+    /// Returns the validated Linux-compatible bit representation.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// Policy-facing classification of one set-xattr value payload.
+///
+/// The class identifies the `security.capability` wire value without parsing
+/// it into [`crate::FileCapabilities`] or exposing a kernel, VFS, xattr-store,
+/// or provider type. Parsing and commoncap decisions remain separate steps
+/// owned by the consumer and this crate's existing pure parser.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum XattrValueClass {
+    /// An opaque value for every name other than `security.capability`.
+    Opaque,
+    /// The opaque Linux `security.capability` wire value.
+    SecurityCapability,
+}
+
+impl XattrValueClass {
+    fn for_name(name: &str) -> Self {
+        if name == crate::SECURITY_CAPABILITY_XATTR_NAME {
+            Self::SecurityCapability
+        } else {
+            Self::Opaque
+        }
+    }
+}
+
+/// Borrowed, operation-specific input to one inode xattr policy hook.
+///
+/// Names and values remain caller-owned wire payloads. The constructors reject
+/// an empty name and preserve Linux's distinct get, list, set, and remove hook
+/// shapes without importing pathname lookup, xattr storage, provider dispatch,
+/// or errno mapping. [`Self::set`] derives the value class from the exact name,
+/// so a caller cannot label another attribute as `security.capability` or hide
+/// that name behind [`XattrValueClass::Opaque`].
+///
+/// The operation cannot outlive either borrowed payload:
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::{InodeXattrOperation, XattrSetFlags};
+///
+/// fn cannot_escape() -> InodeXattrOperation<'static> {
+///     let name = String::from("user.example");
+///     let value = vec![1_u8, 2, 3];
+///     InodeXattrOperation::set(name.as_str(), value.as_slice(), XattrSetFlags::NONE)
+///         .unwrap()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::{InodeXattrOperation, XattrSetFlags, XattrValueClass};
+///
+/// // Named variants are non-exhaustive so external code cannot bypass name
+/// // validation or forge the name-derived value class.
+/// let _ = InodeXattrOperation::Set {
+///     name: "",
+///     value: &[],
+///     flags: XattrSetFlags::NONE,
+///     value_class: XattrValueClass::SecurityCapability,
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum InodeXattrOperation<'a> {
+    /// Read one exact named attribute.
+    #[non_exhaustive]
+    Get {
+        /// Exact non-empty attribute name selected by the consumer.
+        name: &'a str,
+    },
+    /// Enumerate the names visible on the exact target object.
+    List,
+    /// Create or replace one exact named attribute value.
+    #[non_exhaustive]
+    Set {
+        /// Exact non-empty attribute name selected by the consumer.
+        name: &'a str,
+        /// Exact opaque value bytes proposed for publication.
+        value: &'a [u8],
+        /// Validated create/replace condition.
+        flags: XattrSetFlags,
+        /// Name-derived policy classification of `value`.
+        value_class: XattrValueClass,
+    },
+    /// Remove one exact named attribute.
+    #[non_exhaustive]
+    Remove {
+        /// Exact non-empty attribute name selected by the consumer.
+        name: &'a str,
+    },
+}
+
+impl<'a> InodeXattrOperation<'a> {
+    /// Constructs one named-attribute read operation.
+    pub fn get(name: &'a str) -> Option<Self> {
+        if name.is_empty() {
+            None
+        } else {
+            Some(Self::Get { name })
+        }
+    }
+
+    /// Constructs one attribute-name enumeration operation.
+    pub const fn list() -> Self {
+        Self::List
+    }
+
+    /// Constructs one named-attribute set operation over exact borrowed bytes.
+    pub fn set(name: &'a str, value: &'a [u8], flags: XattrSetFlags) -> Option<Self> {
+        if name.is_empty() {
+            None
+        } else {
+            Some(Self::Set {
+                name,
+                value,
+                flags,
+                value_class: XattrValueClass::for_name(name),
+            })
+        }
+    }
+
+    /// Constructs one named-attribute removal operation.
+    pub fn remove(name: &'a str) -> Option<Self> {
+        if name.is_empty() {
+            None
+        } else {
+            Some(Self::Remove { name })
+        }
+    }
+
+    /// Borrows the exact name for a named operation, or `None` for list.
+    pub const fn name(self) -> Option<&'a str> {
+        match self {
+            Self::Get { name } | Self::Set { name, .. } | Self::Remove { name } => Some(name),
+            Self::List => None,
+        }
+    }
+
+    /// Borrows the exact set value, or `None` for operations without a value.
+    pub const fn value(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Set { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns the validated set flags, or `None` for non-set operations.
+    pub const fn set_flags(self) -> Option<XattrSetFlags> {
+        match self {
+            Self::Set { flags, .. } => Some(flags),
+            _ => None,
+        }
+    }
+
+    /// Returns the set value's name-derived class, if this is a set operation.
+    pub const fn value_class(self) -> Option<XattrValueClass> {
+        match self {
+            Self::Set { value_class, .. } => Some(value_class),
+            _ => None,
+        }
+    }
+}
+
+/// Complete immutable input to one inode xattr policy hook.
+///
+/// `O` is the embedding kernel's exact pinned target identity. The context
+/// retains the immutable actor separately from the DAC snapshot selected for
+/// this operation, plus the target filesystem's owner namespace and one typed
+/// borrowed xattr operation. It performs no namespace policy, DAC check,
+/// lookup, xattr-store mutation, hook dispatch, post-set notification,
+/// `security.capability` parsing, or errno mapping.
+pub struct InodeXattrContext<'a, N: UserNamespaceView, O: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    target_object: &'a O,
+    operation: InodeXattrOperation<'a>,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> InodeXattrContext<'a, N, O> {
+    /// Binds one exact actor, target object, owner namespace, and xattr input.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        target_object: &'a O,
+        operation: InodeXattrOperation<'a>,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            target_object,
+            operation,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for this operation.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the affected filesystem object.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact target-object identity.
+    pub const fn target_object(&self) -> &'a O {
+        self.target_object
+    }
+
+    /// Returns the exact borrowed xattr operation presented to policy.
+    pub const fn operation(&self) -> InodeXattrOperation<'a> {
+        self.operation
     }
 }
 
@@ -1178,6 +2588,320 @@ mod tests {
 
     struct DummyHandle {
         cookie: &'static str,
+    }
+
+    #[test]
+    fn xattr_set_flags_reject_combined_and_unknown_bits() {
+        assert_eq!(XattrSetFlags::try_from_bits(0), Some(XattrSetFlags::NONE));
+        assert_eq!(
+            XattrSetFlags::try_from_bits(XattrSetFlags::CREATE.bits()),
+            Some(XattrSetFlags::CREATE)
+        );
+        assert_eq!(
+            XattrSetFlags::try_from_bits(XattrSetFlags::REPLACE.bits()),
+            Some(XattrSetFlags::REPLACE)
+        );
+        assert_eq!(
+            XattrSetFlags::try_from_bits(
+                XattrSetFlags::CREATE.bits() | XattrSetFlags::REPLACE.bits()
+            ),
+            None
+        );
+        assert_eq!(XattrSetFlags::try_from_bits(1 << 7), None);
+        assert_eq!(
+            XattrSetFlags::try_from_bits(XattrSetFlags::CREATE.bits() | (1 << 7)),
+            None
+        );
+    }
+
+    #[test]
+    fn inode_xattr_operations_validate_names_and_classify_set_values() {
+        assert_eq!(InodeXattrOperation::get(""), None);
+        assert_eq!(
+            InodeXattrOperation::set("", b"value", XattrSetFlags::NONE),
+            None
+        );
+        assert_eq!(InodeXattrOperation::remove(""), None);
+
+        let value = [1_u8, 2, 3];
+        let capability = InodeXattrOperation::set(
+            crate::SECURITY_CAPABILITY_XATTR_NAME,
+            value.as_slice(),
+            XattrSetFlags::CREATE,
+        )
+        .unwrap();
+        assert_eq!(
+            capability.value_class(),
+            Some(XattrValueClass::SecurityCapability)
+        );
+        assert_eq!(capability.value(), Some(value.as_slice()));
+        assert_eq!(capability.set_flags(), Some(XattrSetFlags::CREATE));
+
+        let opaque = InodeXattrOperation::set("user.test", &[], XattrSetFlags::NONE).unwrap();
+        assert_eq!(opaque.value_class(), Some(XattrValueClass::Opaque));
+        assert_eq!(opaque.value(), Some([].as_slice()));
+        assert_eq!(InodeXattrOperation::list().name(), None);
+    }
+
+    #[test]
+    fn inode_create_mode_accepts_only_normalized_permission_and_special_bits() {
+        assert_eq!(InodeCreateMode::try_from_bits(0).unwrap().bits(), 0);
+        assert_eq!(
+            InodeCreateMode::try_from_bits(0o7777).unwrap().bits(),
+            0o7777
+        );
+        assert_eq!(InodeCreateMode::try_from_bits(0o100000 | 0o644), None);
+        assert_eq!(InodeCreateMode::try_from_bits(1 << 15), None);
+    }
+
+    #[test]
+    fn named_inode_contexts_bind_distinct_frozen_roles() {
+        let actor_namespace = MockNamespace::root();
+        let actor = root_credential(actor_namespace.clone());
+        let target_owner_namespace =
+            MockNamespace::child(&actor_namespace, Kuid::INITIAL_ROOT, Some(kuid(1000)));
+        let dac_credential = FsCredentialSnapshot::new(
+            kuid(1000),
+            kgid(1000),
+            actor.groups().clone(),
+            [0; CAPABILITY_WORDS],
+            false,
+        );
+        let parent = DummyHandle {
+            cookie: "create-parent",
+        };
+        let new_entry = DummyHandle {
+            cookie: "prospective-named-entry",
+        };
+        let file_mode = InodeCreateMode::try_from_bits(0o640).unwrap();
+        let create = InodeCreateContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &parent,
+            &new_entry,
+            file_mode,
+        );
+        assert!(core::ptr::eq(create.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(create.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(
+            create.target_owner_user_ns(),
+            &target_owner_namespace
+        ));
+        assert!(core::ptr::eq(create.parent_object(), &parent));
+        assert!(core::ptr::eq(create.new_entry_object(), &new_entry));
+        assert_eq!(create.parent_object().cookie, "create-parent");
+        assert_eq!(create.new_entry_object().cookie, "prospective-named-entry");
+        assert_eq!(create.mode(), file_mode);
+
+        let directory_mode = InodeCreateMode::try_from_bits(0o2750).unwrap();
+        let mkdir = InodeMkdirContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &parent,
+            &new_entry,
+            directory_mode,
+        );
+        assert!(core::ptr::eq(mkdir.parent_object(), &parent));
+        assert!(core::ptr::eq(mkdir.new_entry_object(), &new_entry));
+        assert_eq!(mkdir.mode(), directory_mode);
+
+        let target = [0xff, b'/', b't', b'a', b'r', b'g', b'e', b't'];
+        let symlink = InodeSymlinkContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &parent,
+            &new_entry,
+            target.as_slice(),
+        );
+        assert!(core::ptr::eq(symlink.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(symlink.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(
+            symlink.target_owner_user_ns(),
+            &target_owner_namespace
+        ));
+        assert!(core::ptr::eq(symlink.parent_object(), &parent));
+        assert!(core::ptr::eq(symlink.new_entry_object(), &new_entry));
+        assert!(core::ptr::eq(symlink.symlink_target(), target.as_slice()));
+        assert_eq!(symlink.symlink_target(), target.as_slice());
+
+        let source = DummyHandle {
+            cookie: "exact-hard-link-source",
+        };
+        let link = InodeLinkContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &source,
+            &parent,
+            &new_entry,
+        );
+        assert!(core::ptr::eq(link.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(link.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(
+            link.target_owner_user_ns(),
+            &target_owner_namespace
+        ));
+        assert!(core::ptr::eq(link.source_object(), &source));
+        assert!(core::ptr::eq(link.parent_object(), &parent));
+        assert!(core::ptr::eq(link.new_entry_object(), &new_entry));
+        assert_eq!(link.source_object().cookie, "exact-hard-link-source");
+
+        let target_entry = DummyHandle {
+            cookie: "exact-existing-victim-entry",
+        };
+        let unlink = InodeUnlinkContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &parent,
+            &target_entry,
+        );
+        assert!(core::ptr::eq(unlink.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(unlink.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(
+            unlink.target_owner_user_ns(),
+            &target_owner_namespace
+        ));
+        assert!(core::ptr::eq(unlink.parent_object(), &parent));
+        assert!(core::ptr::eq(unlink.target_entry_object(), &target_entry));
+        assert_eq!(
+            unlink.target_entry_object().cookie,
+            "exact-existing-victim-entry"
+        );
+
+        let rmdir = InodeRmdirContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &parent,
+            &target_entry,
+        );
+        assert!(core::ptr::eq(rmdir.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(rmdir.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(
+            rmdir.target_owner_user_ns(),
+            &target_owner_namespace
+        ));
+        assert!(core::ptr::eq(rmdir.parent_object(), &parent));
+        assert!(core::ptr::eq(rmdir.target_entry_object(), &target_entry));
+    }
+
+    #[test]
+    fn inode_rename_context_binds_four_ordered_roles() {
+        let namespace = MockNamespace::root();
+        let actor = root_credential(namespace.clone());
+        let dac_credential = FsCredentialSnapshot::new(
+            kuid(3300),
+            kgid(3300),
+            actor.groups().clone(),
+            [0; CAPABILITY_WORDS],
+            false,
+        );
+        let old_parent = DummyHandle {
+            cookie: "exact-old-parent",
+        };
+        let old_entry = DummyHandle {
+            cookie: "exact-old-entry",
+        };
+        let new_parent = DummyHandle {
+            cookie: "exact-new-parent",
+        };
+        let new_entry = DummyHandle {
+            cookie: "exact-new-entry",
+        };
+
+        let forward = InodeRenameContext::new(
+            &actor,
+            &dac_credential,
+            &namespace,
+            &old_parent,
+            &old_entry,
+            &new_parent,
+            &new_entry,
+        );
+        assert!(core::ptr::eq(forward.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(forward.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(forward.target_owner_user_ns(), &namespace));
+        assert!(core::ptr::eq(forward.old_parent_object(), &old_parent));
+        assert!(core::ptr::eq(forward.old_entry_object(), &old_entry));
+        assert!(core::ptr::eq(forward.new_parent_object(), &new_parent));
+        assert!(core::ptr::eq(forward.new_entry_object(), &new_entry));
+        assert_eq!(forward.old_parent_object().cookie, "exact-old-parent");
+        assert_eq!(forward.old_entry_object().cookie, "exact-old-entry");
+        assert_eq!(forward.new_parent_object().cookie, "exact-new-parent");
+        assert_eq!(forward.new_entry_object().cookie, "exact-new-entry");
+
+        // Linux's exchange wrapper dispatches this reverse direction before
+        // the forward direction; neither leaf context carries a flag.
+        let reverse = InodeRenameContext::new(
+            &actor,
+            &dac_credential,
+            &namespace,
+            &new_parent,
+            &new_entry,
+            &old_parent,
+            &old_entry,
+        );
+        assert!(core::ptr::eq(reverse.old_parent_object(), &new_parent));
+        assert!(core::ptr::eq(reverse.old_entry_object(), &new_entry));
+        assert!(core::ptr::eq(reverse.new_parent_object(), &old_parent));
+        assert!(core::ptr::eq(reverse.new_entry_object(), &old_entry));
+    }
+
+    #[test]
+    fn inode_mknod_operation_enforces_kind_device_pairing() {
+        let mode = InodeCreateMode::try_from_bits(0o600).unwrap();
+        for kind in [InodeMknodKind::Fifo, InodeMknodKind::Socket] {
+            let operation = InodeMknodOperation::new(kind, mode, None).unwrap();
+            assert_eq!(operation.kind(), kind);
+            assert_eq!(operation.mode(), mode);
+            assert_eq!(operation.rdev(), None);
+            assert_eq!(InodeMknodOperation::new(kind, mode, Some(7)), None);
+        }
+        for kind in [InodeMknodKind::CharacterDevice, InodeMknodKind::BlockDevice] {
+            assert_eq!(InodeMknodOperation::new(kind, mode, None), None);
+            let operation = InodeMknodOperation::new(kind, mode, Some(0x1234)).unwrap();
+            assert_eq!(operation.kind(), kind);
+            assert_eq!(operation.mode(), mode);
+            assert_eq!(operation.rdev(), Some(0x1234));
+        }
+    }
+
+    #[test]
+    fn inode_mknod_context_binds_operation_and_opaque_entries() {
+        let namespace = MockNamespace::root();
+        let actor = root_credential(namespace.clone());
+        let dac_credential = actor.fs_credential_snapshot();
+        let parent = DummyHandle {
+            cookie: "mknod-parent",
+        };
+        let new_entry = DummyHandle {
+            cookie: "mknod-entry",
+        };
+        let operation = InodeMknodOperation::new(
+            InodeMknodKind::CharacterDevice,
+            InodeCreateMode::try_from_bits(0o620).unwrap(),
+            Some(0x0501),
+        )
+        .unwrap();
+        let context = InodeMknodContext::new(
+            &actor,
+            &dac_credential,
+            &namespace,
+            &parent,
+            &new_entry,
+            operation,
+        );
+
+        assert!(core::ptr::eq(context.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(context.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(context.target_owner_user_ns(), &namespace));
+        assert!(core::ptr::eq(context.parent_object(), &parent));
+        assert!(core::ptr::eq(context.new_entry_object(), &new_entry));
+        assert_eq!(context.operation(), operation);
     }
 
     #[test]

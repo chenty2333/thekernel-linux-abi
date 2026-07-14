@@ -70,6 +70,56 @@
   `security_file_open`. Keep mode 3's read/write admission distinct from its
   no-data persistent description so it may retain a successful unnamed-create
   result.
+- Add an inode-setattr leaf contract with field-private, typed chmod/chown
+  intents and a normalized hook-point proposal. Preserve UID/GID omission as
+  separate `Option` fields, keep implicit set-ID mode cleanup distinct from
+  post-hook core preparation, and replace raw `ATTR_KILL_PRIV` with a typed
+  privilege-cleanup effect. Keep the fallible `InodeSetattrContext` distinct
+  from the successful-only `InodePostSetattrContext`; the embedding kernel owns
+  writable-mount and inode locking order, `may_setattr`, DAC/commoncap
+  preparation, privilege-provider transactions, backend publication, linear
+  post-hook preflight, notification, and errno mapping.
+- Preserve Linux's distinct regular-file `inode_create`, directory
+  `inode_mkdir`, and special-node `inode_mknod` topology with separate typed
+  contexts. Each context binds caller-owned parent and prospective named-entry
+  identities to the actor, selected DAC snapshot, destination-owner namespace,
+  and consumer-prepared final normalized mode. The mknod operation additionally
+  requires an `rdev` exactly for character and block devices and forbids it for
+  FIFO and socket nodes; symlink, hard-link, and unnamed temporary-file
+  operations enter distinct contracts or no named-create hook.
+- Add the distinct Linux `inode_symlink` contract over the same frozen actor,
+  DAC snapshot, destination-owner namespace, parent, and prospective entry,
+  plus an opaque borrowed target payload. Keep target encoding, pathname
+  decoding, destination stability, dispatch, and publication in the embedding
+  kernel; do not invent a mode or device-number fact absent from this hook.
+- Add the distinct Linux `inode_link` contract over an exact opaque source
+  object, destination parent, and prospective entry together with the frozen
+  actor, independently selected DAC snapshot, and filesystem-owner namespace.
+  Keep protected-hardlink ownership/`CAP_FOWNER` policy, cross-filesystem
+  rejection, destination stability, dispatch, and same-source publication in
+  the embedding kernel; do not reuse symlink target or new-inode mode facts.
+- Add distinct Linux `inode_unlink` and `inode_rmdir` contracts over an opaque
+  existing victim entry and its exact parent together with the frozen actor,
+  selected DAC snapshot, and filesystem-owner namespace. Keep writable-mount,
+  sticky-directory, type, append/immutable, mountpoint, backend-emptiness,
+  dispatch, notification, and publication rules in the embedding kernel, and
+  do not encode the hook family as a forgeable boolean.
+- Add a Linux `inode_rename` leaf contract which freezes the actor, selected
+  DAC snapshot, filesystem-owner namespace, and four independently typed old
+  parent/entry and new parent/entry identities. Preserve the pinned LSM hook's
+  flag-free signature: ordinary, no-replace, and whiteout operations have one
+  forward leaf dispatch, while an exchange remains an adapter-owned reverse-
+  then-forward dispatch with denial short-circuiting. Keep raw flag decoding,
+  flag-combination validation, path hooks, admission, lookup, transaction,
+  backend mutation, and notification outside this crate.
+- Add one typed inode-xattr leaf context whose operation preserves Linux's
+  distinct get, list, set, and remove shapes. Borrow exact non-empty names and
+  opaque set-value bytes, validate only zero/create/replace set flags, and
+  derive a `security.capability` wire-value class from the exact name without
+  importing a parsed capability, xattr-store, VFS, kernel, or provider type.
+  Keep namespace policy, DAC admission, mount and size checks, lookup, storage,
+  registry dispatch, post-set notification, publication, and errno mapping in
+  the embedding consumer.
 - Remove duplicate pre-release namespace-entry and filesystem-snapshot
   spellings before freezing 0.1, leaving one canonical consumer path for each
   operation.
@@ -85,7 +135,7 @@
   application of dumpability, MM-owner, ptrace, and parent-death effects;
 - security-hook registry storage, dispatch, boot freeze, notification phases,
   and concrete kernel object wrappers;
-- VFS object/location identity, DAC adapters, open transactions,
-  process/signal/scheduler/IPC authorization adapters, MM, and syscall/usercopy
-  glue; and
+- VFS object/location identity, DAC and protected-hardlink adapters,
+  open/link/rename transactions, process/signal/scheduler/IPC authorization
+  adapters, MM, and syscall/usercopy glue; and
 - kernel errno values, concrete lock types, hash maps, RCU, or epoch schemes.
