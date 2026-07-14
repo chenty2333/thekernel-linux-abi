@@ -31,8 +31,25 @@ signal, MM, security-hook registry/dispatch, executable lease, exec publication
 transaction, syscall, or errno type. Ptrace, traceme, and scheduler commoncap
 policy consumes typed immutable contexts whose kernel object payload is an
 opaque caller-owned generic; it introduces no process/MM trait or orphan-rule
-edge. The nightly `allocator_api` requirement is a fallible-allocation
-toolchain constraint, not a dependency on `kspin` or kernel synchronization.
+edge. Inode-permission and file-open policy contexts follow the same leaf
+boundary: they bind the exact actor, independently selected DAC snapshot,
+target-owner namespace, and opaque caller-owned object to normalized access or
+open facts. File-open normalization distinguishes ordinary data access and
+reserved access mode 3 descriptions with no persistent read/write data
+access. Mode 3 retains its earlier `MAY_READ | MAY_WRITE` admission fact
+indirectly: it can carry a successful created-and-unnamed `O_TMPFILE` result
+despite exposing no persistent write access. `O_PATH` is not a file-open policy
+event: the pinned Linux topology completes `FMODE_PATH` setup and returns before
+`security_file_open`, so the VFS/FD consumer owns path-only semantics and skips
+this context and hook dispatch. The contexts do not own VFS identity, lookup,
+security registry/dispatch, or the open transaction. The nightly
+`allocator_api` requirement is a fallible-allocation toolchain constraint, not
+a dependency on `kspin` or kernel synchronization.
+
+Credential 0.1 freezes one canonical namespace-entry constructor and one
+canonical filesystem-snapshot accessor. Pre-release compatibility spellings
+are deliberately absent so kernel adapters converge on the same public
+contract before package publication.
 
 VFS and FD accept typed caller snapshots rather than depending on a
 credential, signal, or generic mechanism package. MM may depend on credentials,

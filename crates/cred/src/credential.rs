@@ -558,11 +558,6 @@ impl<N: UserNamespaceView> Credential<N> {
         .map_err(|_| CredError::NoMemory)
     }
 
-    /// Compatibility spelling for [`Self::try_with_user_namespace`].
-    pub fn try_with_user_ns(current: &Self, user_ns: Arc<N>) -> Result<Arc<Self>, CredError> {
-        Self::try_with_user_namespace(current, user_ns)
-    }
-
     /// Validates and prepares one ordinary immutable replacement bound to the
     /// exact old credential owner.
     ///
@@ -673,11 +668,6 @@ impl<N: UserNamespaceView> Credential<N> {
             self.caps.effective,
             self.user_ns.is_initial(),
         )
-    }
-
-    /// Compatibility spelling for [`Self::fs_credential_snapshot`].
-    pub fn fs_dac_credentials(&self) -> FsCredentialSnapshot {
-        self.fs_credential_snapshot()
     }
 
     /// Tests effective capability authority over legacy objects governed by

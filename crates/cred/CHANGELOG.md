@@ -40,6 +40,18 @@
   a bounded validated Linux signal number, and an opaque core-authorization
   proof which retains the exact immutable actor/target pair through policy
   context construction.
+- Add policy-neutral inode-permission and file-open contexts over an exact
+  actor, independently selected DAC snapshot, target-owner namespace, and
+  opaque caller-owned object; normalize non-empty read/write/execute access,
+  ordinary file access, reserved ioctl-oriented no-data access mode 3,
+  append, truncate, created, and unnamed `O_TMPFILE` facts without accepting
+  raw descriptor flags or owning VFS dispatch. Deliberately omit `O_PATH`
+  because Linux returns its path-only description before `security_file_open`.
+  Preserve mode 3's `MAY_WRITE` open admission so a no-data description can
+  still record a successful unnamed `O_TMPFILE` creation.
+- Remove the pre-release `try_with_user_ns` and `fs_dac_credentials`
+  compatibility aliases before the 0.1 API freeze; consumers use
+  `try_with_user_namespace` and `fs_credential_snapshot` exclusively.
 - Introduce non-exhaustive `CredError` values so adapters retain control of
   errno mapping.
 - Keep namespace locks, lifetime admission, procfs identity, and signal

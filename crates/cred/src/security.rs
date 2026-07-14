@@ -6,11 +6,15 @@
 //! lock, publication mechanism, or errno mapping.
 
 use alloc::sync::Arc;
-use core::{fmt, num::NonZeroU32};
+use core::{
+    fmt,
+    num::NonZeroU32,
+    ops::{BitOr, BitOrAssign},
+};
 
 use linux_raw_sys::general::{CAP_KILL, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT};
 
-use crate::{CAPABILITY_WORDS, Credential, UserNamespaceView, ns_capable};
+use crate::{CAPABILITY_WORDS, Credential, FsCredentialSnapshot, UserNamespaceView, ns_capable};
 
 /// Policy-neutral authorization failures returned by commoncap helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +32,354 @@ impl fmt::Display for AuthorizationError {
             Self::NotPermitted => formatter.write_str("security operation not permitted"),
             Self::AccessDenied => formatter.write_str("security access denied"),
         }
+    }
+}
+
+/// Non-empty normalized access requested from an inode permission hook.
+///
+/// The representation uses the low-three POSIX read/write/execute layout, but
+/// remains a crate-local typed value rather than Linux `MAY_*`, open, or file
+/// descriptor flags. A consumer resolves its VFS request first and then uses
+/// [`Self::try_from_bits`] or the typed constants to construct the exact access
+/// combination presented to policy.
+///
+/// Empty permission checks have no stable hook meaning and are rejected, as
+/// are bits outside [`Self::ALL`]. Fields remain private so external consumers
+/// cannot bypass those invariants.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::InodePermissionAccess;
+///
+/// // Raw tuple construction is not part of the public contract.
+/// let _ = InodePermissionAccess(1);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodePermissionAccess(u8);
+
+impl InodePermissionAccess {
+    const READ_BIT: u8 = 0b100;
+    const WRITE_BIT: u8 = 0b010;
+    const EXECUTE_BIT: u8 = 0b001;
+    const ALL_BITS: u8 = Self::READ_BIT | Self::WRITE_BIT | Self::EXECUTE_BIT;
+
+    /// Read access to the exact target object.
+    pub const READ: Self = Self(Self::READ_BIT);
+    /// Write access to the exact target object.
+    pub const WRITE: Self = Self(Self::WRITE_BIT);
+    /// Execute or search access to the exact target object.
+    pub const EXECUTE: Self = Self(Self::EXECUTE_BIT);
+    /// Every access kind represented by this contract.
+    pub const ALL: Self = Self(Self::ALL_BITS);
+
+    /// Constructs a non-empty combination from crate-local normalized bits.
+    ///
+    /// Returns `None` for an empty request or when any unknown bit is present.
+    /// Callers decoding Linux or VFS-specific masks must normalize them before
+    /// calling this method.
+    pub const fn try_from_bits(bits: u8) -> Option<Self> {
+        if bits == 0 || bits & !Self::ALL_BITS != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    /// Returns the crate-local normalized bit representation.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Reports whether every access kind in `other` is requested by `self`.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Reports whether any access kind in `other` is requested by `self`.
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// Combines two non-empty access requests.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl BitOr for InodePermissionAccess {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.union(rhs)
+    }
+}
+
+impl BitOrAssign for InodePermissionAccess {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = self.union(rhs);
+    }
+}
+
+/// Complete immutable input to one inode permission policy hook.
+///
+/// `O` is the embedding kernel's exact pinned inode/location identity. The
+/// context only borrows that opaque object and does not define VFS identity,
+/// look it up again, or dispatch policy modules. The target-owner namespace is
+/// supplied independently of the actor credential so a consumer cannot
+/// accidentally substitute the actor's namespace for the object's owner. The
+/// separately frozen DAC credential is the identity actually selected for
+/// this operation; it may intentionally differ from the actor's ordinary
+/// filesystem snapshot, for example under a real-ID access check.
+pub struct InodePermissionContext<'a, N: UserNamespaceView, O: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    target_object: &'a O,
+    access: InodePermissionAccess,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> InodePermissionContext<'a, N, O> {
+    /// Binds one exact actor, object owner, target object, and access request.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        target_object: &'a O,
+        access: InodePermissionAccess,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            target_object,
+            access,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for this DAC check.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the exact target object.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact target object identity.
+    pub const fn target_object(&self) -> &'a O {
+        self.target_object
+    }
+
+    /// Returns the normalized non-empty access request.
+    pub const fn access(&self) -> InodePermissionAccess {
+        self.access
+    }
+}
+
+/// Normalized persistent access mode for one opened file.
+///
+/// This enum is deliberately not a raw `O_ACCMODE` value. [`Self::NoData`]
+/// preserves Linux's reserved access mode 3 after the ABI adapter performs its
+/// read-and-write admission check: the resulting description has neither
+/// persistent read nor write data access and is primarily useful to drivers
+/// which expose ioctl-only descriptors. This contract is constructed only for
+/// opens which reach Linux's `security_file_open` topology. `O_PATH` returns
+/// before that hook and is intentionally not representable here.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::FileOpenAccess;
+///
+/// // Path-only opens do not enter the file-open hook contract.
+/// let _ = FileOpenAccess::Path;
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FileOpenAccess {
+    /// A persistently readable file description.
+    Read,
+    /// A persistently writable file description.
+    Write,
+    /// A persistently readable and writable file description.
+    ReadWrite,
+    /// Linux access mode 3: no persistent data access after read/write admission.
+    ///
+    /// [`Self::reads`] and [`Self::writes`] both return `false` for this
+    /// variant.
+    NoData,
+}
+
+impl FileOpenAccess {
+    /// Reports whether the resulting file description is readable.
+    pub const fn reads(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    /// Reports whether the resulting file description is writable.
+    pub const fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+
+    const fn admits_unnamed_create(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite | Self::NoData)
+    }
+}
+
+/// Normalized, already-validated facts for one file-open policy hook.
+///
+/// The fields are private and the constructor consumes typed access plus
+/// normalized facts, never raw file-descriptor or `open(2)` flags. `created`
+/// records that this open transaction created the exact target. `unnamed`
+/// narrows that fact to a newly created but currently unnamed VFS object, such
+/// as a successful `O_TMPFILE` open; it does not mean an anonymous inode or a
+/// non-VFS source. `O_PATH` opens bypass Linux's file-open hook and therefore
+/// must not cause a consumer to construct or dispatch this operation.
+///
+/// `truncate` is kept independent from persistent write access because Linux
+/// accepts an already-validated `O_RDONLY | O_TRUNC` request and performs an
+/// open-time write-like operation. The same separation lets reserved access
+/// mode 3 carry validated truncation or creation facts even though its
+/// resulting description has no persistent data access. In contrast, append
+/// only has a normalized effect on a persistently writable description and
+/// must be cleared before constructing a [`FileOpenAccess::NoData`] operation.
+/// Linux's mode-3 `ACC_MODE` still contains `MAY_WRITE`, however, so `NoData`
+/// may represent a successfully created unnamed `O_TMPFILE` even though
+/// [`FileOpenAccess::writes`] remains false.
+///
+/// ```compile_fail
+/// use thekernel_linux_cred::{FileOpenAccess, FileOpenOperation};
+///
+/// // External code cannot forge a combination through raw fields.
+/// let _ = FileOpenOperation {
+///     access: FileOpenAccess::Read,
+///     append: false,
+///     truncate: false,
+///     created: false,
+///     unnamed: false,
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FileOpenOperation {
+    access: FileOpenAccess,
+    append: bool,
+    truncate: bool,
+    created: bool,
+    unnamed: bool,
+}
+
+impl FileOpenOperation {
+    /// Constructs one normalized file-open operation.
+    ///
+    /// Returns `None` when append is attached to a non-writable access mode, or
+    /// an unnamed object is not newly created under write-admitted `Write`,
+    /// `ReadWrite`, or reserved mode-3 `NoData` access.
+    pub const fn new(
+        access: FileOpenAccess,
+        append: bool,
+        truncate: bool,
+        created: bool,
+        unnamed: bool,
+    ) -> Option<Self> {
+        if (append && !access.writes())
+            || (unnamed && (!created || !access.admits_unnamed_create()))
+        {
+            return None;
+        }
+        Some(Self {
+            access,
+            append,
+            truncate,
+            created,
+            unnamed,
+        })
+    }
+
+    /// Returns the normalized persistent access mode.
+    pub const fn access(self) -> FileOpenAccess {
+        self.access
+    }
+
+    /// Reports whether writes through the opened description append.
+    pub const fn append(self) -> bool {
+        self.append
+    }
+
+    /// Reports whether this request includes an open-time truncation.
+    pub const fn truncate(self) -> bool {
+        self.truncate
+    }
+
+    /// Reports whether this transaction created the exact target object.
+    pub const fn created(self) -> bool {
+        self.created
+    }
+
+    /// Reports whether the created target currently has no directory entry.
+    pub const fn unnamed(self) -> bool {
+        self.unnamed
+    }
+}
+
+/// Complete immutable input to one file-open policy hook.
+///
+/// `O` is the embedding kernel's exact pinned file/location identity. This
+/// leaf merely binds that opaque object to the exact actor, owning namespace,
+/// selected DAC credential, and normalized operation. The DAC snapshot may
+/// intentionally differ from the actor's ordinary filesystem identity. VFS
+/// lookup, open transaction ownership, hook registry storage, dispatch, and
+/// publication remain consumer responsibilities.
+pub struct FileOpenContext<'a, N: UserNamespaceView, O: ?Sized> {
+    actor: &'a Credential<N>,
+    dac_credential: &'a FsCredentialSnapshot,
+    target_owner_user_ns: &'a Arc<N>,
+    target_object: &'a O,
+    operation: FileOpenOperation,
+}
+
+impl<'a, N: UserNamespaceView, O: ?Sized> FileOpenContext<'a, N, O> {
+    /// Binds one exact actor, object owner, target object, and open operation.
+    pub const fn new(
+        actor: &'a Credential<N>,
+        dac_credential: &'a FsCredentialSnapshot,
+        target_owner_user_ns: &'a Arc<N>,
+        target_object: &'a O,
+        operation: FileOpenOperation,
+    ) -> Self {
+        Self {
+            actor,
+            dac_credential,
+            target_owner_user_ns,
+            target_object,
+            operation,
+        }
+    }
+
+    /// Borrows the exact immutable actor credential.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Borrows the exact filesystem identity selected for this open's DAC check.
+    pub const fn dac_credential(&self) -> &'a FsCredentialSnapshot {
+        self.dac_credential
+    }
+
+    /// Borrows the user namespace which owns the exact target object.
+    pub const fn target_owner_user_ns(&self) -> &'a Arc<N> {
+        self.target_owner_user_ns
+    }
+
+    /// Borrows the embedding-defined exact target object identity.
+    pub const fn target_object(&self) -> &'a O {
+        self.target_object
+    }
+
+    /// Returns the normalized file-open operation.
+    pub const fn operation(&self) -> FileOpenOperation {
+        self.operation
     }
 }
 
@@ -826,6 +1178,160 @@ mod tests {
 
     struct DummyHandle {
         cookie: &'static str,
+    }
+
+    #[test]
+    fn inode_permission_access_is_nonempty_known_and_composable() {
+        assert_eq!(InodePermissionAccess::try_from_bits(0), None);
+        assert_eq!(InodePermissionAccess::try_from_bits(1 << 7), None);
+        assert_eq!(
+            InodePermissionAccess::try_from_bits(InodePermissionAccess::ALL.bits()),
+            Some(InodePermissionAccess::ALL)
+        );
+
+        let mut access = InodePermissionAccess::READ | InodePermissionAccess::WRITE;
+        assert!(access.contains(InodePermissionAccess::READ));
+        assert!(access.contains(InodePermissionAccess::WRITE));
+        assert!(!access.contains(InodePermissionAccess::EXECUTE));
+        assert!(access.intersects(InodePermissionAccess::WRITE));
+        assert!(!access.intersects(InodePermissionAccess::EXECUTE));
+        access |= InodePermissionAccess::EXECUTE;
+        assert_eq!(access, InodePermissionAccess::ALL);
+    }
+
+    #[test]
+    fn inode_permission_context_binds_actor_owner_object_and_access() {
+        let actor_namespace = MockNamespace::root();
+        let actor = root_credential(actor_namespace.clone());
+        let target_owner_namespace =
+            MockNamespace::child(&actor_namespace, Kuid::INITIAL_ROOT, Some(kuid(1000)));
+        let object = DummyHandle {
+            cookie: "inode-location",
+        };
+        let dac_credential = FsCredentialSnapshot::new(
+            kuid(1000),
+            kgid(1000),
+            actor.groups().clone(),
+            [0; CAPABILITY_WORDS],
+            false,
+        );
+        let access = InodePermissionAccess::READ | InodePermissionAccess::EXECUTE;
+        let context = InodePermissionContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &object,
+            access,
+        );
+
+        assert!(core::ptr::eq(context.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(context.dac_credential(), &dac_credential));
+        assert_ne!(context.dac_credential().uid(), actor.ids().fsuid);
+        assert!(Arc::ptr_eq(
+            context.target_owner_user_ns(),
+            &target_owner_namespace
+        ));
+        assert!(!Arc::ptr_eq(
+            context.target_owner_user_ns(),
+            actor.user_ns()
+        ));
+        assert!(core::ptr::eq(context.target_object(), &object));
+        assert_eq!(context.target_object().cookie, "inode-location");
+        assert_eq!(context.access(), access);
+    }
+
+    #[test]
+    fn file_open_operation_normalizes_creation_and_mutation_facts() {
+        let read_truncate = FileOpenOperation::new(FileOpenAccess::Read, false, true, false, false)
+            .expect("Linux O_RDONLY|O_TRUNC remains representable");
+        assert_eq!(read_truncate.access(), FileOpenAccess::Read);
+        assert!(read_truncate.truncate());
+        assert_eq!(
+            FileOpenOperation::new(FileOpenAccess::Read, true, false, false, false),
+            None
+        );
+
+        let no_data = FileOpenOperation::new(FileOpenAccess::NoData, false, true, true, false)
+            .expect("reserved access mode 3 can retain truncate/create facts");
+        assert!(!no_data.access().reads());
+        assert!(!no_data.access().writes());
+        assert!(no_data.truncate());
+        assert!(no_data.created());
+        assert_eq!(
+            FileOpenOperation::new(FileOpenAccess::NoData, true, false, false, false),
+            None
+        );
+        let no_data_unnamed =
+            FileOpenOperation::new(FileOpenAccess::NoData, false, false, true, true)
+                .expect("mode-3 ACC_MODE admits O_TMPFILE creation");
+        assert!(!no_data_unnamed.access().writes());
+        assert!(no_data_unnamed.created());
+        assert!(no_data_unnamed.unnamed());
+        assert_eq!(
+            FileOpenOperation::new(FileOpenAccess::NoData, false, false, false, true),
+            None
+        );
+
+        let unnamed = FileOpenOperation::new(FileOpenAccess::Write, false, false, true, true)
+            .expect("writable created O_TMPFILE target is valid");
+        assert!(unnamed.created());
+        assert!(unnamed.unnamed());
+        assert_eq!(
+            FileOpenOperation::new(FileOpenAccess::Write, false, false, false, true),
+            None
+        );
+        assert_eq!(
+            FileOpenOperation::new(FileOpenAccess::Read, false, false, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn file_open_context_binds_exact_noncopy_object_and_owner_namespace() {
+        let actor_namespace = MockNamespace::root();
+        let actor = root_credential(actor_namespace.clone());
+        let target_owner_namespace =
+            MockNamespace::child(&actor_namespace, Kuid::INITIAL_ROOT, Some(kuid(1000)));
+        let object = DummyHandle {
+            cookie: "open-location",
+        };
+        let dac_credential = FsCredentialSnapshot::new(
+            kuid(1000),
+            kgid(1000),
+            actor.groups().clone(),
+            [0; CAPABILITY_WORDS],
+            false,
+        );
+        let operation =
+            FileOpenOperation::new(FileOpenAccess::ReadWrite, true, true, true, false).unwrap();
+        let context = FileOpenContext::new(
+            &actor,
+            &dac_credential,
+            &target_owner_namespace,
+            &object,
+            operation,
+        );
+
+        assert!(core::ptr::eq(context.actor(), actor.as_ref()));
+        assert!(core::ptr::eq(context.dac_credential(), &dac_credential));
+        assert_ne!(context.dac_credential().uid(), actor.ids().fsuid);
+        assert!(Arc::ptr_eq(
+            context.target_owner_user_ns(),
+            &target_owner_namespace
+        ));
+        assert!(!Arc::ptr_eq(
+            context.target_owner_user_ns(),
+            actor.user_ns()
+        ));
+        assert!(core::ptr::eq(context.target_object(), &object));
+        assert_eq!(context.target_object().cookie, "open-location");
+        assert_eq!(context.operation(), operation);
+        assert!(context.operation().access().reads());
+        assert!(context.operation().access().writes());
+        assert!(context.operation().append());
+        assert!(context.operation().truncate());
+        assert!(context.operation().created());
+        assert!(!context.operation().unnamed());
     }
 
     #[test]

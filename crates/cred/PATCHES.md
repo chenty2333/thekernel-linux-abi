@@ -57,6 +57,19 @@
 - Normalize signal-zero versus nonzero requests, source class, and delivery
   scope into field-private values; return an opaque successful core token that
   cannot be rebound to a different credential before a consumer hook runs.
+- Add field-private inode-permission and file-open values which bind the exact
+  actor separately from the DAC snapshot actually selected for the operation,
+  retain target-owner namespace and opaque object identity, reject empty or
+  unknown permission bits, and normalize ordinary access, Linux's reserved
+  no-data access mode 3, open mutation, creation, and unnamed `O_TMPFILE` facts
+  without importing VFS or descriptor flags. Omit `O_PATH` from the hook
+  payload because Linux returns its path-only description before
+  `security_file_open`. Keep mode 3's read/write admission distinct from its
+  no-data persistent description so it may retain a successful unnamed-create
+  result.
+- Remove duplicate pre-release namespace-entry and filesystem-snapshot
+  spellings before freezing 0.1, leaving one canonical consumer path for each
+  operation.
 - Declare the `allocator_api` nightly requirement without inventing a `kspin`
   dependency; synchronization remains a consumer decision.
 
@@ -69,6 +82,7 @@
   application of dumpability, MM-owner, ptrace, and parent-death effects;
 - security-hook registry storage, dispatch, boot freeze, notification phases,
   and concrete kernel object wrappers;
-- VFS DAC adapters, process/signal/scheduler/IPC authorization adapters, MM,
-  and syscall/usercopy glue; and
+- VFS object/location identity, DAC adapters, open transactions,
+  process/signal/scheduler/IPC authorization adapters, MM, and syscall/usercopy
+  glue; and
 - kernel errno values, concrete lock types, hash maps, RCU, or epoch schemes.

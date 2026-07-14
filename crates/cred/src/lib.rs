@@ -47,7 +47,8 @@ pub use namespace::{
     UserNamespaceMapState,
 };
 pub use security::{
-    AuthorizationError, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
+    AuthorizationError, FileOpenAccess, FileOpenContext, FileOpenOperation, InodePermissionAccess,
+    InodePermissionContext, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
     PtraceTracemeContext, SchedulerSecurityContext, SchedulerSecurityOperation,
     SignalCoreAuthorization, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
     SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, authorize_signal_core,
