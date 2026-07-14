@@ -13,7 +13,12 @@ use thekernel_linux_cred::{
     PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
     SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
-    SignalSecuritySource, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
+    SignalSecuritySource, SocketAcceptContext, SocketBindContext, SocketConnectContext,
+    SocketCreateContext, SocketCreateSpec, SocketGetOptionContext, SocketGetPeerNameContext,
+    SocketGetSockNameContext, SocketListenBacklog, SocketListenContext, SocketOption,
+    SocketPairContext, SocketPostCreateContext, SocketReceiveMessageContext,
+    SocketSendMessageContext, SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext,
+    UnixStreamConnectContext, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
     XATTR_NAME_MAX, XattrSetFlags, XattrValueClass, authorize_signal_core,
     commoncap_exec_transition, commoncap_ptrace_access, commoncap_ptrace_traceme,
     commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
@@ -86,6 +91,57 @@ impl ExecUserNamespaceView for TestNamespace {
 
 struct NonCopyObject {
     identity: String,
+}
+
+struct PreparedSocketAddress {
+    bytes: Vec<u8>,
+}
+
+struct PreparedSocketMessage {
+    identity: String,
+    normalized_flags: i32,
+}
+
+struct FirstPairSocket(String);
+struct SecondPairSocket(String);
+struct ListeningSocket(String);
+struct AcceptedSocket(String);
+struct ConnectingUnixSocket(String);
+struct ListeningUnixSocket(String);
+struct AcceptedUnixSocket(String);
+struct SendingUnixSocket(String);
+struct ReceivingUnixSocket(String);
+
+fn borrow_bind_parts<'a>(
+    context: &SocketBindContext<'a, TestNamespace, NonCopyObject, PreparedSocketAddress>,
+) -> (
+    &'a Credential<TestNamespace>,
+    &'a NonCopyObject,
+    &'a PreparedSocketAddress,
+) {
+    (context.actor(), context.socket(), context.address())
+}
+
+type UnixStreamTestContext<'a> = UnixStreamConnectContext<
+    'a,
+    TestNamespace,
+    ConnectingUnixSocket,
+    ListeningUnixSocket,
+    AcceptedUnixSocket,
+>;
+
+fn borrow_unix_stream_roles<'a>(
+    context: &UnixStreamTestContext<'a>,
+) -> (
+    &'a ConnectingUnixSocket,
+    &'a ListeningUnixSocket,
+    &'a AcceptedUnixSocket,
+) {
+    (
+        context.connecting_socket(),
+        context.listening_socket(),
+        context.accepted_socket(),
+    )
 }
 
 fn overridden_dac_credential(
@@ -916,4 +972,158 @@ fn file_open_public_contract_normalizes_flags_without_raw_fd_values() {
         FileOpenOperation::new(FileOpenAccess::NoData, false, false, false, true),
         None
     );
+}
+
+#[test]
+fn socket_create_pair_listen_and_accept_contracts_preserve_leaf_roles() {
+    let namespace = TestNamespace::initial("socket-create");
+    let actor = Credential::try_root(namespace).unwrap();
+
+    assert_eq!(SocketCreateSpec::try_new(2, -1, 6, false), None);
+    assert_eq!(SocketCreateSpec::try_new(2, 1 | 0x800, 6, false), None);
+    let spec = SocketCreateSpec::try_new(2, 1, 6, false).unwrap();
+    assert_eq!(spec.family(), 2);
+    assert_eq!(spec.socket_type(), 1);
+    assert_eq!(spec.protocol(), 6);
+    assert!(!spec.kernel_origin());
+
+    let create = SocketCreateContext::new(&actor, spec);
+    assert!(std::ptr::eq(create.actor(), actor.as_ref()));
+    assert_eq!(create.spec(), spec);
+
+    let created_socket = NonCopyObject {
+        identity: String::from("post-create-socket"),
+    };
+    let post_create = SocketPostCreateContext::new(&actor, &created_socket, spec);
+    assert!(std::ptr::eq(post_create.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(post_create.created_socket(), &created_socket));
+    assert_eq!(post_create.created_socket().identity, "post-create-socket");
+    assert_eq!(post_create.spec(), create.spec());
+
+    let first = FirstPairSocket(String::from("first-pair-endpoint"));
+    let second = SecondPairSocket(String::from("second-pair-endpoint"));
+    let pair = SocketPairContext::new(&actor, &first, &second);
+    assert!(std::ptr::eq(pair.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(pair.first_socket(), &first));
+    assert!(std::ptr::eq(pair.second_socket(), &second));
+    assert_eq!(pair.first_socket().0, "first-pair-endpoint");
+    assert_eq!(pair.second_socket().0, "second-pair-endpoint");
+
+    assert_eq!(SocketListenBacklog::try_from_clamped(-1), None);
+    let backlog = SocketListenBacklog::try_from_clamped(128).unwrap();
+    assert_eq!(backlog.get(), 128);
+    let listening = ListeningSocket(String::from("listening-endpoint"));
+    let listen = SocketListenContext::new(&actor, &listening, backlog);
+    assert!(std::ptr::eq(listen.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(listen.socket(), &listening));
+    assert_eq!(listen.socket().0, "listening-endpoint");
+    assert_eq!(listen.backlog(), backlog);
+
+    let accepted = AcceptedSocket(String::from("new-accept-endpoint"));
+    let accept = SocketAcceptContext::new(&actor, &listening, &accepted);
+    assert!(std::ptr::eq(accept.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(accept.listening_socket(), &listening));
+    assert!(std::ptr::eq(accept.new_socket(), &accepted));
+    assert_eq!(accept.listening_socket().0, "listening-endpoint");
+    assert_eq!(accept.new_socket().0, "new-accept-endpoint");
+}
+
+#[test]
+fn socket_operation_contracts_borrow_prepared_objects_and_preserve_raw_facts() {
+    let namespace = TestNamespace::initial("socket-operations");
+    let actor = Credential::try_root(namespace).unwrap();
+    let socket = NonCopyObject {
+        identity: String::from("exact-pinned-socket"),
+    };
+    let address = PreparedSocketAddress {
+        bytes: vec![2, 0, 0x1f, 0x90, 127, 0, 0, 1],
+    };
+
+    let bind = SocketBindContext::new(&actor, &socket, &address, address.bytes.len());
+    let (borrowed_actor, borrowed_socket, borrowed_address) = borrow_bind_parts(&bind);
+    assert!(std::ptr::eq(borrowed_actor, actor.as_ref()));
+    assert!(std::ptr::eq(borrowed_socket, &socket));
+    assert!(std::ptr::eq(borrowed_address, &address));
+    assert_eq!(bind.address_length(), 8);
+
+    let connect = SocketConnectContext::new(&actor, &socket, &address, address.bytes.len());
+    assert!(std::ptr::eq(connect.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(connect.socket(), &socket));
+    assert!(std::ptr::eq(connect.address(), &address));
+    assert_eq!(connect.address_length(), address.bytes.len());
+
+    let send_message = PreparedSocketMessage {
+        identity: String::from("prepared-send-message"),
+        normalized_flags: 0x4000,
+    };
+    let send = SocketSendMessageContext::new(&actor, &socket, &send_message, 4096);
+    assert!(std::ptr::eq(send.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(send.socket(), &socket));
+    assert!(std::ptr::eq(send.prepared_message(), &send_message));
+    assert_eq!(send.prepared_message().identity, "prepared-send-message");
+    assert_eq!(send.prepared_message().normalized_flags, 0x4000);
+    assert_eq!(send.size(), 4096);
+
+    let receive_message = PreparedSocketMessage {
+        identity: String::from("prepared-receive-message"),
+        normalized_flags: 0,
+    };
+    let receive = SocketReceiveMessageContext::new(&actor, &socket, &receive_message, 8192, -7);
+    assert!(std::ptr::eq(receive.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(receive.socket(), &socket));
+    assert!(std::ptr::eq(receive.prepared_message(), &receive_message));
+    assert_eq!(receive.size(), 8192);
+    assert_eq!(receive.flags(), -7);
+
+    let get_name = SocketGetSockNameContext::new(&actor, &socket);
+    let get_peer_name = SocketGetPeerNameContext::new(&actor, &socket);
+    assert!(std::ptr::eq(get_name.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(get_name.socket(), &socket));
+    assert!(std::ptr::eq(get_peer_name.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(get_peer_name.socket(), &socket));
+
+    let option = SocketOption::new(1, 7);
+    assert_eq!(option.level(), 1);
+    assert_eq!(option.name(), 7);
+    let get_option = SocketGetOptionContext::new(&actor, &socket, option);
+    let set_option = SocketSetOptionContext::new(&actor, &socket, option);
+    assert!(std::ptr::eq(get_option.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(get_option.socket(), &socket));
+    assert_eq!(get_option.option(), option);
+    assert!(std::ptr::eq(set_option.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(set_option.socket(), &socket));
+    assert_eq!(set_option.option(), option);
+
+    let shutdown = SocketShutdownContext::new(&actor, &socket, -19);
+    assert!(std::ptr::eq(shutdown.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(shutdown.socket(), &socket));
+    assert_eq!(shutdown.how(), -19);
+}
+
+#[test]
+fn unix_socket_contracts_keep_connect_and_send_directions_distinct() {
+    let namespace = TestNamespace::initial("unix-socket-roles");
+    let actor = Credential::try_root(namespace).unwrap();
+    let connecting = ConnectingUnixSocket(String::from("connecting-client"));
+    let listening = ListeningUnixSocket(String::from("listening-server"));
+    let accepted = AcceptedUnixSocket(String::from("new-server-child"));
+    let stream = UnixStreamConnectContext::new(&actor, &connecting, &listening, &accepted);
+    let (borrowed_connecting, borrowed_listening, borrowed_accepted) =
+        borrow_unix_stream_roles(&stream);
+    assert!(std::ptr::eq(stream.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(borrowed_connecting, &connecting));
+    assert!(std::ptr::eq(borrowed_listening, &listening));
+    assert!(std::ptr::eq(borrowed_accepted, &accepted));
+    assert_eq!(borrowed_connecting.0, "connecting-client");
+    assert_eq!(borrowed_listening.0, "listening-server");
+    assert_eq!(borrowed_accepted.0, "new-server-child");
+
+    let sending = SendingUnixSocket(String::from("sending-endpoint"));
+    let receiving = ReceivingUnixSocket(String::from("receiving-endpoint"));
+    let may_send = UnixMaySendContext::new(&actor, &sending, &receiving);
+    assert!(std::ptr::eq(may_send.actor(), actor.as_ref()));
+    assert!(std::ptr::eq(may_send.sending_socket(), &sending));
+    assert!(std::ptr::eq(may_send.receiving_socket(), &receiving));
+    assert_eq!(may_send.sending_socket().0, "sending-endpoint");
+    assert_eq!(may_send.receiving_socket().0, "receiving-endpoint");
 }

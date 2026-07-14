@@ -95,6 +95,15 @@
   exact byte name `security.capability` without exposing parsed capability,
   kernel, VFS, store, or provider types, and bind the operation to the actor,
   selected DAC snapshot, target-owner namespace, and opaque target identity.
+- Add field-private policy-neutral socket contexts matching Linux v6.18's
+  create/post-create/pair, bind/connect, listen/accept, send/receive message,
+  local/peer name, get/set option, shutdown, Unix stream-connect, and Unix
+  may-send leaf roles. Borrow immutable actors and opaque consumer snapshots,
+  reject flagged create types, retain consumer-clamped backlog and raw shutdown
+  direction, preserve send size without inventing a separate flags field, and
+  preserve receive size plus its explicit raw flags. Keep fd/OFD lookup,
+  address import, transport types, security-module registry state, dispatch,
+  locking, and errno mapping outside the crate.
 - Remove the pre-release `try_with_user_ns` and `fs_dac_credentials`
   compatibility aliases before the 0.1 API freeze; consumers use
   `try_with_user_namespace` and `fs_credential_snapshot` exclusively.
