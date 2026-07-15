@@ -1,0 +1,22 @@
+[package]
+name = "thekernel-linux-io-uring"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Bounded generation-safe Linux io_uring policy core for no_std kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "io-uring"]
+categories = ["no-std", "os"]
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

@@ -16,6 +16,11 @@ must not invent an upstream archive, `Cargo.toml.orig`, or Cargo VCS record.
 Research-derived contracts must also distinguish policy/value reimplementation
 from lower mechanism source: a port trait or planner is not provenance for a
 concrete queue, page table, frame, VFS, task, or usercopy implementation.
+The `thekernel-linux-io-uring` record additionally pins the Linux kernel and
+liburing snapshots used for ABI and memory-ordering research, an Asterinas
+snapshot used as a negative capability comparison, and the first TheKernel
+consumer baseline. Those references do not imply copied implementation or
+ownership of mapped-page atomics, FD/VFS/readiness adapters, or execution.
 
 Original metadata remains in Git even when it is excluded as package source.
 Published packages include the human-readable provenance and patch ledger, but

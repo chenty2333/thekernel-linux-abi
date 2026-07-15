@@ -10,6 +10,7 @@ vfs_dir="$repo_root/crates/vfs"
 fd_dir="$repo_root/crates/fd"
 cred_dir="$repo_root/crates/cred"
 mm_dir="$repo_root/crates/mm"
+io_uring_dir="$repo_root/crates/io-uring"
 
 check_sha256() {
     local expected=$1
@@ -101,5 +102,13 @@ grep -Fq '0e24cb7acc37eab762db97b1dbdbb73924679a19' "$mm_dir/VENDOR.md"
 grep -Fq '44696aa3a489d2baf58efa61b37833f100072bee' "$mm_dir/VENDOR.md"
 grep -Fq '8fe57fc696e6ccd1d8f7f48959116d17db467eaa' "$mm_dir/VENDOR.md"
 grep -Fq '37411049265056135a5e18c8c75a0c3d16b18579' "$mm_dir/VENDOR.md"
+
+check_sha256 \
+    cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 \
+    "$io_uring_dir/LICENSE"
+grep -Fq 'f9e30c9f72e3f267621c2d36aafc83e65ab76568' "$io_uring_dir/VENDOR.md"
+grep -Fq '783cd2c3dca8b6c434e955b84c20c8940588dc68' "$io_uring_dir/VENDOR.md"
+grep -Fq '80272cbeb42bcd0b39a75685a50b0009b77cd380' "$io_uring_dir/VENDOR.md"
+grep -Fq '435916bf0714a61e0fd1ebab5f6486532dedd8e4' "$io_uring_dir/VENDOR.md"
 
 printf 'provenance: PASS\n'

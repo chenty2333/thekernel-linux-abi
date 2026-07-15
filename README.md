@@ -4,7 +4,7 @@
 owned by TheKernel. It is deliberately separate from generic ArceOS
 mechanisms and from TheKernel's syscall and evaluator layers.
 
-The 0.1.0 line contains seven packages:
+The 0.1.0 line contains eight packages:
 
 - `thekernel-linux-usercopy` 0.1.0: explicit-context, bounded, fallible access
   to a caller-provided userspace memory implementation.
@@ -26,6 +26,10 @@ The 0.1.0 line contains seven packages:
 - `thekernel-linux-mm` 0.1.0: checked ranges and mapping generations, bounded
   owner/global pin accounting, cross-VMA revalidation, typed invalidation and
   fault seams, and arithmetic-only remap/memlock planners.
+- `thekernel-linux-io-uring` 0.1.0: checked shared-ring geometry and
+  SQE/registration decoding, bounded generation-safe
+  request/completion/cancellation state, and registered-file leases with
+  explicit close and drain transitions.
 
 Signal depends on usercopy. Process remains independent; task ownership and
 process-to-signal integration stay with the caller rather than becoming hidden
@@ -39,10 +43,11 @@ before a release tag.
 ## Development
 
 The repository pins the same nightly used by its initial TheKernel consumer.
-The usercopy, VFS, FD, and MM crates are additionally checked against stable
-Rust 1.85 or newer. The process, signal, and credential crates are explicitly
-nightly-only because preserving fallible standard `Arc` allocation currently
-requires `allocator_api`; none inherits or claims a stable `rust-version`.
+The usercopy, VFS, FD, MM, and io_uring crates are additionally checked against
+stable Rust 1.85 or newer. The process, signal, and credential crates are
+explicitly nightly-only because preserving fallible standard `Arc` allocation
+currently requires `allocator_api`; none inherits or claims a stable
+`rust-version`.
 
 ```bash
 cargo test --workspace --all-features
@@ -52,6 +57,7 @@ cargo check -p thekernel-linux-vfs --no-default-features --locked
 cargo check -p thekernel-linux-fd --no-default-features --locked
 cargo check -p thekernel-linux-cred --no-default-features --locked
 cargo check -p thekernel-linux-mm --no-default-features --locked
+cargo check -p thekernel-linux-io-uring --no-default-features --locked
 CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh
 PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   ./scripts/test-package.sh
@@ -80,6 +86,13 @@ PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   immutable mapping snapshots. It owns bounded pin admission/accounting and
   generation validation, but not VMA storage, frames, page tables, TLBs,
   concrete fault queues, tasks, VFS objects, locks, raw pointers, or usercopy.
+- io_uring policy owns checked setup/enter/SQE/registration values, request and
+  registered-file generations, bounded leases, terminal completion credits,
+  serialized CQ publication, cancellable/uncancellable execution hand-off,
+  cancellation races, and close state. The
+  embedding kernel still owns shared-page atomic access, UAPI copyin/copyout,
+  mmap and FD lifetimes, VFS/readiness adapters, signal-mask restoration,
+  execution, waiting, and errno conversion.
 - Pathwalk, descriptor, watch, ready-queue, graph, and recovery work are all
   finite. Epoll payload preparation is lock-external and recovery is
   generation-tagged and incrementally bounded. Unsupported exclusive selection
