@@ -16,12 +16,14 @@ mod mapping;
 mod pin;
 mod plan;
 mod range;
+mod userfaultfd;
 
 pub use error::MmError;
 pub use fault::{
     FaultAccess, FaultAdmission, FaultAdmissionPermit, FaultCapacity, FaultCompletionPermit,
     FaultDisposition, FaultFailure, FaultHandlerId, FaultKey, FaultLifecycleState, FaultLoad,
-    FaultPort, FaultRequest, FaultRequestId, FaultType, PageOffset, validate_fault_completion,
+    FaultPageAddress, FaultPort, FaultRequest, FaultRequestId, FaultType, PageOffset,
+    validate_fault_completion,
 };
 pub use identity::{AddressSpaceId, MappingGeneration, MappingId, PinOwner};
 pub use mapping::{
@@ -38,6 +40,15 @@ pub use plan::{
     RemapSegmentGeometry, relocate_affine_origin,
 };
 pub use range::{PageRange, PageSize, UserRange};
+pub use userfaultfd::{
+    UFFD_API, UFFD_O_CLOEXEC, UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY, UffdApiLifecycle,
+    UffdApiNegotiation, UffdApiRequest, UffdApiResponse, UffdApiState, UffdCopyMode,
+    UffdCopyRequest, UffdCreateFlags, UffdFaultPolicy, UffdFeatures, UffdIoctls, UffdRegisterMode,
+    UffdRegistration, UffdRegistrationCommit, UffdRegistrationDeltaPlan, UffdRegistrationId,
+    UffdRegistrationIntent, UffdRegistrationPlan, UffdRegistrationReplacement,
+    UffdRegistrationRequest, UffdRegistrationTable, UffdResolverOutcome, UffdResolverResult,
+    UffdZeroPageMode, UffdZeroPageRequest,
+};
 
 #[cfg(test)]
 mod tests;

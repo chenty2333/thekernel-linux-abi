@@ -427,6 +427,913 @@ fn mapping_request(request: FaultRequest) -> FaultRequest {
     request
 }
 
+fn uffd_snapshot(
+    address_space: u64,
+    mapping: u64,
+    generation: u64,
+    start: usize,
+    length: usize,
+    kind: MappingKind,
+) -> MappingSnapshot {
+    MappingSnapshot::from_raw(
+        address_space,
+        mapping,
+        generation,
+        start,
+        length,
+        PAGE,
+        access(true, true, false).bits(),
+        kind,
+        true,
+        false,
+    )
+    .unwrap()
+}
+
+fn initialized_uffd_api() -> UffdApiState {
+    let mut api = UffdApiState::new();
+    let negotiation = api.prepare_raw(UFFD_API, 0).unwrap();
+    assert_eq!(api.lifecycle(), UffdApiLifecycle::Created);
+    let response = api.commit(negotiation).unwrap();
+    assert_eq!(response.api(), UFFD_API);
+    assert_eq!(response.features(), UffdFeatures::AVAILABLE);
+    assert_eq!(response.ioctls(), UffdIoctls::API_PROFILE);
+    api
+}
+
+fn uffd_registration_request(
+    handler: u64,
+    mapping: MappingSnapshot,
+    range: PageRange,
+) -> UffdRegistrationRequest {
+    UffdRegistrationRequest::new(
+        FaultHandlerId::new(handler).unwrap(),
+        mapping,
+        range,
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap()
+}
+
+fn collect_uffd_register_delta<const CAPACITY: usize>(
+    table: &UffdRegistrationTable<CAPACITY>,
+    api: &UffdApiState,
+    intent: UffdRegistrationIntent,
+    vmas: &[MappingSnapshot],
+) -> (
+    UffdRegistrationDeltaPlan,
+    Vec<UffdRegistrationId>,
+    Vec<UffdRegistrationRequest>,
+) {
+    let plan = table.preflight_register_delta(api, intent, vmas).unwrap();
+    let mut removed = Vec::with_capacity(plan.removed());
+    let mut replacements = Vec::with_capacity(plan.replacements());
+    table
+        .replay_register_delta(
+            plan,
+            intent,
+            vmas,
+            |id| removed.push(id),
+            |request| replacements.push(request),
+        )
+        .unwrap();
+    assert_eq!(removed.len(), plan.removed());
+    assert_eq!(replacements.len(), plan.replacements());
+    (plan, removed, replacements)
+}
+
+fn commit_uffd_register_delta<const CAPACITY: usize>(
+    table: &mut UffdRegistrationTable<CAPACITY>,
+    api: &UffdApiState,
+    intent: UffdRegistrationIntent,
+    vmas: &[MappingSnapshot],
+) {
+    let (plan, removed, replacements) = collect_uffd_register_delta(table, api, intent, vmas);
+    if plan.is_noop() {
+        return;
+    }
+    if removed.is_empty() {
+        table.register_batch(api, &replacements, |_| {}).unwrap();
+    } else {
+        table
+            .replace_batch(api, &removed, &replacements, |_| {})
+            .unwrap();
+    }
+}
+
+#[test]
+fn fault_keys_keep_absolute_page_identity_and_reject_moved_ranges() {
+    let first = uffd_snapshot(1, 30, 7, 0x1000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let second = uffd_snapshot(1, 31, 7, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let first_key = FaultKey::from_address(first, 0x2001, FaultAccess::Write).unwrap();
+    let second_key = FaultKey::from_address(second, 0x9001, FaultAccess::Write).unwrap();
+    assert_eq!(first_key.page(), second_key.page());
+    assert_ne!(first_key.page_address(), second_key.page_address());
+    assert_ne!(first_key, second_key);
+
+    let moved = uffd_snapshot(1, 30, 7, 0x2000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(first_key.revalidate(moved), Err(MmError::StaleGeneration));
+}
+
+#[test]
+fn userfaultfd_create_and_api_negotiation_preserve_linux_error_classes() {
+    assert_eq!(
+        UffdCreateFlags::from_bits(1 << 4),
+        Err(MmError::InvalidUffdFlags)
+    );
+    assert_eq!(
+        UffdCreateFlags::from_bits(UFFD_O_CLOEXEC)
+            .unwrap()
+            .validate_profile(),
+        Err(MmError::AccessDenied)
+    );
+    let flags = UffdCreateFlags::from_bits(UFFD_USER_MODE_ONLY | UFFD_O_NONBLOCK | UFFD_O_CLOEXEC)
+        .unwrap()
+        .validate_profile()
+        .unwrap();
+    assert!(flags.user_mode_only());
+    assert!(flags.nonblocking());
+    assert!(flags.close_on_exec());
+
+    let mut api = UffdApiState::new();
+    assert_eq!(
+        api.prepare_raw(UFFD_API + 1, 0),
+        Err(MmError::InvalidUffdApi)
+    );
+    assert_eq!(
+        api.prepare_raw(UFFD_API, 1 << 63),
+        Err(MmError::InvalidUffdFeatures)
+    );
+    assert_eq!(
+        api.prepare_raw(UFFD_API, UffdFeatures::EVENT_FORK.bits()),
+        Err(MmError::UnsupportedUffdFeatures)
+    );
+
+    let abandoned_copyout = api.prepare_raw(UFFD_API, 0).unwrap();
+    assert_eq!(api.lifecycle(), UffdApiLifecycle::Created);
+    let retry = api.prepare_raw(UFFD_API, 0).unwrap();
+    assert_eq!(retry, abandoned_copyout);
+    api.commit(retry).unwrap();
+    assert_eq!(api.lifecycle(), UffdApiLifecycle::Initialized);
+    assert_eq!(api.enabled_features(), UffdFeatures::AVAILABLE);
+    assert_eq!(
+        api.prepare_raw(UFFD_API, 0),
+        Err(MmError::UffdAlreadyInitialized)
+    );
+}
+
+#[test]
+fn userfaultfd_registration_modes_and_mapping_profile_are_explicit() {
+    assert_eq!(
+        UffdRegisterMode::from_bits(0),
+        Err(MmError::InvalidUffdMode)
+    );
+    assert_eq!(
+        UffdRegisterMode::from_bits(1 << 8),
+        Err(MmError::InvalidUffdMode)
+    );
+    assert_eq!(
+        UffdRegisterMode::from_bits(UffdRegisterMode::WP.bits()),
+        Err(MmError::UnsupportedUffdMode)
+    );
+    assert_eq!(
+        UffdRegisterMode::from_bits(UffdRegisterMode::MINOR.bits()),
+        Err(MmError::UnsupportedUffdMode)
+    );
+
+    let shared = uffd_snapshot(1, 40, 1, 0x1000, PAGE, MappingKind::AnonymousShared);
+    assert_eq!(
+        UffdRegistrationRequest::new(
+            FaultHandlerId::new(1).unwrap(),
+            shared,
+            shared.range(),
+            UffdRegisterMode::MISSING,
+        ),
+        Err(MmError::UnsupportedUffdMapping)
+    );
+}
+
+#[test]
+fn userfaultfd_registration_batch_is_atomic_idempotent_and_owner_aware() {
+    let api = initialized_uffd_api();
+    let first = uffd_snapshot(1, 50, 1, 0x1000, PAGE, MappingKind::AnonymousPrivate);
+    let second = uffd_snapshot(1, 51, 1, 0x4000, PAGE, MappingKind::AnonymousPrivate);
+    let first_request = uffd_registration_request(7, first, first.range());
+    let second_request = uffd_registration_request(7, second, second.range());
+
+    let mut table = UffdRegistrationTable::<4>::new(10).unwrap();
+    let mut ids = Vec::new();
+    let commit = table
+        .register_batch(&api, &[first_request, second_request], |registration| {
+            ids.push(registration.id().get());
+        })
+        .unwrap();
+    assert_eq!(commit.published(), 2);
+    assert_eq!(commit.reused(), 0);
+    assert_eq!(commit.registrations(), 2);
+    assert_eq!(table.len(), 2);
+    assert_eq!(ids, vec![10, 11]);
+
+    let duplicate = table.register(&api, first_request).unwrap();
+    assert_eq!(duplicate.id().get(), 10);
+    assert_eq!(table.len(), 2);
+
+    let foreign = uffd_registration_request(8, first, first.range());
+    assert_eq!(table.register(&api, foreign), Err(MmError::Busy));
+    assert_eq!(table.len(), 2);
+
+    let mut too_small = UffdRegistrationTable::<1>::new(1).unwrap();
+    assert!(matches!(
+        too_small.register_batch(&api, &[first_request, second_request], |_| {}),
+        Err(MmError::CapacityExceeded)
+    ));
+    assert!(too_small.is_empty());
+    assert_eq!(
+        too_small.register(&api, first_request).unwrap().id().get(),
+        1
+    );
+
+    let mut exhausted = UffdRegistrationTable::<2>::new(u64::MAX).unwrap();
+    assert!(matches!(
+        exhausted.register_batch(&api, &[first_request, second_request], |_| {}),
+        Err(MmError::IdExhausted)
+    ));
+    assert!(exhausted.is_empty());
+    assert_eq!(
+        exhausted.register(&api, first_request).unwrap().id().get(),
+        u64::MAX
+    );
+}
+
+#[test]
+fn userfaultfd_partial_register_handles_subset_prefix_and_suffix_canonically() {
+    let api = initialized_uffd_api();
+    let mapping = uffd_snapshot(6, 100, 1, 0x1000, 5 * PAGE, MappingKind::AnonymousPrivate);
+    let handler = FaultHandlerId::new(50).unwrap();
+    let mut table = UffdRegistrationTable::<4>::new(1).unwrap();
+    let middle = PageRange::new(0x2000, 2 * PAGE, PAGE).unwrap();
+    let original = table
+        .register(&api, uffd_registration_request(50, mapping, middle))
+        .unwrap();
+
+    let subset = UffdRegistrationIntent::new(
+        handler,
+        PageRange::new(0x3000, PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    let (plan, removed, replacements) =
+        collect_uffd_register_delta(&table, &api, subset, &[mapping]);
+    assert!(plan.is_noop());
+    assert!(removed.is_empty());
+    assert!(replacements.is_empty());
+    assert_eq!(table.get(original.id()), Ok(original));
+
+    let prefix = UffdRegistrationIntent::new(
+        handler,
+        PageRange::new(0x1000, 2 * PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    let (plan, removed, replacements) =
+        collect_uffd_register_delta(&table, &api, prefix, &[mapping]);
+    assert_eq!(plan.removed(), 1);
+    assert_eq!(plan.replacements(), 1);
+    assert_eq!(removed, vec![original.id()]);
+    assert_eq!(
+        replacements[0].range(),
+        PageRange::new(0x1000, 3 * PAGE, PAGE).unwrap()
+    );
+    commit_uffd_register_delta(&mut table, &api, prefix, &[mapping]);
+
+    let suffix = UffdRegistrationIntent::new(
+        handler,
+        PageRange::new(0x3000, 3 * PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    commit_uffd_register_delta(&mut table, &api, suffix, &[mapping]);
+    let registrations = table.iter().collect::<Vec<_>>();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(
+        registrations[0].range(),
+        PageRange::new(0x1000, 5 * PAGE, PAGE).unwrap()
+    );
+}
+
+#[test]
+fn userfaultfd_partial_register_bridges_fragments_but_preserves_vma_gaps() {
+    let api = initialized_uffd_api();
+    let handler = FaultHandlerId::new(60).unwrap();
+    let bridge_vma = uffd_snapshot(7, 110, 1, 0x10_000, 5 * PAGE, MappingKind::AnonymousPrivate);
+    let mut bridge_table = UffdRegistrationTable::<4>::new(1).unwrap();
+    let left = uffd_registration_request(
+        60,
+        bridge_vma,
+        PageRange::new(0x10_000, PAGE, PAGE).unwrap(),
+    );
+    let right = uffd_registration_request(
+        60,
+        bridge_vma,
+        PageRange::new(0x12_000, PAGE, PAGE).unwrap(),
+    );
+    bridge_table
+        .register_batch(&api, &[left, right], |_| {})
+        .unwrap();
+    let bridge = UffdRegistrationIntent::new(
+        handler,
+        PageRange::new(0x11_000, PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    let (plan, removed, replacements) =
+        collect_uffd_register_delta(&bridge_table, &api, bridge, &[bridge_vma]);
+    assert_eq!(plan.removed(), 2);
+    assert_eq!(plan.replacements(), 1);
+    assert_eq!(removed.len(), 2);
+    assert_eq!(
+        replacements[0].range(),
+        PageRange::new(0x10_000, 3 * PAGE, PAGE).unwrap()
+    );
+    commit_uffd_register_delta(&mut bridge_table, &api, bridge, &[bridge_vma]);
+    assert_eq!(bridge_table.len(), 1);
+
+    let first_vma = uffd_snapshot(8, 120, 1, 0x20_000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let second_vma = uffd_snapshot(8, 121, 1, 0x24_000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let across_gap = UffdRegistrationIntent::new(
+        handler,
+        PageRange::new(0x20_000, 6 * PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    let mut gap_table = UffdRegistrationTable::<4>::new(1).unwrap();
+    let (plan, removed, replacements) =
+        collect_uffd_register_delta(&gap_table, &api, across_gap, &[first_vma, second_vma]);
+    assert_eq!(plan.removed(), 0);
+    assert_eq!(plan.replacements(), 2);
+    assert!(removed.is_empty());
+    assert_eq!(replacements[0].range(), first_vma.range());
+    assert_eq!(replacements[1].range(), second_vma.range());
+    commit_uffd_register_delta(&mut gap_table, &api, across_gap, &[first_vma, second_vma]);
+    assert_eq!(gap_table.len(), 2);
+}
+
+#[test]
+fn userfaultfd_register_delta_failures_never_mutate_the_table() {
+    let api = initialized_uffd_api();
+    let vma = uffd_snapshot(9, 130, 1, 0x30_000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let foreign_intent = UffdRegistrationIntent::new(
+        FaultHandlerId::new(70).unwrap(),
+        PageRange::new(0x31_000, PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    let mut foreign = UffdRegistrationTable::<2>::new(1).unwrap();
+    let foreign_record = foreign
+        .register(
+            &api,
+            uffd_registration_request(71, vma, PageRange::new(0x31_000, PAGE, PAGE).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(
+        foreign.preflight_register_delta(&api, foreign_intent, &[vma]),
+        Err(MmError::Busy)
+    );
+    assert_eq!(foreign.iter().collect::<Vec<_>>(), vec![foreign_record]);
+
+    let first = uffd_snapshot(10, 140, 1, 0x40_000, PAGE, MappingKind::AnonymousPrivate);
+    let second = uffd_snapshot(10, 141, 1, 0x42_000, PAGE, MappingKind::AnonymousPrivate);
+    let third = uffd_snapshot(10, 142, 1, 0x44_000, PAGE, MappingKind::AnonymousPrivate);
+    let mut full = UffdRegistrationTable::<2>::new(1).unwrap();
+    full.register(&api, uffd_registration_request(72, first, first.range()))
+        .unwrap();
+    full.register(&api, uffd_registration_request(72, second, second.range()))
+        .unwrap();
+    let before = full.iter().collect::<Vec<_>>();
+    let new_intent = UffdRegistrationIntent::new(
+        FaultHandlerId::new(72).unwrap(),
+        third.range(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    assert_eq!(
+        full.preflight_register_delta(&api, new_intent, &[third]),
+        Err(MmError::CapacityExceeded)
+    );
+    assert_eq!(full.iter().collect::<Vec<_>>(), before);
+
+    let mut exhausted = UffdRegistrationTable::<2>::new(u64::MAX).unwrap();
+    let old = exhausted
+        .register(
+            &api,
+            uffd_registration_request(73, vma, PageRange::new(0x31_000, PAGE, PAGE).unwrap()),
+        )
+        .unwrap();
+    let extension = UffdRegistrationIntent::new(
+        FaultHandlerId::new(73).unwrap(),
+        PageRange::new(0x30_000, 2 * PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    assert_eq!(
+        exhausted.preflight_register_delta(&api, extension, &[vma]),
+        Err(MmError::IdExhausted)
+    );
+    assert_eq!(exhausted.iter().collect::<Vec<_>>(), vec![old]);
+
+    let mut stale = UffdRegistrationTable::<3>::new(1).unwrap();
+    let stale_plan = stale
+        .preflight_register_delta(&api, new_intent, &[third])
+        .unwrap();
+    stale
+        .register(&api, uffd_registration_request(72, first, first.range()))
+        .unwrap();
+    let mut emitted_removed = 0usize;
+    let mut emitted_replaced = 0usize;
+    assert_eq!(
+        stale.replay_register_delta(
+            stale_plan,
+            new_intent,
+            &[third],
+            |_| emitted_removed += 1,
+            |_| emitted_replaced += 1,
+        ),
+        Err(MmError::StaleGeneration)
+    );
+    assert_eq!(emitted_removed, 0);
+    assert_eq!(emitted_replaced, 0);
+    assert_eq!(stale.len(), 1);
+}
+
+#[test]
+fn userfaultfd_register_delta_requires_explicit_lineage_refresh() {
+    let api = initialized_uffd_api();
+    let old = uffd_snapshot(
+        12,
+        160,
+        1,
+        0x70_000,
+        3 * PAGE,
+        MappingKind::AnonymousPrivate,
+    );
+    let new_generation = uffd_snapshot(
+        12,
+        160,
+        2,
+        0x70_000,
+        3 * PAGE,
+        MappingKind::AnonymousPrivate,
+    );
+    let new_lineage = uffd_snapshot(
+        12,
+        161,
+        2,
+        0x70_000,
+        3 * PAGE,
+        MappingKind::AnonymousPrivate,
+    );
+    let handler = FaultHandlerId::new(81).unwrap();
+    let registered_range = PageRange::new(0x71_000, PAGE, PAGE).unwrap();
+    let intent = UffdRegistrationIntent::new(
+        handler,
+        PageRange::new(0x70_000, 2 * PAGE, PAGE).unwrap(),
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    let mut table = UffdRegistrationTable::<2>::new(1).unwrap();
+    let old_registration = table
+        .register(
+            &api,
+            UffdRegistrationRequest::new(handler, old, registered_range, UffdRegisterMode::MISSING)
+                .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        table.preflight_register_delta(&api, intent, &[new_generation]),
+        Err(MmError::StaleGeneration)
+    );
+    assert_eq!(
+        table.preflight_register_delta(&api, intent, &[new_lineage]),
+        Err(MmError::StaleGeneration)
+    );
+    assert_eq!(table.iter().collect::<Vec<_>>(), vec![old_registration]);
+
+    let refreshed = UffdRegistrationRequest::new(
+        handler,
+        new_lineage,
+        registered_range,
+        UffdRegisterMode::MISSING,
+    )
+    .unwrap();
+    table
+        .replace_batch(&api, &[old_registration.id()], &[refreshed], |_| {})
+        .unwrap();
+    let (plan, removed, replacements) =
+        collect_uffd_register_delta(&table, &api, intent, &[new_lineage]);
+    assert_eq!(plan.removed(), 1);
+    assert_eq!(plan.replacements(), 1);
+    assert_eq!(removed.len(), 1);
+    assert_eq!(
+        replacements[0].range(),
+        PageRange::new(0x70_000, 2 * PAGE, PAGE).unwrap()
+    );
+}
+
+#[test]
+fn userfaultfd_register_delta_matches_a_reference_interval_union() {
+    let api = initialized_uffd_api();
+    let base = 0x60_000usize;
+    let mapping = uffd_snapshot(11, 150, 1, base, 8 * PAGE, MappingKind::AnonymousPrivate);
+    let handler = FaultHandlerId::new(80).unwrap();
+    let candidate_pages = [0usize, 2, 4, 6];
+
+    for mask in 0u8..(1 << candidate_pages.len()) {
+        let mut table = UffdRegistrationTable::<8>::new(1).unwrap();
+        let mut initial = Vec::new();
+        for (bit, page) in candidate_pages.iter().copied().enumerate() {
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            initial.push(
+                UffdRegistrationRequest::new(
+                    handler,
+                    mapping,
+                    PageRange::new(base + page * PAGE, PAGE, PAGE).unwrap(),
+                    UffdRegisterMode::MISSING,
+                )
+                .unwrap(),
+            );
+        }
+        if !initial.is_empty() {
+            table.register_batch(&api, &initial, |_| {}).unwrap();
+        }
+        let existing = table.iter().collect::<Vec<_>>();
+
+        for start_page in 0usize..8 {
+            for end_page in (start_page + 1)..=8 {
+                let requested = PageRange::new(
+                    base + start_page * PAGE,
+                    (end_page - start_page) * PAGE,
+                    PAGE,
+                )
+                .unwrap();
+                let intent =
+                    UffdRegistrationIntent::new(handler, requested, UffdRegisterMode::MISSING)
+                        .unwrap();
+                let (plan, removed, replacements) =
+                    collect_uffd_register_delta(&table, &api, intent, &[mapping]);
+
+                let mut expected_start = requested.start();
+                let mut expected_end = requested.end();
+                loop {
+                    let before = (expected_start, expected_end);
+                    for registration in &existing {
+                        if registration.range().start() <= expected_end
+                            && expected_start <= registration.range().end()
+                        {
+                            expected_start = expected_start.min(registration.range().start());
+                            expected_end = expected_end.max(registration.range().end());
+                        }
+                    }
+                    if before == (expected_start, expected_end) {
+                        break;
+                    }
+                }
+                let expected_range =
+                    PageRange::new(expected_start, expected_end - expected_start, PAGE).unwrap();
+                let connected = existing
+                    .iter()
+                    .copied()
+                    .filter(|registration| {
+                        registration.range().start() <= expected_range.end()
+                            && expected_range.start() <= registration.range().end()
+                    })
+                    .collect::<Vec<_>>();
+                let no_op = connected.len() == 1 && connected[0].range() == expected_range;
+                let expected_removed = if no_op {
+                    Vec::new()
+                } else {
+                    connected
+                        .iter()
+                        .map(|registration| registration.id())
+                        .collect::<Vec<_>>()
+                };
+
+                assert_eq!(
+                    plan.is_noop(),
+                    no_op,
+                    "mask={mask:#x} request={requested:?}"
+                );
+                assert_eq!(
+                    removed, expected_removed,
+                    "mask={mask:#x} request={requested:?}"
+                );
+                if no_op {
+                    assert!(replacements.is_empty());
+                } else {
+                    assert_eq!(replacements.len(), 1);
+                    assert_eq!(
+                        replacements[0].range(),
+                        expected_range,
+                        "mask={mask:#x} request={requested:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn userfaultfd_registration_refresh_is_transactional_and_stale_plan_safe() {
+    let api = initialized_uffd_api();
+    let old = uffd_snapshot(4, 80, 1, 0x20_000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let refreshed = uffd_snapshot(4, 80, 2, 0x20_000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<4>::new(100).unwrap();
+    let old_registration = table
+        .register(&api, uffd_registration_request(30, old, old.range()))
+        .unwrap();
+    let left =
+        uffd_registration_request(30, refreshed, PageRange::new(0x20_000, PAGE, PAGE).unwrap());
+    let right =
+        uffd_registration_request(30, refreshed, PageRange::new(0x21_000, PAGE, PAGE).unwrap());
+    let replacements = [left, right];
+
+    let plan = table
+        .preflight_replace(&api, &[old_registration.id()], &replacements)
+        .unwrap();
+    assert_eq!(plan.removed(), 1);
+    assert_eq!(plan.published(), 2);
+    assert_eq!(table.len(), 1);
+    assert_eq!(table.get(old_registration.id()), Ok(old_registration));
+
+    let mut refreshed_ids = Vec::new();
+    let commit = table
+        .commit_replace(
+            plan,
+            &[old_registration.id()],
+            &replacements,
+            |registration| refreshed_ids.push(registration.id().get()),
+        )
+        .unwrap();
+    assert_eq!(commit.removed(), 1);
+    assert_eq!(commit.published(), 2);
+    assert_eq!(table.len(), 2);
+    assert_eq!(
+        table.get(old_registration.id()),
+        Err(MmError::UnknownUffdRegistration)
+    );
+    assert_eq!(refreshed_ids, vec![101, 102]);
+    for id in refreshed_ids {
+        assert_eq!(
+            table
+                .get(UffdRegistrationId::new(id).unwrap())
+                .unwrap()
+                .generation(),
+            refreshed.generation()
+        );
+    }
+
+    let disjoint = uffd_snapshot(4, 81, 1, 0x30_000, PAGE, MappingKind::AnonymousPrivate);
+    let disjoint_request = uffd_registration_request(30, disjoint, disjoint.range());
+    let refreshed_left = table
+        .resolver_registration(
+            refreshed.address_space(),
+            PageRange::new(0x20_000, PAGE, PAGE).unwrap(),
+        )
+        .unwrap();
+    let stale_plan = table
+        .preflight_replace(&api, &[refreshed_left.id()], &[left])
+        .unwrap();
+    table.register(&api, disjoint_request).unwrap();
+    assert_eq!(
+        table.commit_replace(stale_plan, &[refreshed_left.id()], &[left], |_| {}),
+        Err(MmError::StaleGeneration)
+    );
+    assert!(table.get(refreshed_left.id()).is_ok());
+}
+
+#[test]
+fn userfaultfd_mapping_refresh_is_all_or_none_across_multiple_handlers() {
+    let api = initialized_uffd_api();
+    let first_old = uffd_snapshot(5, 90, 1, 0x40_000, PAGE, MappingKind::AnonymousPrivate);
+    let second_old = uffd_snapshot(5, 91, 1, 0x42_000, PAGE, MappingKind::AnonymousPrivate);
+    let first_new = uffd_snapshot(5, 90, 2, 0x40_000, PAGE, MappingKind::AnonymousPrivate);
+    let second_new = uffd_snapshot(5, 91, 2, 0x42_000, PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<6>::new(1).unwrap();
+    let first = table
+        .register(
+            &api,
+            uffd_registration_request(40, first_old, first_old.range()),
+        )
+        .unwrap();
+    let second = table
+        .register(
+            &api,
+            uffd_registration_request(41, second_old, second_old.range()),
+        )
+        .unwrap();
+    let removed = [first.id(), second.id()];
+
+    let wrong_owner = UffdRegistrationReplacement::new(
+        first.id(),
+        uffd_registration_request(99, first_new, first_new.range()),
+    );
+    assert_eq!(
+        table.preflight_mapping_replace(&removed, &[wrong_owner]),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+    assert_eq!(table.len(), 2);
+
+    let replacements = [
+        UffdRegistrationReplacement::new(
+            first.id(),
+            uffd_registration_request(40, first_new, first_new.range()),
+        ),
+        UffdRegistrationReplacement::new(
+            second.id(),
+            uffd_registration_request(41, second_new, second_new.range()),
+        ),
+    ];
+    let stale_plan = table
+        .preflight_mapping_replace(&removed, &replacements)
+        .unwrap();
+    assert_eq!(stale_plan.removed(), 2);
+    assert_eq!(stale_plan.published(), 2);
+
+    let third = uffd_snapshot(5, 92, 1, 0x50_000, PAGE, MappingKind::AnonymousPrivate);
+    table
+        .register(&api, uffd_registration_request(40, third, third.range()))
+        .unwrap();
+    assert_eq!(
+        table.commit_mapping_replace(stale_plan, &removed, &replacements, |_| {}),
+        Err(MmError::StaleGeneration)
+    );
+    assert_eq!(table.get(first.id()), Ok(first));
+    assert_eq!(table.get(second.id()), Ok(second));
+
+    let plan = table
+        .preflight_mapping_replace(&removed, &replacements)
+        .unwrap();
+    let mut refreshed = Vec::new();
+    let commit = table
+        .commit_mapping_replace(plan, &removed, &replacements, |registration| {
+            refreshed.push(registration);
+        })
+        .unwrap();
+    assert_eq!(commit.removed(), 2);
+    assert_eq!(commit.published(), 2);
+    assert_eq!(refreshed.len(), 2);
+    assert_eq!(refreshed[0].handler(), FaultHandlerId::new(40).unwrap());
+    assert_eq!(refreshed[1].handler(), FaultHandlerId::new(41).unwrap());
+    assert_eq!(refreshed[0].generation(), first_new.generation());
+    assert_eq!(refreshed[1].generation(), second_new.generation());
+
+    let covering = PageRange::new(0x40_000, 3 * PAGE, PAGE).unwrap();
+    let intersecting = table
+        .intersecting(first_new.address_space(), covering)
+        .map(|registration| registration.id())
+        .collect::<Vec<_>>();
+    assert_eq!(intersecting.len(), 2);
+    let remove_plan = table.preflight_mapping_remove(&intersecting).unwrap();
+    let removed_commit = table
+        .commit_mapping_remove(remove_plan, &intersecting)
+        .unwrap();
+    assert_eq!(removed_commit.removed(), 2);
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn userfaultfd_fault_policy_uses_lower_broker_permits_without_queue_state() {
+    let api = initialized_uffd_api();
+    let mapping = uffd_snapshot(2, 60, 4, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<2>::new(1).unwrap();
+    let registration = table
+        .register(&api, uffd_registration_request(9, mapping, mapping.range()))
+        .unwrap();
+    let request = FaultRequest::new(
+        FaultKey::from_address(mapping, 0x9001, FaultAccess::Write).unwrap(),
+        FaultHandlerId::new(9).unwrap(),
+        FaultType::Missing,
+    );
+    let capacity = FaultCapacity::new(2, 2, 4).unwrap();
+    let permit = UffdFaultPolicy::admit(
+        registration,
+        mapping,
+        request,
+        capacity,
+        FaultLoad::new(1, 1, 3),
+        FaultLifecycleState::Open,
+    )
+    .unwrap();
+    assert_eq!(permit.request(), request);
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            mapping,
+            request,
+            capacity,
+            FaultLoad::new(2, 1, 3),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::QuotaExceeded)
+    );
+
+    let wrong_handler = FaultRequest::new(
+        request.key(),
+        FaultHandlerId::new(10).unwrap(),
+        FaultType::Missing,
+    );
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            mapping,
+            wrong_handler,
+            capacity,
+            FaultLoad::new(0, 0, 0),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::UffdRegistrationMismatch)
+    );
+    assert_eq!(
+        UffdFaultPolicy::prepare_completion(request, mapping, FaultDisposition::Continue),
+        Err(MmError::UnsupportedUffdDisposition)
+    );
+
+    let replacement = uffd_snapshot(2, 60, 5, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        UffdFaultPolicy::prepare_completion(request, replacement, FaultDisposition::ZeroFill),
+        Err(MmError::StaleGeneration)
+    );
+    let completion =
+        UffdFaultPolicy::prepare_completion(request, mapping, FaultDisposition::ZeroFill).unwrap();
+    assert_eq!(completion.request(), request);
+    assert_eq!(completion.disposition(), FaultDisposition::ZeroFill);
+}
+
+#[test]
+fn userfaultfd_resolver_is_bound_mm_capability_with_signed_prefix_progress() {
+    let api = initialized_uffd_api();
+    let mapping = uffd_snapshot(3, 70, 1, 0x10_000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<1>::new(1).unwrap();
+    let registered = table
+        .register(
+            &api,
+            uffd_registration_request(20, mapping, mapping.range()),
+        )
+        .unwrap();
+    let destination = PageRange::new(0x10_000, 2 * PAGE, PAGE).unwrap();
+    assert_eq!(
+        table
+            .resolver_registration(mapping.address_space(), destination)
+            .unwrap(),
+        registered
+    );
+
+    assert_eq!(
+        UffdCopyMode::from_bits(1 << 2),
+        Err(MmError::InvalidUffdCopyMode)
+    );
+    assert_eq!(
+        UffdCopyMode::from_bits(1 << 1),
+        Err(MmError::UnsupportedUffdCopyMode)
+    );
+    assert_eq!(
+        UffdZeroPageMode::from_bits(1 << 1),
+        Err(MmError::InvalidUffdZeroPageMode)
+    );
+
+    let copy = UffdCopyRequest::new(
+        UserRange::new(0x1801, 2 * PAGE).unwrap(),
+        destination,
+        UffdCopyMode::from_bits(0).unwrap(),
+    )
+    .unwrap();
+    let partial = UffdResolverResult::for_copy(copy, PAGE).unwrap();
+    assert_eq!(partial.reported_bytes(), PAGE as i64);
+    assert_eq!(partial.outcome(), UffdResolverOutcome::Retry);
+    assert_eq!(
+        partial.completed(),
+        Some(PageRange::new(0x10_000, PAGE, PAGE).unwrap())
+    );
+    assert_eq!(partial.wake_range(), partial.completed());
+
+    let zero = UffdZeroPageRequest::new(destination, UffdZeroPageMode::from_bits(1).unwrap());
+    let complete = UffdResolverResult::for_zeropage(zero, 2 * PAGE).unwrap();
+    assert_eq!(complete.outcome(), UffdResolverOutcome::Complete);
+    assert_eq!(complete.reported_bytes(), (2 * PAGE) as i64);
+    assert_eq!(complete.wake_range(), None);
+    assert_eq!(
+        UffdResolverResult::for_zeropage(zero, PAGE / 2),
+        Err(MmError::InvalidUffdProgress)
+    );
+    let failure = UffdResolverResult::failure(14).unwrap();
+    assert_eq!(failure.reported_bytes(), -14);
+    assert_eq!(failure.outcome(), UffdResolverOutcome::Failed);
+    assert_eq!(failure.completed(), None);
+    assert_eq!(failure.wake_range(), None);
+}
+
 #[test]
 fn remap_fragments_share_one_anchor_and_low_address_affine_rebases() {
     let old = PageRange::new(0x8000, 0x4000, PAGE).unwrap();

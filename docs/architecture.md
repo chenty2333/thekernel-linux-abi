@@ -103,10 +103,16 @@ map, RCU scheme, filesystem object, waker, task, errno, or syscall record.
 
 The MM crate owns checked Linux-visible ranges, mapping-generation contracts,
 pin admission/accounting, invalidation values, stale fault-completion policy,
-and pure remap/memlock arithmetic. Mapping-ID storage, VMA indexing, frames,
-page tables, TLBs, file/page-cache mechanisms, and the concrete bounded fault
-broker remain below it. Its `FaultPort` trait is a dependency-inversion seam,
-not a queue or userfaultfd implementation.
+pure remap/memlock arithmetic, and a bounded Linux v6.12 userfaultfd policy
+profile. That profile owns transactional API negotiation, anonymous-private
+MISSING registration, canonical same-handler interval-delta and mapping-refresh
+plans, and COPY/ZEROPAGE mode/progress rules. The adapter supplies ordered VMA
+snapshots and bounded output storage, while interval subset/extension/bridge
+policy stays in the MM crate. Mapping-ID storage, VMA indexing, frames, page
+tables, TLBs, file/page-cache mechanisms, and the concrete bounded fault broker
+remain below it. Its `FaultPort` trait and stateless `UffdFaultPolicy` produce
+typed permits; they do not duplicate the lower broker's queue, claim, waiter,
+readiness, credit, cancellation, terminal, or close state.
 
 The FD adapter must publish `EpollGraph` and `EpollCore` changes as one
 transaction, retain every source token until cancellation, and run

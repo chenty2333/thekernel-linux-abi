@@ -28,7 +28,11 @@ Version 0.1.0 provides:
   I/O range is not incorrectly forced into one backend or mapping snapshot;
 - generation-safe `FaultKey`, typed fault requests/dispositions, finite
   capacity admission values, stale-reply validation, and a `FaultPort` seam for
-  a lower generic broker; and
+  a lower generic broker;
+- a Linux v6.12 userfaultfd policy core with transactional API negotiation,
+  anonymous-private MISSING registrations, O(1)-stack multi-VMA
+  preflight/commit and mapping-refresh transactions, and checked
+  COPY/ZEROPAGE mode and signed-prefix progress; and
 - arithmetic-only page-covering, memlock, affine-origin, and remap-fragment
   planners, including canonical low-address rebasing and one whole-remap
   backend anchor pair for every fragment.
@@ -48,7 +52,68 @@ owns raw ABI decoding and all userspace copyin/copyout.
 
 `FaultPort` is only a dependency-inversion seam. The crate does not contain a
 queue, waiter table, observer list, wakeup implementation, readiness source, or
-userfaultfd file. Version 0.1.0 therefore does not claim userfaultfd support.
+userfaultfd file. Its userfaultfd types are reusable Linux policy for a future
+adapter, not a claim that the embedding kernel already exposes a complete
+`userfaultfd(2)` syscall.
+
+## Initial userfaultfd profile
+
+The policy is pinned to Linux v6.12 API `0xaa`. Creation accepts only
+`O_CLOEXEC`, `O_NONBLOCK`, and `UFFD_USER_MODE_ONLY`; the bounded first
+profile requires `UFFD_USER_MODE_ONLY`. This keeps unknown flags
+distinguishable from the permission gate so an adapter can return `EINVAL`
+versus `EPERM`.
+
+`UFFDIO_API` is a copyout-aware transaction. The adapter prepares negotiation,
+copies the response to userspace, and commits initialization only after that
+copy succeeds. Every negotiation error clears the complete userspace response.
+The initial profile advertises no optional features: WP, MINOR, lifecycle
+events, thread IDs, exact byte addresses, shmem/hugetlb, SIGBUS, poison, move,
+and async WP remain unsupported.
+
+Registration accepts anonymous-private MISSING fragments only. A Linux range
+may cross multiple VMAs and gaps. The adapter supplies one raw registration
+intent plus the ordered compatible VMA snapshots; the crate's canonical delta
+planner implements Linux's same-handler partial registration law. It emits no
+delta for a covered subset, unions prefix/suffix extensions, transitively
+bridges same-handler fragments, preserves unmapped gaps as distinct outputs,
+and reports a foreign handler as `Busy`/`EBUSY`. Every fragment considered for
+folding must still match the supplied mapping identity and generation; stale
+sidecar lineage fails closed and must be repaired through the explicit mapping
+replace transaction rather than being silently refreshed by REGISTER.
+
+The constant-size delta proof reports exact removal/replacement counts before
+replaying into caller-owned bounded storage. Capacity, non-wrapping ID, stale
+revision, and sealed-revision failure leave the table unchanged. The emitted
+slices feed the table's existing all-or-none register/replace transaction;
+syscall code performs no interval union. Direct table batches still reject
+non-canonical same-handler overlap. Mapping split, trim, grow, and generation
+changes use the matching replace transaction so old fragments remain visible
+until every replacement has passed preflight. Mapping-level replacement pairs
+each new fragment with its source token, allowing one all-or-none mutation to
+refresh several non-overlapping handler owners in the same address space.
+Allocation-free table/intersection iterators let the adapter collect affected
+IDs into its own bounded storage first. A saturated table revision is sealed
+against publication but still permits revalidated pure removal, unregister,
+detach, and final teardown without wrapping.
+
+COPY accepts only zero or `DONTWAKE` mode; COPY-WP is recognized but rejected.
+ZEROPAGE likewise accepts only zero or `DONTWAKE`. Positive lower completion
+is a page-aligned prefix: a full prefix returns success, a short positive
+prefix is reported and returns `EAGAIN`, and a zero-page failure reports the
+adapter-mapped negative errno. Installed pages survive result-copyout failure;
+wake happens only after successful result copyout. Resolver lookup is an
+address-space capability and intentionally does not require the invoking
+handler to own the destination registration.
+
+The lower broker remains the sole source of truth for fault queues and credits.
+It must atomically claim FIFO `Pending -> Delivered` before copying one
+`uffd_msg`; a failed message copyout leaves the request Delivered, not
+requeueable. Before API initialization, read returns `EINVAL` and poll reports
+`ERR`. Linux poll also reports `ERR` for a blocking FD; only an initialized
+`O_NONBLOCK` FD may report `IN` when a pending event exists. A read buffer
+must hold at least one 32-byte message, the first message may block, and
+subsequent messages in the same read are claimed without waiting.
 
 ## Pin transaction
 

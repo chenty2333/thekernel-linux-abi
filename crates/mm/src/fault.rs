@@ -29,6 +29,21 @@ impl PageOffset {
     }
 }
 
+/// Absolute, page-aligned userspace address identifying a delegated fault page.
+///
+/// This is deliberately part of [`FaultKey`] identity. A relative page offset
+/// alone can collide when a consumer supplies an address-space-wide mapping
+/// identity for multiple VMAs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FaultPageAddress(usize);
+
+impl FaultPageAddress {
+    /// Absolute page-aligned userspace address.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
 macro_rules! nonzero_fault_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
@@ -67,28 +82,12 @@ pub struct FaultKey {
     address_space: crate::AddressSpaceId,
     mapping: crate::MappingId,
     generation: crate::MappingGeneration,
+    page_address: FaultPageAddress,
     page: PageOffset,
     access: FaultAccess,
 }
 
 impl FaultKey {
-    /// Builds a key from typed mapping facts.
-    pub const fn new(
-        address_space: crate::AddressSpaceId,
-        mapping: crate::MappingId,
-        generation: crate::MappingGeneration,
-        page: PageOffset,
-        access: FaultAccess,
-    ) -> Self {
-        Self {
-            address_space,
-            mapping,
-            generation,
-            page,
-            access,
-        }
-    }
-
     /// Builds a key for a fault address contained by `snapshot`.
     pub fn from_address(
         snapshot: MappingSnapshot,
@@ -103,13 +102,14 @@ impl FaultKey {
             .checked_sub(snapshot.range().start())
             .ok_or(MmError::Overflow)?;
         let page = byte_offset / snapshot.range().page_size().bytes();
-        Ok(Self::new(
-            snapshot.address_space(),
-            snapshot.mapping(),
-            snapshot.generation(),
-            PageOffset::new(u64::try_from(page).map_err(|_| MmError::Overflow)?),
+        Ok(Self {
+            address_space: snapshot.address_space(),
+            mapping: snapshot.mapping(),
+            generation: snapshot.generation(),
+            page_address: FaultPageAddress(snapshot.range().page_size().align_down(address)),
+            page: PageOffset::new(u64::try_from(page).map_err(|_| MmError::Overflow)?),
             access,
-        ))
+        })
     }
 
     /// Address-space identity.
@@ -125,6 +125,11 @@ impl FaultKey {
     /// Mapping generation frozen at fault admission.
     pub const fn generation(self) -> crate::MappingGeneration {
         self.generation
+    }
+
+    /// Absolute page-aligned address frozen at fault admission.
+    pub const fn page_address(self) -> FaultPageAddress {
+        self.page_address
     }
 
     /// Relative page offset.
@@ -145,10 +150,28 @@ impl FaultKey {
         {
             return Err(MmError::StaleGeneration);
         }
-        if self.page.get()
-            >= u64::try_from(current.range().page_count()).map_err(|_| MmError::Overflow)?
+        if !current
+            .range()
+            .user_range()
+            .contains_address(self.page_address.get())
         {
             return Err(MmError::RangeNotMapped);
+        }
+        if !current
+            .range()
+            .page_size()
+            .is_aligned(self.page_address.get())
+        {
+            return Err(MmError::Unaligned);
+        }
+        let relative = self
+            .page_address
+            .get()
+            .checked_sub(current.range().start())
+            .ok_or(MmError::RangeNotMapped)?
+            / current.range().page_size().bytes();
+        if self.page.get() != u64::try_from(relative).map_err(|_| MmError::Overflow)? {
+            return Err(MmError::StaleGeneration);
         }
         Self::check_access(current, self.access)
     }

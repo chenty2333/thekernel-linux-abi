@@ -21,6 +21,11 @@ liburing snapshots used for ABI and memory-ordering research, an Asterinas
 snapshot used as a negative capability comparison, and the first TheKernel
 consumer baseline. Those references do not imply copied implementation or
 ownership of mapped-page atomics, FD/VFS/readiness adapters, or execution.
+The first `thekernel-linux-mm` userfaultfd policy slice pins Linux v6.12
+`adc218676eef25575469234709c2d87185ca223a` for UAPI and state-transition
+research. It reimplements those public contracts without copying Linux code
+and does not move the concrete queue, waiter, readiness, page installer,
+usercopy, FD, or syscall adapter into the crate.
 
 Original metadata remains in Git even when it is excluded as package source.
 Published packages include the human-readable provenance and patch ledger, but

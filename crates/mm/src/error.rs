@@ -56,6 +56,42 @@ pub enum MmError {
     Busy,
     /// A fault ticket no longer names a pending request.
     UnknownFault,
+    /// Raw `userfaultfd(2)` creation flags contain an unknown bit.
+    InvalidUffdFlags,
+    /// The requested userfaultfd API number does not match Linux `UFFD_API`.
+    InvalidUffdApi,
+    /// A userfaultfd feature mask contains a bit outside the pinned Linux ABI.
+    InvalidUffdFeatures,
+    /// A known Linux userfaultfd feature is outside the bounded initial profile.
+    UnsupportedUffdFeatures,
+    /// `UFFDIO_API` has not initialized this userfaultfd policy context.
+    UffdNotInitialized,
+    /// Linux permits `UFFDIO_API` negotiation only once per context.
+    UffdAlreadyInitialized,
+    /// A userfaultfd registration mode is empty or contains an unknown bit.
+    InvalidUffdMode,
+    /// A known registration mode is outside the MISSING-only initial profile.
+    UnsupportedUffdMode,
+    /// A mapping kind is outside the anonymous-private initial profile.
+    UnsupportedUffdMapping,
+    /// A userfaultfd registration interval overlaps an existing owner.
+    UffdRegistrationOverlap,
+    /// A multi-VMA registration batch mixes owners or overlapping fragments.
+    InvalidUffdRegistrationBatch,
+    /// A registration token or exact registered interval is not present.
+    UnknownUffdRegistration,
+    /// A fault does not belong to the supplied registration interval or handler.
+    UffdRegistrationMismatch,
+    /// A fault disposition is outside the MISSING-only resolution profile.
+    UnsupportedUffdDisposition,
+    /// Raw UFFDIO_COPY mode contains a bit outside Linux v6.12.
+    InvalidUffdCopyMode,
+    /// UFFDIO_COPY requests a known mode outside the bounded initial profile.
+    UnsupportedUffdCopyMode,
+    /// Raw UFFDIO_ZEROPAGE mode contains an unsupported bit.
+    InvalidUffdZeroPageMode,
+    /// COPY/ZEROPAGE progress is zero, non-page-aligned, or out of range.
+    InvalidUffdProgress,
     /// A remap segment is outside the source prefix or otherwise inconsistent.
     InvalidRemap,
     /// Mapping segments supplied for pin revalidation are not contiguous.

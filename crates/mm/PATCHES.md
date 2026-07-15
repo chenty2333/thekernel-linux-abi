@@ -36,6 +36,12 @@
 - Keep the fault surface to typed values, finite policy admission, stale reply
   validation, and a lower port trait. Concrete broker queues, waiters,
   observers, wakeups, readiness, and coalescing remain generic VM mechanisms.
+- Add Linux v6.12 userfaultfd policy without importing a second queue:
+  transactional API negotiation, bounded MISSING registration ownership,
+  constant-stack multi-VMA preflight/commit, mixed-handler mapping
+  split/trim/grow refresh, canonical subset/extension/bridge registration
+  deltas with fail-closed lineage checks, and COPY/ZEROPAGE mode/progress
+  classification all remain above the generic `FaultPort` broker.
 - Export canonical affine-origin relocation so consumers can remove duplicate
   syscall/backend arithmetic.
 
@@ -44,7 +50,7 @@
 - VMA tree/index layout, mapping-ID storage, page tables, TLB/ASID operations,
   frames, page-cache pins, physical scatter/gather segments, and dirty release;
 - concrete fault broker storage, waiter/coalescing mechanics, observers,
-  readiness, userfaultfd FD/queue semantics, and task wakeups;
+  readiness, userfaultfd FD/read/copyout implementation, and task wakeups;
 - files, mounts, credentials, security registry/dispatch, signals, processes,
   syscalls, usercopy, raw pointers, and architecture/HAL address types; and
 - kernel locks, RCU/epoch implementation, allocator choice, and errno mapping.

@@ -25,7 +25,8 @@ The 0.1.0 line contains eight packages:
   Linux file-capability parsing, and typed commoncap policy contexts.
 - `thekernel-linux-mm` 0.1.0: checked ranges and mapping generations, bounded
   owner/global pin accounting, cross-VMA revalidation, typed invalidation and
-  fault seams, and arithmetic-only remap/memlock planners.
+  fault seams, Linux v6.12 MISSING-only userfaultfd policy with canonical
+  partial-registration planning, and arithmetic-only remap/memlock planners.
 - `thekernel-linux-io-uring` 0.1.0: checked shared-ring geometry and
   SQE/registration decoding, bounded generation-safe
   request/completion/cancellation state, and registered-file leases with
@@ -35,10 +36,11 @@ Signal depends on usercopy. Process remains independent; task ownership and
 process-to-signal integration stay with the caller rather than becoming hidden
 workspace-global state.
 
-The workspace name is not a facade package. The MM package exposes a policy
-and lifecycle contract, not a page-table implementation or a claim of
-userfaultfd support. Real-consumer and dual-architecture gates remain required
-before a release tag.
+The workspace name is not a facade package. The MM package exposes policy and
+lifecycle contracts, including reusable userfaultfd negotiation/registration
+rules; it is not a page-table, fault-broker, FD/readiness implementation, or a
+claim that a consumer already exposes the complete syscall. Real-consumer and
+dual-architecture gates remain required before a release tag.
 
 ## Development
 
@@ -84,8 +86,9 @@ PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   mapping.
 - MM policy consumes caller-owned address-space/mapping identities and
   immutable mapping snapshots. It owns bounded pin admission/accounting and
-  generation validation, but not VMA storage, frames, page tables, TLBs,
-  concrete fault queues, tasks, VFS objects, locks, raw pointers, or usercopy.
+  generation validation plus Linux userfaultfd policy, but not VMA storage,
+  frames, page tables, TLBs, concrete fault queues, readiness, tasks, VFS
+  objects, locks, raw pointers, or usercopy.
 - io_uring policy owns checked setup/enter/SQE/registration values, request and
   registered-file generations, bounded leases, terminal completion credits,
   serialized CQ publication, cancellable/uncancellable execution hand-off,

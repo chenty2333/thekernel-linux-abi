@@ -38,6 +38,15 @@ Observable lifetime and ownership contracts were checked by RFC 0004 on
 - Asterinas `37411049265056135a5e18c8c75a0c3d16b18579`, especially VMAR fault,
   fork, interval-set, and VM-space implementations.
 
+The first userfaultfd policy slice was checked directly against the Linux
+v6.12 tag `adc218676eef25575469234709c2d87185ca223a`, especially
+`fs/userfaultfd.c` and `include/uapi/linux/userfaultfd.h`. The reviewed
+contracts include creation/API error classes, one-shot initialization,
+read-claim ordering, poll restrictions, registration ownership and
+same-handler partial-range behavior, bound-MM resolver capability,
+COPY/ZEROPAGE mode masks, signed partial progress, and wake-after-result-copyout
+ordering.
+
 Linux is GPL-2.0-only, the reviewed Zircon source uses an MIT-style license,
 and the reviewed Asterinas files are MPL-2.0. This package reimplements public
 contracts and general architecture in Rust; it does not copy their source.
