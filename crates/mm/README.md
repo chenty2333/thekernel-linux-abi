@@ -17,8 +17,10 @@ Version 0.1.0 provides:
   filesystem invalidation, exec, and teardown;
 - field-private `PinRequest` values carrying access, duration, use, range, and
   accounting owner;
-- a fixed-capacity, allocation-free pin policy registry with per-owner/global
-  pages, bytes, and token quotas;
+- a fixed-capacity, allocation-free pin policy registry with per-owner and
+  per-registry pages, bytes, and token quotas;
+- a separate fixed-capacity `PinBudget` whose opaque charges enforce one real
+  system-wide page, byte, and token bound across independent address spaces;
 - two-phase reservation/publication, rollback on failed generation or access
   revalidation, read/read overlap, write-exclusive overlap, mutation admission,
   non-wrapping tokens, and explicit close/teardown states;
@@ -53,24 +55,29 @@ userfaultfd file. Version 0.1.0 therefore does not claim userfaultfd support.
 The consumer follows this sequence:
 
 1. freeze the current address-space identity and build a `PinRequest`;
-2. call `PinRegistry::reserve` to charge owner/global quotas and reserve a
-   unique token before blocking work;
-3. snapshot and fault each covered mapping without holding the VMA/page-table
+2. reserve a `PinBudgetCharge` from the consumer's system-shared budget before
+   acquiring any lower pin ownership;
+3. call `PinRegistry::reserve` to charge owner/per-registry quotas and reserve
+   a unique address-space token before blocking work;
+4. snapshot and fault each covered mapping without holding the VMA/page-table
    lock across blocking work, breaking COW before writable exposure;
-4. call `revalidate_next` for every contiguous covered mapping segment in
+5. call `revalidate_next` for every contiguous covered mapping segment in
    ascending order while holding the consumer's topology publication
    serialization;
-5. publish lower frame/page-cache pins and call `commit` only after the whole
+6. publish lower frame/page-cache pins and call `commit` only after the whole
    page range has revalidated; and
-6. call `release` after synchronous completion, verified async completion, or
-   cancellation.
+7. after synchronous completion, verified async completion, or cancellation,
+   release lower frame/page-cache ownership, the registry token, and finally
+   the system charge.
 
 Any `revalidate_next` generation, range, or access failure removes the pending
 record and refunds both quotas; the consumer still drops any lower partial
 frame/page-cache pins it prepared. An abandoned reservation must be explicitly
 cancelled; forced teardown cancels all unpublished reservations and waits for
 active mechanism pins to release. Mapping mutations ask `admit_mutation` before
-changing an overlapping range.
+changing an overlapping range. System charges are intentionally separate from
+registry teardown so the embedding kernel can keep them alive until its last
+mechanism owner has actually released.
 
 ## Error and stability contract
 

@@ -1,4 +1,7 @@
-use core::num::NonZeroU64;
+use core::{
+    num::NonZeroU64,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     AddressSpaceId, ExpectedMapping, InvalidationRange, MappingKind, MappingSnapshot, MmError,
@@ -209,6 +212,181 @@ impl PinAccounting {
                 .checked_sub(charge.tokens)
                 .ok_or(MmError::Overflow)?,
         })
+    }
+
+    fn for_range(range: PageRange) -> Result<Self, MmError> {
+        Ok(Self {
+            pages: u64::try_from(range.page_count()).map_err(|_| MmError::Overflow)?,
+            bytes: u64::try_from(range.len()).map_err(|_| MmError::Overflow)?,
+            tokens: 1,
+        })
+    }
+}
+
+/// Opaque token for one live system-wide pin-budget charge.
+///
+/// The budget identity prevents a token from one system domain from refunding
+/// an unrelated domain that happens to use the same local token sequence.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[must_use = "a system pin-budget charge must be released by its originating budget"]
+pub struct PinBudgetCharge {
+    budget: NonZeroU64,
+    token: NonZeroU64,
+}
+
+impl PinBudgetCharge {
+    /// Consumer-visible opaque token value for diagnostics.
+    pub const fn get(self) -> u64 {
+        self.token.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PinBudgetRecord {
+    charge: PinBudgetCharge,
+    range: PageRange,
+    accounting: PinAccounting,
+}
+
+/// Fixed-capacity system-wide pin accounting shared by address spaces.
+///
+/// This type performs no allocation and owns no lock. A kernel places one
+/// instance behind its system accounting lock, reserves a charge before any
+/// lower pin mechanism work, and holds the opaque charge until that work has
+/// been cancelled or completed. Per-address-space [`PinRegistry`] accounting
+/// remains responsible for mapping mutation and owner policy; this budget
+/// supplies the aggregate bound those independent registries cannot enforce.
+pub struct PinBudget<const CHARGE_CAPACITY: usize> {
+    identity: NonZeroU64,
+    page_size: PageSize,
+    quota: PinQuota,
+    usage: PinAccounting,
+    records: [Option<PinBudgetRecord>; CHARGE_CAPACITY],
+    next_charge: Option<NonZeroU64>,
+}
+
+static NEXT_PIN_BUDGET_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_pin_budget_identity() -> Result<NonZeroU64, MmError> {
+    let identity = NEXT_PIN_BUDGET_IDENTITY
+        .fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| match current {
+                0 => None,
+                u64::MAX => Some(0),
+                _ => Some(current + 1),
+            },
+        )
+        .map_err(|_| MmError::IdExhausted)?;
+    NonZeroU64::new(identity).ok_or(MmError::IdExhausted)
+}
+
+impl<const CHARGE_CAPACITY: usize> PinBudget<CHARGE_CAPACITY> {
+    /// Builds an empty uniquely identified budget with a consumer-selected
+    /// nonzero first charge token. Budget identities and charge tokens never
+    /// wrap or get reused.
+    pub fn new(page_size: usize, quota: PinQuota, first_charge: u64) -> Result<Self, MmError> {
+        let page_size = PageSize::new(page_size)?;
+        let next_charge = Some(NonZeroU64::new(first_charge).ok_or(MmError::InvalidIdentity)?);
+        let identity = allocate_pin_budget_identity()?;
+        Ok(Self {
+            identity,
+            page_size,
+            quota,
+            usage: PinAccounting {
+                pages: 0,
+                bytes: 0,
+                tokens: 0,
+            },
+            records: [None; CHARGE_CAPACITY],
+            next_charge,
+        })
+    }
+
+    /// Page size used to cover byte requests before accounting.
+    pub const fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    /// Aggregate finite quota.
+    pub const fn quota(&self) -> PinQuota {
+        self.quota
+    }
+
+    /// Aggregate live accounting, including pre-publication work.
+    pub const fn accounting(&self) -> PinAccounting {
+        self.usage
+    }
+
+    /// Number of live system charges.
+    pub fn live_charges(&self) -> usize {
+        self.records.iter().flatten().count()
+    }
+
+    /// Reserves aggregate quota before any lower pin mechanism is acquired.
+    /// Every failure is mutation-free.
+    pub fn reserve(&mut self, request: PinRequest) -> Result<PinBudgetCharge, MmError> {
+        let range = PageRange::covering(request.range(), self.page_size)?;
+        let record_index = self
+            .records
+            .iter()
+            .position(Option::is_none)
+            .ok_or(MmError::CapacityExceeded)?;
+        let accounting = PinAccounting::for_range(range)?;
+        let new_usage = self.usage.checked_add(accounting)?;
+        if !self.quota.admits(new_usage) {
+            return Err(MmError::QuotaExceeded);
+        }
+        let token = self.next_charge.ok_or(MmError::IdExhausted)?;
+        let charge = PinBudgetCharge {
+            budget: self.identity,
+            token,
+        };
+
+        self.next_charge = token.get().checked_add(1).and_then(NonZeroU64::new);
+        self.usage = new_usage;
+        self.records[record_index] = Some(PinBudgetRecord {
+            charge,
+            range,
+            accounting,
+        });
+        Ok(charge)
+    }
+
+    /// Exact page-covering range owned by a live charge.
+    pub fn range(&self, charge: PinBudgetCharge) -> Result<PageRange, MmError> {
+        self.record(charge).map(|record| record.range)
+    }
+
+    /// Exact aggregate accounting owned by a live charge.
+    pub fn charge_accounting(&self, charge: PinBudgetCharge) -> Result<PinAccounting, MmError> {
+        self.record(charge).map(|record| record.accounting)
+    }
+
+    /// Releases one charge after all lower pin ownership has ended.
+    pub fn release(&mut self, charge: PinBudgetCharge) -> Result<(), MmError> {
+        let index = self.record_index(charge)?;
+        let record = self.records[index].expect("located budget charge");
+        let new_usage = self.usage.checked_sub(record.accounting)?;
+        self.records[index] = None;
+        self.usage = new_usage;
+        Ok(())
+    }
+
+    fn record(&self, charge: PinBudgetCharge) -> Result<PinBudgetRecord, MmError> {
+        let index = self.record_index(charge)?;
+        Ok(self.records[index].expect("located budget charge"))
+    }
+
+    fn record_index(&self, charge: PinBudgetCharge) -> Result<usize, MmError> {
+        if charge.budget != self.identity {
+            return Err(MmError::BudgetMismatch);
+        }
+        self.records
+            .iter()
+            .position(|record| record.is_some_and(|record| record.charge == charge))
+            .ok_or(MmError::UnknownToken)
     }
 }
 
@@ -524,7 +702,7 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
             .iter()
             .position(Option::is_none)
             .ok_or(MmError::CapacityExceeded)?;
-        let charge = Self::charge_for(range)?;
+        let charge = PinAccounting::for_range(range)?;
         let owner = self.owners[owner_index].expect("located owner");
         let new_owner_usage = owner.usage.checked_add(charge)?;
         let new_global_usage = self.global_usage.checked_add(charge)?;
@@ -756,14 +934,6 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
         self.records
             .iter()
             .position(|record| record.is_some_and(|record| record.token == token))
-    }
-
-    fn charge_for(range: PageRange) -> Result<PinAccounting, MmError> {
-        Ok(PinAccounting {
-            pages: u64::try_from(range.page_count()).map_err(|_| MmError::Overflow)?,
-            bytes: u64::try_from(range.len()).map_err(|_| MmError::Overflow)?,
-            tokens: 1,
-        })
     }
 
     fn allocate_token(&mut self) -> Result<PinToken, MmError> {

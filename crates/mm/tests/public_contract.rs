@@ -73,6 +73,83 @@ fn public_values_keep_invariants_private_and_checked() {
         FaultCapacity::new(1, u32::MAX, 1),
         Err(MmError::UnboundedLimit)
     );
+    assert!(matches!(
+        PinBudget::<1>::new(PAGE, PinQuota::new(1, PAGE as u64, 1), 0),
+        Err(MmError::InvalidIdentity)
+    ));
+}
+
+#[test]
+fn one_system_budget_bounds_independent_address_space_registries() {
+    let quota = PinQuota::new(2, (2 * PAGE) as u64, 2);
+    let mut budget = PinBudget::<3>::new(PAGE, quota, 1).unwrap();
+    let mut first_registry = registry::<1, 1>(quota, 1);
+    let mut second_registry = registry::<1, 1>(quota, 1);
+    let first_request = request(0x1000, PAGE, PinAccess::Read, PinDuration::AsyncIo, 7);
+    let second_request = request(0x8000, PAGE, PinAccess::Write, PinDuration::AsyncIo, 7);
+    let first = budget.reserve(first_request).unwrap();
+    let first_local = first_registry
+        .reserve(first_request, AddressSpaceId::new(1).unwrap())
+        .unwrap();
+    let second = budget.reserve(second_request).unwrap();
+    let second_local = second_registry
+        .reserve(second_request, AddressSpaceId::new(2).unwrap())
+        .unwrap();
+
+    assert_eq!(budget.live_charges(), 2);
+    assert_eq!(budget.accounting().pages(), 2);
+    assert_eq!(budget.accounting().tokens(), 2);
+    assert_eq!(
+        budget.reserve(request(
+            0x20_000,
+            PAGE,
+            PinAccess::Read,
+            PinDuration::Synchronous,
+            9,
+        )),
+        Err(MmError::QuotaExceeded)
+    );
+    assert_eq!(budget.accounting().pages(), 2);
+    assert_eq!(budget.live_charges(), 2);
+
+    first_registry.cancel_reservation(first_local).unwrap();
+    budget.release(first).unwrap();
+    assert_eq!(budget.accounting().pages(), 1);
+    second_registry.cancel_reservation(second_local).unwrap();
+    budget.release(second).unwrap();
+    assert_eq!(budget.accounting(), PinAccounting::default());
+}
+
+#[test]
+fn system_budget_rejects_foreign_and_released_charges_without_mutation() {
+    let quota = PinQuota::new(1, PAGE as u64, 1);
+    let mut first = PinBudget::<1>::new(PAGE, quota, 7).unwrap();
+    let mut second = PinBudget::<1>::new(PAGE, quota, 7).unwrap();
+    let charge = first
+        .reserve(request(
+            0x1000,
+            PAGE,
+            PinAccess::Read,
+            PinDuration::AsyncIo,
+            7,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        first.reserve(request(
+            0x2000,
+            PAGE,
+            PinAccess::Read,
+            PinDuration::AsyncIo,
+            7,
+        )),
+        Err(MmError::CapacityExceeded)
+    );
+    assert_eq!(second.release(charge), Err(MmError::BudgetMismatch));
+    assert_eq!(second.accounting(), PinAccounting::default());
+    first.release(charge).unwrap();
+    assert_eq!(first.release(charge), Err(MmError::UnknownToken));
+    assert_eq!(first.accounting(), PinAccounting::default());
 }
 
 #[test]

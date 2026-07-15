@@ -24,6 +24,8 @@ pub enum MmError {
     UnsupportedPin,
     /// Per-owner or global pin accounting would exceed its finite quota.
     QuotaExceeded,
+    /// A system pin-budget charge was presented to a different budget.
+    BudgetMismatch,
     /// A caller-owned bounded registry has no free slot.
     CapacityExceeded,
     /// A resource limit used the reserved effectively-unbounded maximum value.

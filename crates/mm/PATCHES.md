@@ -24,6 +24,9 @@
 - Add a fixed-capacity policy sidecar whose reservations charge before blocking
   work, roll back on stale/access failure, and cannot wrap tokens into ABA
   reuse.
+- Separate system-wide pin charges from per-address-space policy records so a
+  consumer can enforce one aggregate bound without moving locks, frame types,
+  or mechanism ownership into this crate.
 - Support one pin crossing multiple VMAs/backends through ordered contiguous
   expected-generation checks rather than binding the request to one snapshot.
 - Permit overlapping read pins while rejecting any overlap involving a write,

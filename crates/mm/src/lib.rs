@@ -29,9 +29,9 @@ pub use mapping::{
     MappingSnapshot,
 };
 pub use pin::{
-    LifecycleProgress, MutationBlocker, PinAccess, PinAccounting, PinDuration, PinLeaseView,
-    PinQuota, PinRegistry, PinRegistryState, PinRequest, PinReservation, PinSnapshot, PinToken,
-    PinUse, TeardownReport,
+    LifecycleProgress, MutationBlocker, PinAccess, PinAccounting, PinBudget, PinBudgetCharge,
+    PinDuration, PinLeaseView, PinQuota, PinRegistry, PinRegistryState, PinRequest, PinReservation,
+    PinSnapshot, PinToken, PinUse, TeardownReport,
 };
 pub use plan::{
     AffineRelocation, MemlockLimit, MemlockPlan, PageCoveringPlan, RemapGeometry,

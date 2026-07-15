@@ -7,7 +7,10 @@
 - Add immutable mapping snapshots, expected-generation revalidation, and typed
   invalidation ranges/reasons including resident-page discard.
 - Add typed pin access/duration/use/owner requests and a fixed-capacity policy
-  registry with per-owner/global page, byte, and token accounting.
+  registry with per-owner/per-registry page, byte, and token accounting.
+- Add an allocation-free, fixed-capacity system pin budget with domain-safe,
+  non-wrapping charge tokens so independent address-space registries share one
+  real aggregate bound.
 - Add rollback-safe reservation, cross-VMA ordered revalidation, read/read
   coexistence, write-exclusive overlap, mutation admission, close/teardown,
   and non-wrapping tokens.
