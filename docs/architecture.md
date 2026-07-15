@@ -9,6 +9,7 @@ The initial graph is:
 ```text
 thekernel-linux-signal -> thekernel-linux-usercopy
 thekernel-linux-cred      (independent credential policy leaf)
+thekernel-linux-mm        (independent MM policy/lifecycle core)
 thekernel-linux-vfs       (independent policy core)
 thekernel-linux-fd        (independent policy core)
 thekernel-linux-process   (independent)
@@ -57,10 +58,10 @@ canonical filesystem-snapshot accessor. Pre-release compatibility spellings
 are deliberately absent so kernel adapters converge on the same public
 contract before package publication.
 
-VFS and FD accept typed caller snapshots rather than depending on a
-credential, signal, or generic mechanism package. MM may depend on credentials,
-usercopy, and generic mapping mechanisms. VFS objects and file-backed MM are
-connected through explicit adapter traits rather than dependency cycles.
+VFS, FD, and MM accept typed caller snapshots rather than depending on a
+credential, signal, or generic mechanism package. The initial MM crate is an
+independent leaf: credential, VFS, usercopy, and generic mapping mechanisms are
+connected by the embedding kernel rather than dependency cycles.
 
 No crate obtains the current task, address space, filesystem context, or FD
 table implicitly. Operation context and immutable snapshots are passed by the
@@ -99,6 +100,13 @@ and mutation rollback over a generic walker supplied by the consumer. The FD
 crate owns descriptor/OFD identity and Linux readiness/epoll state over
 retained generic source registrations. Neither crate fixes a concrete lock,
 map, RCU scheme, filesystem object, waker, task, errno, or syscall record.
+
+The MM crate owns checked Linux-visible ranges, mapping-generation contracts,
+pin admission/accounting, invalidation values, stale fault-completion policy,
+and pure remap/memlock arithmetic. Mapping-ID storage, VMA indexing, frames,
+page tables, TLBs, file/page-cache mechanisms, and the concrete bounded fault
+broker remain below it. Its `FaultPort` trait is a dependency-inversion seam,
+not a queue or userfaultfd implementation.
 
 The FD adapter must publish `EpollGraph` and `EpollCore` changes as one
 transaction, retain every source token until cancellation, and run

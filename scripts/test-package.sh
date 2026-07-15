@@ -20,6 +20,7 @@ if [ "$#" -eq 0 ]; then
         thekernel-linux-vfs
         thekernel-linux-fd
         thekernel-linux-cred
+        thekernel-linux-mm
     )
 else
     packages=("$@")
@@ -75,6 +76,10 @@ for package in "${packages[@]}"; do
         thekernel-linux-cred)
             version=0.1.0
             crate_path=crates/cred
+            ;;
+        thekernel-linux-mm)
+            version=0.1.0
+            crate_path=crates/mm
             ;;
         *)
             printf 'unknown workspace package: %s\n' "$package" >&2

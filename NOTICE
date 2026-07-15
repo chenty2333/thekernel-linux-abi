@@ -5,3 +5,7 @@ The usercopy crate is derived from the StarryOS `starry-vm` crate authored by
 朝倉水希 and Mivik. Exact source identity, archive checksum, authorship, and
 local patch lineage are recorded in `crates/usercopy/VENDOR.md` and
 `crates/usercopy/PATCHES.md`.
+
+The MM crate is a new Apache-2.0 policy extraction. Linux, Zircon, and
+Asterinas snapshots were consulted for observable contracts; exact identities
+and the no-source-copy boundary are recorded in `crates/mm/VENDOR.md`.

@@ -19,6 +19,7 @@ if [ "$#" -eq 0 ]; then
         thekernel-linux-vfs
         thekernel-linux-fd
         thekernel-linux-cred
+        thekernel-linux-mm
     )
 else
     packages=("$@")
@@ -32,7 +33,7 @@ fi
 cd "$repo_root"
 for package in "${packages[@]}"; do
     case "$package" in
-        thekernel-linux-usercopy|thekernel-linux-process|thekernel-linux-vfs|thekernel-linux-fd|thekernel-linux-cred)
+        thekernel-linux-usercopy|thekernel-linux-process|thekernel-linux-vfs|thekernel-linux-fd|thekernel-linux-cred|thekernel-linux-mm)
             ;;
         thekernel-linux-signal)
             if [ "${SIGNAL_REGISTRY_READY:-0}" != 1 ]; then

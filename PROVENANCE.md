@@ -13,6 +13,9 @@ A new extraction with no upstream registry identity instead records the exact
 TheKernel source commit and paths, contract/RFC commit, research snapshots,
 authors, and license. Its active manifest is the original manifest; maintainers
 must not invent an upstream archive, `Cargo.toml.orig`, or Cargo VCS record.
+Research-derived contracts must also distinguish policy/value reimplementation
+from lower mechanism source: a port trait or planner is not provenance for a
+concrete queue, page table, frame, VFS, task, or usercopy implementation.
 
 Original metadata remains in Git even when it is excluded as package source.
 Published packages include the human-readable provenance and patch ledger, but

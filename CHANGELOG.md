@@ -31,6 +31,11 @@ crate-local change and provenance ledger.
   exact-old-bound ordinary and exec transitions, strict file-capability
   parsing, and typed commoncap contexts without process, VFS, FD, MM, usercopy,
   or synchronization dependencies.
+- Release `thekernel-linux-mm` 0.1.0 as a dependency-free stable policy core
+  with checked ranges/identities, generation-safe invalidation and fault
+  values, bounded pin accounting and lifecycle, cross-VMA revalidation, and
+  remap/memlock planners without page-table, VFS, task, usercopy, raw-pointer,
+  or concrete fault-broker dependencies.
 - Gate every package archive with provenance checks, rustdoc warnings,
   registry-only normalized manifests, dual-architecture builds, unpacked
   tests, and independent publication dry-runs.
