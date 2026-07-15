@@ -13,6 +13,22 @@
   namespace, excludes exec-only invariant relaxations, owns the exact old
   credential `Arc`, and releases its proposed owner only after a pointer
   identity check.
+- Add allocation-free, exact-old-borrowing planners for the complete Linux
+  `setuid`/`setgid`/`setre*`/`setres*`/`setfs*` transition families. Require
+  explicit typed `CAP_SETUID` or `CAP_SETGID` hook results, apply mapped-root
+  UID and FSUID commoncap fixups in their distinct Linux operation families,
+  preserve silent unchanged FSID refusal and the Linux v6.18 `setres*` early
+  no-op for distinct filesystem IDs, and convert plans into the existing
+  `PreparedCredential` only after exact-old `Arc` identity validation.
+- Add a typed `capset` request and authority-bound planner which enforces
+  effective/permitted admission, non-growing permitted authority, both
+  inheritable constraints (including the unconditional bounding-set gate),
+  and ambient reconciliation while preserving bounding and securebits.
+- Add validated `CapabilitySets` helpers for ordinary securebits and
+  `KEEP_CAPS` changes, including Linux v6.18's advisory exec value/lock pairs
+  and `SECURE_ALL_UNPRIVILEGED`, so consumers no longer need a field-public
+  mutable capability draft. Keep `CAP_SETPCAP`, unprivileged changed-bit
+  admission, hook dispatch, and exact-old publication consumer-owned.
 - Derive ordinary-transition dumpability and parent-death effects from
   effective/filesystem ID changes and Linux `cred_cap_issubset()` instead of
   requiring a kernel adapter to reconstruct that policy.

@@ -671,7 +671,11 @@ mod tests {
     use linux_raw_sys::general::{CAP_CHOWN, CAP_DAC_OVERRIDE};
 
     use super::*;
-    use crate::{CAPABILITY_VALID_MASK, GroupInfo, IdMapInputExtent, SECBIT_KEEP_CAPS_LOCKED};
+    use crate::{
+        CAPABILITY_VALID_MASK, GroupInfo, IdMapInputExtent, SECBIT_EXEC_DENY_INTERACTIVE,
+        SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, SECBIT_EXEC_RESTRICT_FILE,
+        SECBIT_EXEC_RESTRICT_FILE_LOCKED, SECBIT_KEEP_CAPS_LOCKED,
+    };
 
     struct MockNamespace {
         level: u32,
@@ -1713,8 +1717,14 @@ mod tests {
     fn exec_clears_keep_caps_but_preserves_its_lock_and_other_securebits() {
         let root = root_credential();
         let old_caps = root.capabilities();
-        let securebits =
-            old_caps.securebits() | SECBIT_KEEP_CAPS | SECBIT_KEEP_CAPS_LOCKED | SECBIT_NOROOT;
+        let securebits = old_caps.securebits()
+            | SECBIT_KEEP_CAPS
+            | SECBIT_KEEP_CAPS_LOCKED
+            | SECBIT_NOROOT
+            | SECBIT_EXEC_RESTRICT_FILE
+            | SECBIT_EXEC_RESTRICT_FILE_LOCKED
+            | SECBIT_EXEC_DENY_INTERACTIVE
+            | SECBIT_EXEC_DENY_INTERACTIVE_LOCKED;
         let root = with_state(
             &root,
             root.ids(),
@@ -1733,6 +1743,10 @@ mod tests {
         assert_eq!(proposed & SECBIT_KEEP_CAPS, 0);
         assert_ne!(proposed & SECBIT_KEEP_CAPS_LOCKED, 0);
         assert_ne!(proposed & SECBIT_NOROOT, 0);
+        assert_ne!(proposed & SECBIT_EXEC_RESTRICT_FILE, 0);
+        assert_ne!(proposed & SECBIT_EXEC_RESTRICT_FILE_LOCKED, 0);
+        assert_ne!(proposed & SECBIT_EXEC_DENY_INTERACTIVE, 0);
+        assert_ne!(proposed & SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, 0);
     }
 
     #[test]

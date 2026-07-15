@@ -36,6 +36,16 @@
   and occurs before a consumer publishes state.
 - Separate pure credential/capability invariants and topology authorization
   from process state, locks, global registries, syscalls, and errno mapping.
+- Replace the kernel-local mutable capability draft and syscall-local set-ID
+  and `capset` matrices with field-private immutable next-state planners. Bind
+  each decision to an explicit old credential and typed consumer-provided
+  authority, retain Linux's distinct ID-family versus FSID commoncap fixup
+  paths and `setres*` early no-op, and enforce the inheritable bounding-set
+  constraint independently of `CAP_SETPCAP`.
+- Extend the immutable securebits value domain through Linux v6.18's advisory
+  exec value/lock pairs. Export its unprivileged mask and enforce supported-bit
+  and lock monotonicity locally while leaving capability admission, stacked
+  hooks, and publication in the embedding consumer.
 - Replace raw capable options and unvalidated numbers with a typed operation,
   bounded `CapabilityNumber`, and field-private successful commoncap context.
   Bind the caller-supplied immutable actor and target namespace without
@@ -141,7 +151,8 @@
 
 - embedding user-namespace allocation, lifetime limits, synchronization,
   procfs identity, and signal-pending accounting;
-- credential-slot synchronization, generation handling, and task attachment;
+- credential-slot synchronization, generation handling, task attachment, and
+  application of planner output to a consumer-owned unpublished builder;
 - executable leases, xattr lookup, credential writer/publication locks, and
   application of dumpability, MM-owner, ptrace, and parent-death effects;
 - security-hook registry storage, dispatch, boot freeze, publication-phase

@@ -20,15 +20,18 @@ mod mmap_security;
 mod namespace;
 mod security;
 mod socket_security;
+mod transition;
 
 pub(crate) use credential::CredentialTransitionMode;
 pub use credential::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, Credential, CredentialIds,
     CredentialTransitionEffects, FsCredentialSnapshot, GroupInfo, PreparedCredential,
-    SECBIT_KEEP_CAPS, SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE,
-    SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED, SECBIT_NO_SETUID_FIXUP, SECBIT_NO_SETUID_FIXUP_LOCKED,
-    SECBIT_NOROOT, SECBIT_NOROOT_LOCKED, SECURE_ALL_BITS, SECURE_ALL_LOCKS, UserNamespaceView,
-    credential_cap_is_subset, ns_capable,
+    SECBIT_EXEC_DENY_INTERACTIVE, SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, SECBIT_EXEC_RESTRICT_FILE,
+    SECBIT_EXEC_RESTRICT_FILE_LOCKED, SECBIT_KEEP_CAPS, SECBIT_KEEP_CAPS_LOCKED,
+    SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED, SECBIT_NO_SETUID_FIXUP,
+    SECBIT_NO_SETUID_FIXUP_LOCKED, SECBIT_NOROOT, SECBIT_NOROOT_LOCKED, SECURE_ALL_BITS,
+    SECURE_ALL_LOCKS, SECURE_ALL_UNPRIVILEGED, UserNamespaceView, credential_cap_is_subset,
+    ns_capable,
 };
 pub use error::CredError;
 pub use exec::{
@@ -75,4 +78,9 @@ pub use socket_security::{
     SocketListenBacklog, SocketListenContext, SocketOption, SocketPairContext,
     SocketPostCreateContext, SocketReceiveMessageContext, SocketSendMessageContext,
     SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext, UnixStreamConnectContext,
+};
+pub use transition::{
+    CapsetAuthority, CapsetPlan, CapsetRequest, GroupIdAuthority, GroupIdTransitionInput,
+    GroupIdTransitionPlan, UserIdAuthority, UserIdTransitionInput, UserIdTransitionPlan,
+    plan_capset, plan_group_id_transition, plan_user_id_transition,
 };

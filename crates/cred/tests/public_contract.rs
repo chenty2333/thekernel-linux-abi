@@ -1,19 +1,22 @@
 use std::{string::String, sync::Arc};
 
 use thekernel_linux_cred::{
-    CAPABILITY_WORDS, CapabilityNumber, CapabilitySecurityOperation, CredError, Credential,
-    CredentialPublicationContext, CredentialPublicationOperation, ExecCredentialInput,
-    ExecDumpability, ExecFileOwner, ExecImageReadability, ExecMountPrivilege, ExecTraceState,
-    ExecUserNamespaceView, FileMprotectContext, FileOpenAccess, FileOpenContext, FileOpenOperation,
-    FsCredentialSnapshot, IdMap, InodeChmodIntent, InodeChownIntent, InodeCreateContext,
-    InodeCreateMode, InodeLinkContext, InodeMkdirContext, InodeMknodContext, InodeMknodKind,
-    InodeMknodOperation, InodePermissionAccess, InodePermissionContext, InodePostSetattrContext,
-    InodeRenameContext, InodeRmdirContext, InodeSetattrContext, InodeSetattrIntent,
-    InodeSetattrMode, InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext,
-    InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, Kgid, Kuid, MemoryProtection,
-    MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation, MmapFileSecurityRef,
-    MmapFileTarget, PreparedCredentialCapabilityOperation, PtraceAccessContext, PtraceAccessKind,
-    PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
+    CAPABILITY_WORDS, CapabilityNumber, CapabilitySecurityOperation, CapabilitySets,
+    CapsetAuthority, CapsetRequest, CredError, Credential, CredentialPublicationContext,
+    CredentialPublicationOperation, ExecCredentialInput, ExecDumpability, ExecFileOwner,
+    ExecImageReadability, ExecMountPrivilege, ExecTraceState, ExecUserNamespaceView,
+    FileMprotectContext, FileOpenAccess, FileOpenContext, FileOpenOperation, FsCredentialSnapshot,
+    GroupIdAuthority, GroupIdTransitionInput, IdMap, InodeChmodIntent, InodeChownIntent,
+    InodeCreateContext, InodeCreateMode, InodeLinkContext, InodeMkdirContext, InodeMknodContext,
+    InodeMknodKind, InodeMknodOperation, InodePermissionAccess, InodePermissionContext,
+    InodePostSetattrContext, InodeRenameContext, InodeRmdirContext, InodeSetattrContext,
+    InodeSetattrIntent, InodeSetattrMode, InodeSetattrPrivilegeCleanup, InodeSetattrProposal,
+    InodeSymlinkContext, InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, Kgid, Kuid,
+    MemoryProtection, MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation,
+    MmapFileSecurityRef, MmapFileTarget, PreparedCredentialCapabilityOperation,
+    PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind, PtraceTracemeContext,
+    SECBIT_EXEC_DENY_INTERACTIVE, SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, SECBIT_EXEC_RESTRICT_FILE,
+    SECBIT_EXEC_RESTRICT_FILE_LOCKED, SECURE_ALL_UNPRIVILEGED, SECURITY_CAPABILITY_XATTR_NAME,
     SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
     SignalSecuritySource, SocketAcceptContext, SocketBindContext, SocketConnectContext,
@@ -21,11 +24,12 @@ use thekernel_linux_cred::{
     SocketGetSockNameContext, SocketListenBacklog, SocketListenContext, SocketOption,
     SocketPairContext, SocketPostCreateContext, SocketReceiveMessageContext,
     SocketSendMessageContext, SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext,
-    UnixStreamConnectContext, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
-    XATTR_NAME_MAX, XattrSetFlags, XattrValueClass, authorize_capability_core,
-    authorize_prepared_credential_capability_core, authorize_signal_core,
-    commoncap_exec_transition, commoncap_ptrace_access, commoncap_ptrace_traceme,
-    commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
+    UnixStreamConnectContext, UserIdAuthority, UserIdTransitionInput, UserNamespaceDomain,
+    UserNamespaceMapState, UserNamespaceView, XATTR_NAME_MAX, XattrSetFlags, XattrValueClass,
+    authorize_capability_core, authorize_prepared_credential_capability_core,
+    authorize_signal_core, commoncap_exec_transition, commoncap_ptrace_access,
+    commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
+    plan_capset, plan_group_id_transition, plan_user_id_transition,
 };
 
 struct TestNamespace {
@@ -275,6 +279,104 @@ fn ordinary_transition_proposal_is_bound_to_the_exact_old_arc() {
     let proposed = accepted.try_into_proposed(&old).unwrap();
     assert!(proposed.no_new_privs());
     assert!(Arc::ptr_eq(proposed.user_ns(), old.user_ns()));
+}
+
+#[test]
+fn setid_and_capset_planners_are_publicly_composable_with_prepared_credentials() {
+    let namespace = TestNamespace::initial("ordinary-mutation-policy");
+    let old = Credential::try_root(namespace).unwrap();
+    let uid = Kuid::from_raw(1000).unwrap();
+    let gid = Kgid::from_raw(1000).unwrap();
+
+    let mut mutable_copy = CapabilitySets::empty();
+    mutable_copy.try_set_keep_caps(true).unwrap();
+    assert!(mutable_copy.securebits() != 0);
+    mutable_copy.try_set_keep_caps(false).unwrap();
+    mutable_copy.try_set_securebits(0).unwrap();
+    assert_eq!(
+        SECBIT_EXEC_RESTRICT_FILE_LOCKED,
+        SECBIT_EXEC_RESTRICT_FILE << 1
+    );
+    assert_eq!(
+        SECBIT_EXEC_DENY_INTERACTIVE_LOCKED,
+        SECBIT_EXEC_DENY_INTERACTIVE << 1
+    );
+    assert_eq!(
+        SECURE_ALL_UNPRIVILEGED,
+        SECBIT_EXEC_RESTRICT_FILE | SECBIT_EXEC_DENY_INTERACTIVE
+    );
+    mutable_copy
+        .try_set_securebits(
+            SECURE_ALL_UNPRIVILEGED
+                | SECBIT_EXEC_RESTRICT_FILE_LOCKED
+                | SECBIT_EXEC_DENY_INTERACTIVE_LOCKED,
+        )
+        .unwrap();
+
+    let user_plan = plan_user_id_transition(
+        old.as_ref(),
+        UserIdTransitionInput::setuid(uid),
+        UserIdAuthority::CAP_SETUID,
+    )
+    .unwrap();
+    assert!(std::ptr::eq(user_plan.old(), old.as_ref()));
+    assert_eq!(user_plan.input(), UserIdTransitionInput::setuid(uid));
+    assert_eq!(user_plan.authority(), UserIdAuthority::CAP_SETUID);
+    assert_eq!(user_plan.previous_fsuid(), Kuid::INITIAL_ROOT);
+    assert_eq!(user_plan.ids().euid, uid);
+    assert!(user_plan.changes_credential());
+
+    let prepared = user_plan.try_prepare_credential(&old).unwrap();
+    let user = prepared.try_into_proposed(&old).unwrap();
+    assert_eq!(user.ids().euid, uid);
+
+    let group_plan = plan_group_id_transition(
+        user.as_ref(),
+        GroupIdTransitionInput::setgid(gid),
+        GroupIdAuthority::CAP_SETGID,
+    )
+    .unwrap();
+    assert!(std::ptr::eq(group_plan.old(), user.as_ref()));
+    assert_eq!(group_plan.input(), GroupIdTransitionInput::setgid(gid));
+    assert_eq!(group_plan.authority(), GroupIdAuthority::CAP_SETGID);
+    assert_eq!(group_plan.ids().egid, gid);
+    assert_eq!(group_plan.previous_fsgid(), Kgid::INITIAL_ROOT);
+    assert_eq!(group_plan.capabilities(), user.capabilities());
+    let group = group_plan
+        .try_prepare_credential(&user)
+        .unwrap()
+        .try_into_proposed(&user)
+        .unwrap();
+    assert_eq!(group.ids().egid, gid);
+
+    let request = CapsetRequest::try_new(
+        [0; CAPABILITY_WORDS],
+        [0; CAPABILITY_WORDS],
+        [0; CAPABILITY_WORDS],
+    )
+    .unwrap();
+    let capset_plan = plan_capset(group.as_ref(), request, CapsetAuthority::RESTRICTED).unwrap();
+    assert!(std::ptr::eq(capset_plan.old(), group.as_ref()));
+    assert_eq!(capset_plan.request(), request);
+    assert_eq!(capset_plan.authority(), CapsetAuthority::RESTRICTED);
+    assert_eq!(request.effective(), [0; CAPABILITY_WORDS]);
+    assert_eq!(request.permitted(), [0; CAPABILITY_WORDS]);
+    assert_eq!(request.inheritable(), [0; CAPABILITY_WORDS]);
+    assert_eq!(capset_plan.ids(), group.ids());
+    assert_eq!(
+        capset_plan.capabilities().effective(),
+        [0; CAPABILITY_WORDS]
+    );
+    assert_eq!(
+        capset_plan.capabilities().permitted(),
+        [0; CAPABILITY_WORDS]
+    );
+    let capped = capset_plan
+        .try_prepare_credential(&group)
+        .unwrap()
+        .try_into_proposed(&group)
+        .unwrap();
+    assert_eq!(capped.ids(), group.ids());
 }
 
 #[test]

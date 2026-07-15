@@ -12,6 +12,11 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 - pure set-ID/file-capability exec derivation into an opaque proposal bound to
   the exact old credential snapshot, plus typed dumpability, aux-identity,
   ptrace-revalidation, and commoncap decisions;
+- pure `setuid`/`setgid` family and `capset` planners over one explicit old
+  credential, normalized kernel IDs, and typed consumer-supplied
+  `CAP_SETUID`/`CAP_SETGID`/`CAP_SETPCAP` authority, including mapped-root UID
+  and FSUID capability fixups, silent FSID refusal, ambient reconciliation,
+  and the independent inheritable bounding-set constraint;
 - typed ptrace, traceme, and scheduler authorization contexts over immutable
   credentials and caller-owned opaque object identities, with policy-neutral
   commoncap decisions and no caller-supplied ownership shortcut;
@@ -80,6 +85,42 @@ field-private `CapabilitySecurityContext`; a consumer then walks its frozen
 module registry in declaration order and stops at the first denial. The three
 operation variants preserve Linux's ordinary, no-audit, and set-ID check intent
 without exposing raw `CAP_OPT_*` bits.
+
+Ordinary credential mutation follows the same boundary. A kernel first pins
+one immutable old credential and completes any stacked set-ID capability hook.
+It then constructs `UserIdTransitionInput` or `GroupIdTransitionInput` from
+already mapped kernel-global IDs and passes the matching typed authority to
+`plan_user_id_transition` or `plan_group_id_transition`. The returned plan
+borrows that exact old credential and exposes only a complete next ID and
+capability state; it neither allocates nor publishes. Unauthorized ordinary
+set-ID requests return `CredError::NotPermitted`, while unauthorized
+`setfsuid`/`setfsgid` requests deliberately produce unchanged plans carrying
+the previous filesystem ID, matching their Linux return convention. Linux
+v6.18's `setresuid`/`setresgid` early no-op is retained as well: omitted
+effective IDs preserve a distinct old FSID when every supplied ID is unchanged,
+whereas explicitly supplying the unchanged effective ID synchronizes the FSID.
+
+`CapsetRequest` contains only normalized effective, permitted, and inheritable
+words. `plan_capset` checks effective-within-permitted, prevents permitted
+growth, always enforces `old inheritable | old bounding`, and additionally
+enforces `old inheritable | old permitted` unless the exact actor supplied
+`CapsetAuthority::CAP_SETPCAP`. The plan preserves bounding and securebits and
+intersects ambient authority with the new permitted and inheritable sets.
+Syscall version decoding, legacy-word masking, usercopy, target-task selection,
+hook dispatch, and errno conversion remain in the consumer. Calling
+`try_prepare_credential` on any plan verifies the expected old `Arc` by pointer
+identity and produces the crate's existing `PreparedCredential`; the consumer
+can then attach its own module state and publish through its existing outer
+exact-old transaction.
+
+`CapabilitySets::try_set_securebits` validates the supported value/lock mask,
+forbids changing a locked value, and forbids clearing an established lock. It
+includes Linux v6.18's advisory `EXEC_RESTRICT_FILE` and
+`EXEC_DENY_INTERACTIVE` value/lock pairs and exports
+`SECURE_ALL_UNPRIVILEGED`. This helper deliberately does not decide whether an
+actor may make the request: the consumer owns the `CAP_SETPCAP` hook, the
+unprivileged changed-bit exception (including Linux's legacy denial of an
+unprivileged no-change request), exact-old serialization, and publication.
 
 `CredentialPublicationContext` is a successful-only lifecycle notification for
 a separately prepared fork child or a child credential rooted in a new user

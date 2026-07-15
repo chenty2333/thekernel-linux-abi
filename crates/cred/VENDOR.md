@@ -10,11 +10,13 @@
 - Relevant maintained paths:
   - `kernel/src/task/idmap.rs`
   - `kernel/src/task/creds.rs`
+  - `kernel/src/task/thread_cred.rs`
   - `kernel/src/task/process.rs`
   - `kernel/src/task/access.rs`
   - `kernel/src/task/exec_cred.rs`
   - `kernel/src/task/security.rs`
   - `kernel/src/file/executable.rs`
+  - `kernel/src/syscall/task/ctl.rs`
 - Design contract: TheKernel RFC 0001,
   `docs/rfcs/0001-credential-v2.md`, introduced by commit
   `c5207dc09b5524eb67c53d181c28dfdf696415b2`.
@@ -24,6 +26,11 @@ package, upstream crate manifest, archive checksum, or Cargo VCS record to
 preserve. The active package manifest is the original manifest for this new
 package; inventing `Cargo.toml.orig` or `.cargo_vcs_info.json` would
 misrepresent its provenance.
+
+The ordinary-transition ownership closure was additionally checked against
+TheKernel commit `608efde9902a6ef57ff81d9602074af144e28b63`, especially the
+remaining capability draft, set-ID transition matrix, mapped-root capability
+fixups, and syscall-local `capset` admission in the maintained paths above.
 
 The baseline contains the full in-kernel Credential v2 integration. Version
 0.1.0 of this crate extracts the independent value and topology-policy slice:
@@ -92,6 +99,18 @@ The Credential v2 contract was checked on 2026-07-11 against:
 Linux is GPL-2.0-only and FreeBSD is BSD-licensed. This package independently
 implements observable semantics and general architecture in Rust; it does not
 copy their source.
+
+The set-ID and `capset` planners were rechecked on 2026-07-15 against Linux
+v6.18 commit `7d0a66e4bb9081d75c82ec4957c50034cb0ea449`, especially
+`kernel/sys.c`, `kernel/capability.c`, `security/commoncap.c`,
+`include/uapi/linux/securebits.h`, and `include/linux/capability.h`. This check
+retains the `setres*` early no-op, the separate `LSM_SETID_ID`/`RE`/`RES` UID
+fixup and `LSM_SETID_FS` filesystem-capability fixup families, both commoncap
+inheritable constraints, the old-FSID return convention, Linux v6.18's
+advisory exec securebits, and their unprivileged changed-bit admission mask.
+Linux is GPL-2.0-only; this crate expresses those observable policies
+independently as typed Rust inputs and plans while leaving capability and hook
+admission in the consumer.
 
 ## Linux v6.18 socket-hook research snapshot
 

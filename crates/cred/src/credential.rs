@@ -49,11 +49,30 @@ pub const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 5;
 pub const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
 /// Lock [`SECBIT_NO_CAP_AMBIENT_RAISE`].
 pub const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: u32 = 1 << 7;
+/// Ask userspace interpreters to require a successful kernel execution check
+/// before interpreting a file.
+pub const SECBIT_EXEC_RESTRICT_FILE: u32 = 1 << 8;
+/// Lock [`SECBIT_EXEC_RESTRICT_FILE`].
+pub const SECBIT_EXEC_RESTRICT_FILE_LOCKED: u32 = 1 << 9;
+/// Ask userspace interpreters to reject unchecked interactive commands.
+pub const SECBIT_EXEC_DENY_INTERACTIVE: u32 = 1 << 10;
+/// Lock [`SECBIT_EXEC_DENY_INTERACTIVE`].
+pub const SECBIT_EXEC_DENY_INTERACTIVE_LOCKED: u32 = 1 << 11;
 /// Every supported securebit value bit, excluding its adjacent lock bit.
-pub const SECURE_ALL_BITS: u32 =
-    SECBIT_NOROOT | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE;
+pub const SECURE_ALL_BITS: u32 = SECBIT_NOROOT
+    | SECBIT_NO_SETUID_FIXUP
+    | SECBIT_KEEP_CAPS
+    | SECBIT_NO_CAP_AMBIENT_RAISE
+    | SECBIT_EXEC_RESTRICT_FILE
+    | SECBIT_EXEC_DENY_INTERACTIVE;
 /// Every supported securebit lock bit.
 pub const SECURE_ALL_LOCKS: u32 = SECURE_ALL_BITS << 1;
+/// Securebit values which Linux v6.18 allows an unprivileged actor to change.
+///
+/// Capability admission remains consumer-owned; this mask lets a consumer
+/// reproduce Linux's `PR_SET_SECUREBITS` admission without importing raw UAPI
+/// constants or duplicating the supported-bit set.
+pub const SECURE_ALL_UNPRIVILEGED: u32 = SECBIT_EXEC_RESTRICT_FILE | SECBIT_EXEC_DENY_INTERACTIVE;
 
 /// Complete kernel-global real, effective, saved, and filesystem IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,6 +303,44 @@ impl CapabilitySets {
             return Err(CredError::InvalidInput);
         };
         self.bounding[word] &= !mask;
+        Ok(())
+    }
+
+    /// Replaces the securebits word after enforcing Linux's ordinary
+    /// lock/value transition rules.
+    ///
+    /// Capability admission remains a consumer responsibility. This method
+    /// only validates the requested state against this exact old value; it
+    /// does not consult a current task or dispatch a security hook.
+    pub fn try_set_securebits(&mut self, requested: u32) -> Result<(), CredError> {
+        if requested & !(SECURE_ALL_BITS | SECURE_ALL_LOCKS) != 0 {
+            return Err(CredError::NotPermitted);
+        }
+
+        let locked_values = (self.securebits & SECURE_ALL_LOCKS) >> 1;
+        let changed_locked_values = locked_values & (self.securebits ^ requested) & SECURE_ALL_BITS;
+        let cleared_locks = self.securebits & SECURE_ALL_LOCKS & !requested;
+        if changed_locked_values != 0 || cleared_locks != 0 {
+            return Err(CredError::NotPermitted);
+        }
+
+        self.securebits = requested;
+        Ok(())
+    }
+
+    /// Enables or disables `KEEP_CAPS` unless its adjacent lock is set.
+    ///
+    /// This is the ordinary `prctl`-style transition. Exec's dedicated
+    /// `KEEP_CAPS` clearing relaxation remains private to the exec planner.
+    pub fn try_set_keep_caps(&mut self, enabled: bool) -> Result<(), CredError> {
+        if self.securebits & SECBIT_KEEP_CAPS_LOCKED != 0 {
+            return Err(CredError::NotPermitted);
+        }
+        if enabled {
+            self.securebits |= SECBIT_KEEP_CAPS;
+        } else {
+            self.securebits &= !SECBIT_KEEP_CAPS;
+        }
         Ok(())
     }
 
