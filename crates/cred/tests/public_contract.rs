@@ -4,25 +4,27 @@ use thekernel_linux_cred::{
     CAPABILITY_WORDS, CapabilityNumber, CapabilitySecurityOperation, CredError, Credential,
     CredentialPublicationContext, CredentialPublicationOperation, ExecCredentialInput,
     ExecDumpability, ExecFileOwner, ExecImageReadability, ExecMountPrivilege, ExecTraceState,
-    ExecUserNamespaceView, FileOpenAccess, FileOpenContext, FileOpenOperation,
+    ExecUserNamespaceView, FileMprotectContext, FileOpenAccess, FileOpenContext, FileOpenOperation,
     FsCredentialSnapshot, IdMap, InodeChmodIntent, InodeChownIntent, InodeCreateContext,
     InodeCreateMode, InodeLinkContext, InodeMkdirContext, InodeMknodContext, InodeMknodKind,
     InodeMknodOperation, InodePermissionAccess, InodePermissionContext, InodePostSetattrContext,
     InodeRenameContext, InodeRmdirContext, InodeSetattrContext, InodeSetattrIntent,
     InodeSetattrMode, InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext,
-    InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, Kgid, Kuid, PtraceAccessContext,
-    PtraceAccessKind, PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
-    SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
-    SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
-    SignalSecuritySource, SocketAcceptContext, SocketBindContext, SocketConnectContext,
-    SocketCreateContext, SocketCreateSpec, SocketGetOptionContext, SocketGetPeerNameContext,
-    SocketGetSockNameContext, SocketListenBacklog, SocketListenContext, SocketOption,
-    SocketPairContext, SocketPostCreateContext, SocketReceiveMessageContext,
-    SocketSendMessageContext, SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext,
-    UnixStreamConnectContext, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
-    XATTR_NAME_MAX, XattrSetFlags, XattrValueClass, authorize_capability_core,
-    authorize_signal_core, commoncap_exec_transition, commoncap_ptrace_access,
-    commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
+    InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, Kgid, Kuid, MemoryProtection,
+    MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation, MmapFileSecurityRef,
+    MmapFileTarget, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
+    PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME, SchedulerSecurityContext,
+    SchedulerSecurityOperation, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
+    SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, SocketAcceptContext,
+    SocketBindContext, SocketConnectContext, SocketCreateContext, SocketCreateSpec,
+    SocketGetOptionContext, SocketGetPeerNameContext, SocketGetSockNameContext,
+    SocketListenBacklog, SocketListenContext, SocketOption, SocketPairContext,
+    SocketPostCreateContext, SocketReceiveMessageContext, SocketSendMessageContext,
+    SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext, UnixStreamConnectContext,
+    UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView, XATTR_NAME_MAX, XattrSetFlags,
+    XattrValueClass, authorize_capability_core, authorize_signal_core, commoncap_exec_transition,
+    commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential,
+    parse_file_capabilities,
 };
 
 struct TestNamespace {
@@ -112,6 +114,12 @@ struct ListeningUnixSocket(String);
 struct AcceptedUnixSocket(String);
 struct SendingUnixSocket(String);
 struct ReceivingUnixSocket(String);
+struct MappedFile(String);
+struct MemoryImage(String);
+struct PreChangeVma {
+    identity: String,
+    old_protection: MemoryProtection,
+}
 
 fn borrow_bind_parts<'a>(
     context: &SocketBindContext<'a, TestNamespace, NonCopyObject, PreparedSocketAddress>,
@@ -142,6 +150,20 @@ fn borrow_unix_stream_roles<'a>(
         context.connecting_socket(),
         context.listening_socket(),
         context.accepted_socket(),
+    )
+}
+
+fn borrow_mmap_file_parts<'a>(
+    context: &MmapFileContext<'a, TestNamespace, MappedFile>,
+) -> (
+    &'a Credential<TestNamespace>,
+    &'a Arc<TestNamespace>,
+    &'a MappedFile,
+) {
+    (
+        context.actor(),
+        context.target().filesystem_owner_user_ns().unwrap(),
+        context.target().file_object().unwrap(),
     )
 }
 
@@ -1190,4 +1212,88 @@ fn unix_socket_contracts_keep_connect_and_send_directions_distinct() {
     assert!(std::ptr::eq(may_send.receiving_socket(), &receiving));
     assert_eq!(may_send.sending_socket().0, "sending-endpoint");
     assert_eq!(may_send.receiving_socket().0, "receiving-endpoint");
+}
+
+#[test]
+fn mmap_security_contracts_are_strict_lossless_and_exactly_borrowed() {
+    assert_eq!(
+        MemoryProtection::try_from_bits(0),
+        Some(MemoryProtection::NONE)
+    );
+    let requested = MemoryProtection::READ | MemoryProtection::WRITE;
+    let effective = requested | MemoryProtection::EXECUTE;
+    assert_eq!(effective, MemoryProtection::ALL);
+    assert_eq!(MemoryProtection::try_from_bits(0x7), Some(effective));
+    assert_eq!(MemoryProtection::try_from_bits(0x8), None);
+    assert_eq!(MemoryProtection::try_from_bits(usize::MAX), None);
+
+    let flags = MmapFileFlags::from_raw(usize::MAX);
+    assert_eq!(flags.raw(), usize::MAX);
+    let operation = MmapFileOperation::new(requested, effective, flags);
+    assert_eq!(operation.requested(), requested);
+    assert_eq!(operation.effective(), effective);
+    assert_eq!(operation.flags().raw(), usize::MAX);
+
+    let actor_namespace = TestNamespace::initial("mmap-actor");
+    let filesystem_namespace = TestNamespace::initial("mmap-filesystem-owner");
+    let image_namespace = TestNamespace::initial("mmap-image-owner");
+    let actor = Credential::try_root(actor_namespace.clone()).unwrap();
+    let file = MappedFile(String::from("exact-mapped-file"));
+
+    let anonymous: MmapFileContext<'_, TestNamespace, MappedFile> =
+        MmapFileContext::new(&actor, MmapFileTarget::Anonymous, operation);
+    assert!(anonymous.target().is_anonymous());
+    assert!(anonymous.target().file_security_ref().is_none());
+    assert!(anonymous.target().file_object().is_none());
+    assert!(anonymous.target().filesystem_owner_user_ns().is_none());
+
+    let file_target = MmapFileTarget::File(MmapFileSecurityRef::new(&filesystem_namespace, &file));
+    let file_context = MmapFileContext::new(&actor, file_target, operation);
+    let (borrowed_actor, borrowed_filesystem_namespace, borrowed_file) =
+        borrow_mmap_file_parts(&file_context);
+    assert!(std::ptr::eq(borrowed_actor, actor.as_ref()));
+    assert!(Arc::ptr_eq(
+        borrowed_filesystem_namespace,
+        &filesystem_namespace
+    ));
+    assert!(!Arc::ptr_eq(
+        borrowed_filesystem_namespace,
+        &actor_namespace
+    ));
+    assert!(std::ptr::eq(borrowed_file, &file));
+    assert_eq!(borrowed_file.0, "exact-mapped-file");
+    assert_eq!(file_context.operation(), operation);
+
+    let image = MemoryImage(String::from("exact-address-space-image"));
+    let address = MmapAddressContext::new(&actor, &image_namespace, &image, 0x7fff_4000);
+    assert!(std::ptr::eq(address.actor(), actor.as_ref()));
+    assert!(Arc::ptr_eq(address.image_owner_user_ns(), &image_namespace));
+    assert!(std::ptr::eq(address.image(), &image));
+    assert_eq!(address.image().0, "exact-address-space-image");
+    assert_eq!(address.final_address(), 0x7fff_4000);
+
+    let pre_change_vma = PreChangeVma {
+        identity: String::from("exact-pre-change-vma"),
+        old_protection: MemoryProtection::READ,
+    };
+    let mprotect = FileMprotectContext::new(
+        &actor,
+        &image_namespace,
+        &pre_change_vma,
+        requested,
+        effective,
+    );
+    assert!(std::ptr::eq(mprotect.actor(), actor.as_ref()));
+    assert!(Arc::ptr_eq(
+        mprotect.image_owner_user_ns(),
+        &image_namespace
+    ));
+    assert!(std::ptr::eq(mprotect.pre_change_vma(), &pre_change_vma));
+    assert_eq!(mprotect.pre_change_vma().identity, "exact-pre-change-vma");
+    assert_eq!(
+        mprotect.pre_change_vma().old_protection,
+        MemoryProtection::READ
+    );
+    assert_eq!(mprotect.requested(), requested);
+    assert_eq!(mprotect.effective(), effective);
 }

@@ -113,6 +113,16 @@
   preserve receive size plus its explicit raw flags. Keep fd/OFD lookup,
   address import, transport types, security-module registry state, dispatch,
   locking, and errno mapping outside the crate.
+- Add field-private policy-neutral contexts matching Linux v6.18's
+  `mmap_file`, `mmap_addr`, and `file_mprotect` leaves. Strictly normalize
+  `PROT_NONE` plus read/write/execute combinations while rejecting unknown
+  protection bits, preserve the complete raw mapping-flags word, keep
+  requested and effective protection distinct, and distinguish an anonymous
+  target from an exact borrowed file paired with its filesystem-owner
+  namespace. Bind address policy to the exact image and final selected address
+  only, and mprotect policy to the exact pre-change VMA, while leaving fd/OFD
+  lookup, address selection, mmap locking and transactions, VMA mutation,
+  registry dispatch, and errno mapping outside the crate.
 - Remove the pre-release `try_with_user_ns` and `fs_dac_credentials`
   compatibility aliases before the 0.1 API freeze; consumers use
   `try_with_user_namespace` and `fs_credential_snapshot` exclusively.

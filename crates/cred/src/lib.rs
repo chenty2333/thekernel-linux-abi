@@ -16,6 +16,7 @@ mod error;
 mod exec;
 mod file_capability;
 mod idmap;
+mod mmap_security;
 mod namespace;
 mod security;
 mod socket_security;
@@ -42,6 +43,10 @@ pub use file_capability::{
 pub use idmap::{
     ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
     validate_id_map_input,
+};
+pub use mmap_security::{
+    FileMprotectContext, MemoryProtection, MmapAddressContext, MmapFileContext, MmapFileFlags,
+    MmapFileOperation, MmapFileSecurityRef, MmapFileTarget,
 };
 pub use namespace::{
     USER_NAMESPACE_MAX_CREATION_PARENT_LEVEL, USER_NAMESPACE_OVERFLOW_ID, UserNamespaceDomain,

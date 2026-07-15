@@ -67,6 +67,11 @@ kernel. Socket security contexts likewise borrow consumer-owned socket,
 address, and prepared-message snapshots while retaining only the normalized or
 raw scalar facts visible at each Linux leaf. They do not extract fd lookup,
 transport operations, network namespace policy, socket locking, or hook
+registry state. Memory-mapping security contexts similarly borrow opaque file,
+image, and pre-change VMA identities while retaining only strict protection,
+lossless mapping flags, filesystem/image-owner namespaces, and final-address
+facts visible at the three pinned leaves. They do not extract fd/OFD lookup,
+address selection, MM locks or transactions, VMA mutation, page-table work, or
 registry state.
 
 ## RFC 0001 research snapshots
@@ -106,12 +111,29 @@ Linux is GPL-2.0-only. This package independently expresses the observable
 hook topology as field-private Rust values and borrowed opaque generics; it
 does not copy Linux implementation code or expose Linux internal structures.
 
+## Linux v6.18 memory-mapping-hook research snapshot
+
+The memory-mapping security leaf topology was checked on 2026-07-15 against
+Linux v6.18 commit `7d0a66e4bb9081d75c82ec4957c50034cb0ea449`, especially:
+
+- `include/linux/lsm_hook_defs.h` for the exact `mmap_file`, `mmap_addr`, and
+  `file_mprotect` leaf prototypes;
+- `security/security.c` for requested/effective mmap protection derivation,
+  anonymous null-file handling, raw flags, and wrapper-to-leaf dispatch;
+- `mm/mmap.c` for final-address selection before `mmap_addr` dispatch; and
+- `mm/mprotect.c` for requested/effective protection and per-pre-change-VMA
+  `file_mprotect` dispatch before VMA and page-table mutation.
+
+Linux is GPL-2.0-only. This package independently expresses the observable
+leaf inputs as field-private Rust values and borrowed opaque generics; it does
+not copy Linux implementation code or expose Linux file, MM, or VMA types.
+
 ## Independent-leaf boundary
 
 `thekernel-linux-cred` has no dependency edge to process, VFS, signal, FD, MM,
 network transport, usercopy, `kspin`, or a syscall/errno package. Consumers own
 namespace locks, lifetime/resource admission and extensions, credential slots,
-security-hook registries, VFS/socket object identity and transactions, exec/MM
-effects, and cross-subsystem publication. Future MM or network policy may
+security-hook registries, VFS/socket/MM object identity and transactions,
+exec/MM effects, and cross-subsystem publication. Future MM or network policy may
 depend on this leaf; this leaf must not depend back on MM, network transport,
 or another consumer.
