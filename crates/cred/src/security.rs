@@ -1862,6 +1862,20 @@ pub enum CapabilitySecurityOperation {
     SetId,
 }
 
+/// Operation metadata for a capability decision over one fully prepared,
+/// still-unpublished credential.
+///
+/// This is deliberately separate from [`CapabilitySecurityOperation`]: the
+/// live actor remains the source credential while commoncap evaluates the
+/// exact proposed credential which will own the new namespace objects.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum PreparedCredentialCapabilityOperation {
+    /// Authority to create a namespace owned by the proposed credential's
+    /// user namespace.
+    NamespaceCreate,
+}
+
 /// Successful commoncap authorization for one exact capability request.
 ///
 /// The caller supplies the immutable actor credential and target namespace;
@@ -1967,6 +1981,73 @@ pub fn authorize_capability_core<'a, N: UserNamespaceView>(
     }
     Ok(CapabilitySecurityContext {
         actor,
+        target_user_ns,
+        capability,
+        operation,
+    })
+}
+
+/// Successful commoncap authorization over one exact prepared credential.
+///
+/// The source is the live actor which initiated the transition. The proposed
+/// credential and target namespace are immutable inputs retained by the
+/// embedding kernel until publication or rollback. Stacked modules may only
+/// narrow this successful commoncap decision.
+pub struct PreparedCredentialCapabilityContext<'a, N: UserNamespaceView> {
+    source_credential: &'a Credential<N>,
+    proposed_credential: &'a Credential<N>,
+    target_user_ns: &'a Arc<N>,
+    capability: CapabilityNumber,
+    operation: PreparedCredentialCapabilityOperation,
+}
+
+impl<'a, N: UserNamespaceView> PreparedCredentialCapabilityContext<'a, N> {
+    /// Borrows the exact live credential which initiated preparation.
+    pub const fn source_credential(&self) -> &'a Credential<N> {
+        self.source_credential
+    }
+
+    /// Borrows the exact still-unpublished credential admitted by commoncap.
+    pub const fn proposed_credential(&self) -> &'a Credential<N> {
+        self.proposed_credential
+    }
+
+    /// Borrows the namespace governing the requested capability.
+    pub const fn target_user_ns(&self) -> &'a Arc<N> {
+        self.target_user_ns
+    }
+
+    /// Returns the validated raw Linux capability number.
+    pub const fn capability(&self) -> CapabilityNumber {
+        self.capability
+    }
+
+    /// Returns the frozen prepared-credential operation.
+    pub const fn operation(&self) -> PreparedCredentialCapabilityOperation {
+        self.operation
+    }
+}
+
+/// Applies commoncap to one exact prepared credential without relabeling it as
+/// a live capable actor.
+///
+/// # Errors
+///
+/// Returns [`AuthorizationError::NotPermitted`] when `proposed_credential`
+/// lacks the requested authority over `target_user_ns`.
+pub fn authorize_prepared_credential_capability_core<'a, N: UserNamespaceView>(
+    source_credential: &'a Credential<N>,
+    proposed_credential: &'a Credential<N>,
+    target_user_ns: &'a Arc<N>,
+    capability: CapabilityNumber,
+    operation: PreparedCredentialCapabilityOperation,
+) -> Result<PreparedCredentialCapabilityContext<'a, N>, AuthorizationError> {
+    if !ns_capable(proposed_credential, target_user_ns, capability.get()) {
+        return Err(AuthorizationError::NotPermitted);
+    }
+    Ok(PreparedCredentialCapabilityContext {
+        source_credential,
+        proposed_credential,
         target_user_ns,
         capability,
         operation,

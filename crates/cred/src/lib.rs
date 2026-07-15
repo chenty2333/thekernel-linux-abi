@@ -60,13 +60,14 @@ pub use security::{
     InodePermissionAccess, InodePermissionContext, InodePostSetattrContext, InodeRenameContext,
     InodeRmdirContext, InodeSetattrContext, InodeSetattrIntent, InodeSetattrMode,
     InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext, InodeUnlinkContext,
-    InodeXattrContext, InodeXattrOperation, PtraceAccessContext, PtraceAccessKind,
+    InodeXattrContext, InodeXattrOperation, PreparedCredentialCapabilityContext,
+    PreparedCredentialCapabilityOperation, PtraceAccessContext, PtraceAccessKind,
     PtraceCredentialKind, PtraceTracemeContext, SchedulerSecurityContext,
     SchedulerSecurityOperation, SignalCoreAuthorization, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
     SignalSecuritySource, XATTR_NAME_MAX, XattrSetFlags, XattrValueClass,
-    authorize_capability_core, authorize_signal_core, commoncap_ptrace_access,
-    commoncap_ptrace_traceme, commoncap_scheduler,
+    authorize_capability_core, authorize_prepared_credential_capability_core,
+    authorize_signal_core, commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler,
 };
 pub use socket_security::{
     SocketAcceptContext, SocketBindContext, SocketConnectContext, SocketCreateContext,

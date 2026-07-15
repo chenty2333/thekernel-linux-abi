@@ -12,19 +12,20 @@ use thekernel_linux_cred::{
     InodeSetattrMode, InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext,
     InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, Kgid, Kuid, MemoryProtection,
     MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation, MmapFileSecurityRef,
-    MmapFileTarget, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
-    PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME, SchedulerSecurityContext,
-    SchedulerSecurityOperation, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
-    SignalSecurityContext, SignalSecurityOperation, SignalSecuritySource, SocketAcceptContext,
-    SocketBindContext, SocketConnectContext, SocketCreateContext, SocketCreateSpec,
-    SocketGetOptionContext, SocketGetPeerNameContext, SocketGetSockNameContext,
-    SocketListenBacklog, SocketListenContext, SocketOption, SocketPairContext,
-    SocketPostCreateContext, SocketReceiveMessageContext, SocketSendMessageContext,
-    SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext, UnixStreamConnectContext,
-    UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView, XATTR_NAME_MAX, XattrSetFlags,
-    XattrValueClass, authorize_capability_core, authorize_signal_core, commoncap_exec_transition,
-    commoncap_ptrace_access, commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential,
-    parse_file_capabilities,
+    MmapFileTarget, PreparedCredentialCapabilityOperation, PtraceAccessContext, PtraceAccessKind,
+    PtraceCredentialKind, PtraceTracemeContext, SECURITY_CAPABILITY_XATTR_NAME,
+    SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
+    SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
+    SignalSecuritySource, SocketAcceptContext, SocketBindContext, SocketConnectContext,
+    SocketCreateContext, SocketCreateSpec, SocketGetOptionContext, SocketGetPeerNameContext,
+    SocketGetSockNameContext, SocketListenBacklog, SocketListenContext, SocketOption,
+    SocketPairContext, SocketPostCreateContext, SocketReceiveMessageContext,
+    SocketSendMessageContext, SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext,
+    UnixStreamConnectContext, UserNamespaceDomain, UserNamespaceMapState, UserNamespaceView,
+    XATTR_NAME_MAX, XattrSetFlags, XattrValueClass, authorize_capability_core,
+    authorize_prepared_credential_capability_core, authorize_signal_core,
+    commoncap_exec_transition, commoncap_ptrace_access, commoncap_ptrace_traceme,
+    commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
 };
 
 struct TestNamespace {
@@ -393,6 +394,22 @@ fn capable_and_credential_publication_contracts_are_publicly_composable() {
 
     let child_namespace = TestNamespace::child(&root_namespace, "capable-child", root.ids().euid);
     let child = Credential::try_with_user_namespace(&root, child_namespace.clone()).unwrap();
+    let prepared = authorize_prepared_credential_capability_core(
+        &root,
+        &child,
+        &child_namespace,
+        capability,
+        PreparedCredentialCapabilityOperation::NamespaceCreate,
+    )
+    .unwrap();
+    assert!(std::ptr::eq(prepared.source_credential(), root.as_ref()));
+    assert!(std::ptr::eq(prepared.proposed_credential(), child.as_ref()));
+    assert!(Arc::ptr_eq(prepared.target_user_ns(), &child_namespace));
+    assert_eq!(prepared.capability(), capability);
+    assert_eq!(
+        prepared.operation(),
+        PreparedCredentialCapabilityOperation::NamespaceCreate
+    );
     assert_eq!(
         authorize_capability_core(
             &child,
