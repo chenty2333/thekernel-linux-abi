@@ -78,7 +78,7 @@ impl SetupFlags {
     }
 }
 
-/// Feature bits that the resolved layout can prove.
+/// Adapter-proven feature bits carried by a resolved layout.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FeatureFlags(u32);
 
@@ -94,16 +94,16 @@ impl FeatureFlags {
     /// One-shot poll consumes the complete 32-bit `poll32_events` field.
     pub const POLL_32BITS: Self = Self(1 << 6);
 
-    /// Complete feature set supported by the initial core contract.
+    /// Complete feature vocabulary supported by the initial core contract.
     ///
-    /// The adapter must prove the shared backing, publication, copied-SQE,
-    /// and readiness conditions before returning a layout to userspace.
-    pub const INITIAL: Self =
+    /// This is an upper bound, not an advertisement. An embedding adapter must
+    /// pass the exact subset it has proved to [`SetupRequest::resolve`].
+    pub const SUPPORTED: Self =
         Self(Self::SINGLE_MMAP.0 | Self::NODROP.0 | Self::SUBMIT_STABLE.0 | Self::POLL_32BITS.0);
 
     /// Strictly decodes only features implemented by this core contract.
     pub const fn from_bits(bits: u32) -> Result<Self, IoUringError> {
-        if bits & !Self::INITIAL.0 == 0 {
+        if bits & !Self::SUPPORTED.0 == 0 {
             Ok(Self(bits))
         } else {
             Err(IoUringError::UnsupportedFeatureFlags)
@@ -194,7 +194,12 @@ impl SetupRequest {
     }
 
     /// Validates setup geometry and produces exact shared-memory offsets.
-    pub fn resolve(self) -> Result<RingLayout, IoUringError> {
+    ///
+    /// `proven_features` is the exact subset whose adapter-owned mmap,
+    /// publication, stable-copy, and readiness premises the caller has proved.
+    /// The policy core validates the vocabulary but never advertises an
+    /// adapter-dependent feature implicitly.
+    pub fn resolve(self, proven_features: FeatureFlags) -> Result<RingLayout, IoUringError> {
         let sq_entries = resolve_sq_entries(self.entries, self.flags)?;
         let cq_entries = resolve_cq_entries(sq_entries, self.cq_entries, self.flags)?;
 
@@ -228,7 +233,7 @@ impl SetupRequest {
             sq_entries,
             cq_entries,
             setup_flags: self.flags,
-            features: FeatureFlags::INITIAL,
+            features: proven_features,
             sq_offsets: SubmissionQueueOffsets {
                 head: 0,
                 tail: 4,
@@ -509,18 +514,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_layout_advertises_only_the_four_proved_features() {
+    fn layout_advertises_exactly_the_adapter_proved_features() {
+        let partial = FeatureFlags::SINGLE_MMAP.union(FeatureFlags::SUBMIT_STABLE);
         let layout = SetupRequest::new(3, 0, SetupFlags::default())
-            .resolve()
+            .resolve(partial)
             .unwrap();
         assert_eq!(layout.sq_entries(), 4);
         assert_eq!(layout.cq_entries(), 8);
-        assert_eq!(layout.features(), FeatureFlags::INITIAL);
+        assert_eq!(layout.features(), partial);
         assert!(layout.features().contains(FeatureFlags::SINGLE_MMAP));
-        assert!(layout.features().contains(FeatureFlags::NODROP));
         assert!(layout.features().contains(FeatureFlags::SUBMIT_STABLE));
-        assert!(layout.features().contains(FeatureFlags::POLL_32BITS));
-        assert_eq!(layout.features().bits(), 0x47);
+        assert!(!layout.features().contains(FeatureFlags::NODROP));
+        assert!(!layout.features().contains(FeatureFlags::POLL_32BITS));
+        assert_eq!(layout.features().bits(), 0x5);
+
+        let empty = SetupRequest::new(3, 0, SetupFlags::default())
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        assert_eq!(empty.features(), FeatureFlags::EMPTY);
+
+        let complete = SetupRequest::new(3, 0, SetupFlags::default())
+            .resolve(FeatureFlags::SUPPORTED)
+            .unwrap();
+        assert_eq!(complete.features(), FeatureFlags::SUPPORTED);
+        assert_eq!(complete.features().bits(), 0x47);
     }
 
     #[test]
@@ -542,7 +559,7 @@ mod tests {
         )
         .unwrap();
         let layout = SetupRequest::new(u32::MAX, u32::MAX, flags)
-            .resolve()
+            .resolve(FeatureFlags::EMPTY)
             .unwrap();
         assert_eq!(layout.sq_entries(), IORING_MAX_ENTRIES);
         assert_eq!(layout.cq_entries(), IORING_MAX_CQ_ENTRIES);
@@ -560,7 +577,7 @@ mod tests {
     #[test]
     fn queue_counters_and_sq_array_indexes_reject_forged_progress() {
         let layout = SetupRequest::new(4, 0, SetupFlags::default())
-            .resolve()
+            .resolve(FeatureFlags::EMPTY)
             .unwrap();
         assert_eq!(layout.pending_submissions(10, 14), Ok(4));
         assert_eq!(
@@ -586,6 +603,10 @@ mod tests {
         );
         assert_eq!(
             SetupFlags::from_bits(1 << 2),
+            Err(IoUringError::UnsupportedSetupFlags)
+        );
+        assert_eq!(
+            SetupFlags::from_bits(1 << 7),
             Err(IoUringError::UnsupportedSetupFlags)
         );
     }
