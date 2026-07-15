@@ -17,6 +17,9 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
   `CAP_SETUID`/`CAP_SETGID`/`CAP_SETPCAP` authority, including mapped-root UID
   and FSUID capability fixups, silent FSID refusal, ambient reconciliation,
   and the independent inheritable bounding-set constraint;
+- an allocation-free regular-file content-write set-ID planner over a checked
+  low-`0o7777` mode and typed consumer-supplied `CAP_FSETID` result, returning
+  the exact cleanup effect and complete next mode without importing VFS types;
 - typed ptrace, traceme, and scheduler authorization contexts over immutable
   credentials and caller-owned opaque object identities, with policy-neutral
   commoncap decisions and no caller-supplied ownership shortcut;
@@ -121,6 +124,17 @@ includes Linux v6.18's advisory `EXEC_RESTRICT_FILE` and
 actor may make the request: the consumer owns the `CAP_SETPCAP` hook, the
 unprivileged changed-bit exception (including Linux's legacy denial of an
 unprivileged no-change request), exact-old serialization, and publication.
+
+Regular-file content mutation uses a separate pure policy leaf. The embedding
+kernel first freezes the actor and filesystem-owner user namespace, completes
+its set-ID `CAP_FSETID` hook, and converts the current low `0o7777` mode into
+`ContentWriteMode`. `plan_content_write_setid_cleanup` preserves both set-ID
+bits for `ContentWriteSetIdAuthority::CAP_FSETID`; without that authority it
+always clears a present `S_ISUID` and clears a present `S_ISGID` only when
+`S_IXGRP` is set. The returned plan reports the exact cleanup effect and the
+complete next mode. Target-kind validation, executable-metadata exclusion,
+`security.capability` discovery/removal, backend publication, data mutation,
+rollback policy, and errno mapping remain in the consumer's transaction.
 
 `CredentialPublicationContext` is a successful-only lifecycle notification for
 a separately prepared fork child or a child credential rooted in a new user

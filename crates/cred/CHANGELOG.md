@@ -24,6 +24,10 @@
   effective/permitted admission, non-growing permitted authority, both
   inheritable constraints (including the unconditional bounding-set gate),
   and ambient reconciliation while preserving bounding and securebits.
+- Add an allocation-free content-write set-ID cleanup planner over a checked
+  low-`0o7777` mode and typed consumer-owned `CAP_FSETID` decision. Return the
+  exact cleanup effect and complete next mode while keeping VFS identity,
+  xattr removal, metadata/data transactions, and errno mapping consumer-owned.
 - Add validated `CapabilitySets` helpers for ordinary securebits and
   `KEEP_CAPS` changes, including Linux v6.18's advisory exec value/lock pairs
   and `SECURE_ALL_UNPRIVILEGED`, so consumers no longer need a field-public

@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod content_write;
 mod credential;
 mod error;
 mod exec;
@@ -22,6 +23,10 @@ mod security;
 mod socket_security;
 mod transition;
 
+pub use content_write::{
+    ContentWriteMode, ContentWriteSetIdAuthority, ContentWriteSetIdCleanup, ContentWriteSetIdPlan,
+    plan_content_write_setid_cleanup,
+};
 pub(crate) use credential::CredentialTransitionMode;
 pub use credential::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, Credential, CredentialIds,

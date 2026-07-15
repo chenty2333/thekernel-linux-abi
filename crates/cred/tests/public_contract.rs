@@ -2,7 +2,8 @@ use std::{string::String, sync::Arc};
 
 use thekernel_linux_cred::{
     CAPABILITY_WORDS, CapabilityNumber, CapabilitySecurityOperation, CapabilitySets,
-    CapsetAuthority, CapsetRequest, CredError, Credential, CredentialPublicationContext,
+    CapsetAuthority, CapsetRequest, ContentWriteMode, ContentWriteSetIdAuthority,
+    ContentWriteSetIdCleanup, CredError, Credential, CredentialPublicationContext,
     CredentialPublicationOperation, ExecCredentialInput, ExecDumpability, ExecFileOwner,
     ExecImageReadability, ExecMountPrivilege, ExecTraceState, ExecUserNamespaceView,
     FileMprotectContext, FileOpenAccess, FileOpenContext, FileOpenOperation, FsCredentialSnapshot,
@@ -29,7 +30,8 @@ use thekernel_linux_cred::{
     authorize_capability_core, authorize_prepared_credential_capability_core,
     authorize_signal_core, commoncap_exec_transition, commoncap_ptrace_access,
     commoncap_ptrace_traceme, commoncap_scheduler, derive_exec_credential, parse_file_capabilities,
-    plan_capset, plan_group_id_transition, plan_user_id_transition,
+    plan_capset, plan_content_write_setid_cleanup, plan_group_id_transition,
+    plan_user_id_transition,
 };
 
 struct TestNamespace {
@@ -377,6 +379,43 @@ fn setid_and_capset_planners_are_publicly_composable_with_prepared_credentials()
         .try_into_proposed(&group)
         .unwrap();
     assert_eq!(capped.ids(), group.ids());
+}
+
+#[test]
+fn content_write_setid_planner_exposes_checked_input_effect_and_next_mode() {
+    assert_eq!(ContentWriteMode::try_from_bits(0o100000 | 0o6755), None);
+    let mode = ContentWriteMode::try_from_bits(0o6755).unwrap();
+
+    let privileged = plan_content_write_setid_cleanup(mode, ContentWriteSetIdAuthority::CAP_FSETID);
+    assert_eq!(privileged.mode(), mode);
+    assert_eq!(
+        privileged.authority(),
+        ContentWriteSetIdAuthority::CAP_FSETID
+    );
+    assert_eq!(privileged.cleanup(), ContentWriteSetIdCleanup::Preserve);
+    assert_eq!(privileged.next_mode(), mode);
+    assert!(!privileged.changes_mode());
+
+    let cases = [
+        (
+            0o6755,
+            ContentWriteSetIdCleanup::ClearSetUserAndGroupId,
+            0o0755,
+        ),
+        (0o4644, ContentWriteSetIdCleanup::ClearSetUserId, 0o0644),
+        (0o2755, ContentWriteSetIdCleanup::ClearSetGroupId, 0o0755),
+        (0o2644, ContentWriteSetIdCleanup::Preserve, 0o2644),
+        (0o0755, ContentWriteSetIdCleanup::Preserve, 0o0755),
+    ];
+    for (before, cleanup, after) in cases {
+        let plan = plan_content_write_setid_cleanup(
+            ContentWriteMode::try_from_bits(before).unwrap(),
+            ContentWriteSetIdAuthority::UNPRIVILEGED,
+        );
+        assert_eq!(plan.cleanup(), cleanup);
+        assert_eq!(plan.next_mode().bits(), after);
+        assert_eq!(plan.changes_mode(), before != after);
+    }
 }
 
 #[test]
