@@ -685,6 +685,14 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
     ///
     /// Every failure is mutation-free. After success, callers must invoke
     /// `commit`, `cancel_reservation`, or `begin_teardown`.
+    ///
+    /// A live reservation is also an address-range mutation fence: it is
+    /// returned by [`Self::first_mutation_blocker`] and rejected by
+    /// [`Self::admit_mutation`] just like an active pin. Consumers that route
+    /// every overlapping mapping mutation through this registry may therefore
+    /// revalidate a large request in bounded publication-lock windows. The
+    /// reservation must remain live between windows, and each lower-level pin
+    /// owner must be acquired before its corresponding window is revalidated.
     pub fn reserve(
         &mut self,
         request: PinRequest,
@@ -734,13 +742,17 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
 
     /// Revalidates the next contiguous mapping segment covering a reservation.
     ///
-    /// Consumers call this once for each covered VMA after faulting and pinning
-    /// its mechanism pages. Segments must arrive in ascending order with no
-    /// gaps or overlap. The consumer must hold its topology publication
-    /// serialization across the complete revalidation sequence and `commit`,
-    /// and must drop any lower partial pins if this method fails. Any
+    /// Consumers call this once for each covered VMA segment after faulting and
+    /// pinning its mechanism pages. Segments must arrive in ascending order
+    /// with no gaps or overlap. Revalidation may use either one continuous
+    /// topology-publication critical section, or multiple bounded sections
+    /// while the live reservation is the mutation fence. The latter is sound
+    /// only when every overlapping mapping mutation is admitted through this
+    /// registry; unrelated ranges may continue to mutate between windows.
+    ///
+    /// The consumer must drop any lower partial pins if this method fails. Any
     /// stale/access failure automatically rolls back the policy reservation
-    /// and its accounting.
+    /// and its accounting, which also removes the mutation fence.
     pub fn revalidate_next(
         &mut self,
         reservation: PinReservation,
@@ -782,6 +794,9 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
     }
 
     /// Publishes a pin only after mapping revalidation covers its full range.
+    ///
+    /// This is a constant-time state transition; all per-mapping work belongs
+    /// in bounded [`Self::revalidate_next`] calls.
     pub fn commit(&mut self, reservation: PinReservation) -> Result<PinToken, MmError> {
         let index = self
             .record_index(reservation.token)
@@ -850,7 +865,7 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
         }
     }
 
-    /// Finds the first pin overlapping a same-generation invalidation.
+    /// Finds the first reservation or active pin overlapping an invalidation.
     pub fn first_mutation_blocker(
         &self,
         invalidation: InvalidationRange,

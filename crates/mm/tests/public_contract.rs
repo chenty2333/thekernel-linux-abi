@@ -197,6 +197,72 @@ fn one_pin_can_revalidate_multiple_contiguous_mappings() {
 }
 
 #[test]
+fn reservation_fences_mutation_across_bounded_revalidation_windows() {
+    let quota = PinQuota::new(16, (16 * PAGE) as u64, 8);
+    let mut registry = registry::<1, 8>(quota, 1);
+    let mapping = snapshot(10, 3, 0x1000, 0x8000, access(true, true, false));
+    let reservation = registry
+        .reserve(
+            request(0x1000, 0x4000, PinAccess::Read, PinDuration::AsyncIo, 7),
+            mapping.address_space(),
+        )
+        .unwrap();
+    let overlap =
+        InvalidationRange::from_raw(mapping, 0x2000, PAGE, InvalidationReason::Protect).unwrap();
+    let disjoint =
+        InvalidationRange::from_raw(mapping, 0x8000, PAGE, InvalidationReason::FileInvalidation)
+            .unwrap();
+
+    // Reservation publication itself closes the gap before the first window.
+    assert_eq!(
+        registry.admit_mutation(overlap),
+        Err(MmError::MappingPinned)
+    );
+    assert_eq!(
+        registry.first_mutation_blocker(overlap).unwrap().token(),
+        reservation.token()
+    );
+    assert!(registry.admit_mutation(disjoint).is_ok());
+
+    registry
+        .revalidate_next(
+            reservation,
+            mapping.expected(),
+            mapping,
+            PageRange::new(0x1000, 0x2000, PAGE).unwrap(),
+        )
+        .unwrap();
+    // A consumer may release and reacquire its publication lock here. The
+    // unvalidated suffix and validated prefix stay protected by one record.
+    assert_eq!(
+        registry.admit_mutation(overlap),
+        Err(MmError::MappingPinned)
+    );
+    assert_eq!(
+        registry.commit(reservation),
+        Err(MmError::IncompleteRevalidation)
+    );
+    assert_eq!(registry.reserved_count(), 1);
+
+    registry
+        .revalidate_next(
+            reservation,
+            mapping.expected(),
+            mapping,
+            PageRange::new(0x3000, 0x2000, PAGE).unwrap(),
+        )
+        .unwrap();
+    let token = registry.commit(reservation).unwrap();
+    assert_eq!(registry.view(token).unwrap().validated_mappings(), 2);
+    assert_eq!(
+        registry.admit_mutation(overlap),
+        Err(MmError::MappingPinned)
+    );
+    registry.release(token).unwrap();
+    assert!(registry.admit_mutation(overlap).is_ok());
+}
+
+#[test]
 fn read_pins_may_overlap_but_any_write_overlap_is_rejected() {
     let quota = PinQuota::new(16, (16 * PAGE) as u64, 8);
     let mut registry = registry::<2, 8>(quota, 1);

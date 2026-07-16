@@ -126,11 +126,14 @@ The consumer follows this sequence:
    a unique address-space token before blocking work;
 4. snapshot and fault each covered mapping without holding the VMA/page-table
    lock across blocking work, breaking COW before writable exposure;
-5. call `revalidate_next` for every contiguous covered mapping segment in
-   ascending order while holding the consumer's topology publication
-   serialization;
-6. publish lower frame/page-cache pins and call `commit` only after the whole
-   page range has revalidated; and
+5. acquire the exact lower frame/page-cache owner for a bounded window, then
+   call `revalidate_next` for every contiguous covered segment in that window;
+   either retain one topology-publication critical section for the full range,
+   or keep the reservation live as a mutation fence and release the lock
+   between windows while routing every overlapping mapping mutation through
+   `admit_mutation`;
+6. call the constant-time `commit` only after the whole page range has
+   revalidated; and
 7. after synchronous completion, verified async completion, or cancellation,
    release lower frame/page-cache ownership, the registry token, and finally
    the system charge.
@@ -139,10 +142,12 @@ Any `revalidate_next` generation, range, or access failure removes the pending
 record and refunds both quotas; the consumer still drops any lower partial
 frame/page-cache pins it prepared. An abandoned reservation must be explicitly
 cancelled; forced teardown cancels all unpublished reservations and waits for
-active mechanism pins to release. Mapping mutations ask `admit_mutation` before
-changing an overlapping range. System charges are intentionally separate from
-registry teardown so the embedding kernel can keep them alive until its last
-mechanism owner has actually released.
+active mechanism pins to release. Both reservations and active pins block an
+overlapping mapping mutation, so every such mutation must ask `admit_mutation`
+before publication. This permits bounded revalidation windows without letting
+the validated prefix become stale. System charges are intentionally separate
+from registry teardown so the embedding kernel can keep them alive until its
+last mechanism owner has actually released.
 
 ## Error and stability contract
 
