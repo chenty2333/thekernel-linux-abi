@@ -15,6 +15,15 @@ thread-private queued records. Cancellation also quiesces a delivery that
 already started, so handler context and mask updates cannot complete after
 endpoint teardown returns.
 
+Synchronous waits use `observe_signal_wait()` under that same sole delivery
+owner. Each observation first accepts a queued signal selected by the caller's
+wait set, then considers asynchronous delivery with that set explicitly
+excluded. A selected signal published in the dequeue-to-delivery gap therefore
+stays pending for the embedding wake and next observation instead of being
+consumed into an asynchronous handler frame. The result distinguishes
+accepted, delivered, and empty observations without exposing lock ownership to
+consumers.
+
 Registration is a two-phase operation. `try_register(tid)` returns an
 admission token; dropping that token rolls the admission back, while
 `commit()` activates it. `commit()` is fallible and returns

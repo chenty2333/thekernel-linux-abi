@@ -64,5 +64,9 @@ This ledger records changes relative to `starry-signal 0.3.0` identified in
 - Resolve thread-directed preparation through the sleepable process snapshot
   and retain the exact active registry entry. Cancelling and later
   re-registering the same manager cannot make an old prepared token valid.
+- Add a synchronous-wait observation transaction under the existing delivery
+  owner. Selected pending signals win each observation, while the selected set
+  is excluded from asynchronous delivery so publication in the inter-scan gap
+  remains queued for the embedding wake and next observation.
 - Declare the package nightly-only: `Arc::try_new` preserves real OOM errors;
   allocator pre-reservation is not treated as a substitute.

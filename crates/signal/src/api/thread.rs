@@ -236,6 +236,19 @@ pub struct DeliveredSignal {
     pub restartable_handler: bool,
 }
 
+/// One linearized observation made by a synchronous signal wait.
+///
+/// `Accepted` owns a signal selected by the wait set. `Delivered` owns a
+/// different, asynchronously deliverable signal whose disposition has already
+/// been resolved and whose handler frame, if any, has already been published.
+/// `None` means neither class was present at this observation.
+#[must_use = "the caller must complete accepted or delivered signal ownership"]
+pub enum SignalWaitObservation {
+    Accepted(SignalInfo),
+    Delivered(DeliveredSignal),
+    None,
+}
+
 /// Thread-level signal manager.
 pub struct ThreadSignalManager {
     /// The process-level signal manager
@@ -614,9 +627,10 @@ impl ThreadSignalManager {
         memory: &mut UserMemoryContext<'_, M>,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
+        excluded: SignalSet,
     ) -> Option<DeliveredSignal> {
         let blocked = self.blocked.lock();
-        let mask = !*blocked;
+        let mask = !*blocked & !excluded;
         let restore_blocked = restore_blocked.unwrap_or_else(|| *blocked);
         drop(blocked);
 
@@ -670,9 +684,88 @@ impl ThreadSignalManager {
         {
             return None;
         }
-        let delivered = self.check_signals_slow(memory, uctx, restore_blocked);
+        let delivered =
+            self.check_signals_slow(memory, uctx, restore_blocked, SignalSet::default());
         drop(delivery);
         delivered
+    }
+
+    fn observe_signal_wait_inner<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+        after_waited_scan: impl FnOnce(),
+    ) -> SignalWaitObservation {
+        // This is the same sole delivery owner used by `check_signals`. Signal
+        // producers remain non-blocking: publication is serialized by the
+        // pending/action locks and never acquires this mutex.
+        let delivery = self.delivery.lock();
+        if !self.accepting_signals.load(Ordering::Acquire) {
+            drop(delivery);
+            return SignalWaitObservation::None;
+        }
+
+        // The selected class always gets the first observation. Every lock in
+        // `dequeue_signal` is released before the owned signal is returned.
+        if let Some(accepted) = self.dequeue_signal(waited) {
+            drop(delivery);
+            return SignalWaitObservation::Accepted(accepted);
+        }
+
+        // The production caller supplies an empty closure. Keeping this seam
+        // private lets the state-machine test deterministically publish in the
+        // otherwise tiny dequeue-to-delivery race window.
+        after_waited_scan();
+
+        if !self.possibly_has_signal.load(Ordering::Acquire)
+            && !self.proc.possibly_has_signal.load(Ordering::Acquire)
+        {
+            drop(delivery);
+            return SignalWaitObservation::None;
+        }
+
+        // A selected signal published after the first scan is deliberately
+        // excluded from asynchronous delivery. Publication requests an
+        // embedding wake, so the caller observes it as `Accepted` on the next
+        // pass; it can never be consumed into a handler frame in this gap.
+        let delivered = self.check_signals_slow(memory, uctx, Some(restore_blocked), *waited);
+        drop(delivery);
+        delivered.map_or(
+            SignalWaitObservation::None,
+            SignalWaitObservation::Delivered,
+        )
+    }
+
+    /// Atomically observes the two classes relevant to a synchronous signal
+    /// wait: a signal selected by `waited`, then any other asynchronously
+    /// deliverable signal.
+    ///
+    /// Signals in `waited` are excluded from the asynchronous selection even
+    /// if they arrive after the selected dequeue. Producers therefore remain
+    /// non-blocking while the next observation retains selected-signal
+    /// priority and owns the exact queued record.
+    pub fn observe_signal_wait<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+    ) -> SignalWaitObservation {
+        self.observe_signal_wait_inner(memory, uctx, waited, restore_blocked, || {})
+    }
+
+    #[cfg(test)]
+    fn observe_signal_wait_with_hook<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+        after_waited_scan: impl FnOnce(),
+    ) -> SignalWaitObservation {
+        self.observe_signal_wait_inner(memory, uctx, waited, restore_blocked, after_waited_scan)
     }
 
     /// Validates an owned signal frame without publishing any state.
@@ -919,5 +1012,100 @@ impl Drop for ThreadSignalManager {
         if let Some(entry) = registration {
             entry.deactivate();
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_wait_tests {
+    use alloc::sync::Arc;
+    use core::mem::MaybeUninit;
+
+    use axcpu::uspace::UserContext;
+    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
+
+    use super::{SignalWaitObservation, ThreadSignalManager};
+    use crate::{
+        SignalInfo, SignalSet, Signo,
+        api::{ProcessSignalManager, SignalActions},
+    };
+
+    struct NoUserAccess;
+
+    // SAFETY: this provider never dereferences a user address and never claims
+    // to have initialized or written any byte.
+    unsafe impl UserMemory for NoUserAccess {
+        fn read(&mut self, _start: usize, _dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+
+        fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    fn registered_thread() -> Arc<ThreadSignalManager> {
+        let process = Arc::new(ProcessSignalManager::new(SignalActions::default(), 0));
+        let thread = ThreadSignalManager::try_new(process).unwrap();
+        thread.try_register(1).unwrap().commit().unwrap();
+        thread
+    }
+
+    #[test]
+    fn waited_arrival_in_dequeue_delivery_gap_stays_synchronous() {
+        let thread = registered_thread();
+        let mut waited = SignalSet::default();
+        waited.add(Signo::SIGUSR1);
+        let mut provider = NoUserAccess;
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let mut context = UserContext::new(0, 0.into(), 0);
+        let sender = Arc::clone(&thread);
+
+        let first = thread.observe_signal_wait_with_hook(
+            &mut memory,
+            &mut context,
+            &waited,
+            SignalSet::default(),
+            move || {
+                assert!(sender.send_unqueued_signal(SignalInfo::new_user(Signo::SIGUSR1, 1, 1,)));
+            },
+        );
+        assert!(matches!(first, SignalWaitObservation::None));
+        assert!(thread.pending().has(Signo::SIGUSR1));
+
+        let second =
+            thread.observe_signal_wait(&mut memory, &mut context, &waited, SignalSet::default());
+        assert!(matches!(
+            second,
+            SignalWaitObservation::Accepted(info) if info.signo() == Signo::SIGUSR1
+        ));
+        assert!(!thread.pending().has(Signo::SIGUSR1));
+    }
+
+    #[test]
+    fn selected_signal_precedes_an_existing_async_delivery() {
+        let thread = registered_thread();
+        assert!(thread.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 1, 1,)));
+        assert!(thread.send_unqueued_signal(SignalInfo::new_user(Signo::SIGUSR1, 1, 1,)));
+
+        let mut waited = SignalSet::default();
+        waited.add(Signo::SIGUSR1);
+        let mut provider = NoUserAccess;
+        let mut memory = UserMemoryContext::new(&mut provider);
+        let mut context = UserContext::new(0, 0.into(), 0);
+
+        let selected =
+            thread.observe_signal_wait(&mut memory, &mut context, &waited, SignalSet::default());
+        assert!(matches!(
+            selected,
+            SignalWaitObservation::Accepted(info) if info.signo() == Signo::SIGUSR1
+        ));
+
+        let delivered =
+            thread.observe_signal_wait(&mut memory, &mut context, &waited, SignalSet::default());
+        assert!(matches!(
+            delivered,
+            SignalWaitObservation::Delivered(signal)
+                if signal.info.signo() == Signo::SIGTERM
+        ));
     }
 }
