@@ -113,6 +113,15 @@ validation deliberately does not: a MISSING fault blocked before
 `mprotect(PROT_NONE)` may still be populated, then its retry observes the new
 protection.
 
+An adapter planning an in-place mapping grow may not yet have a post-grow VMA
+snapshot. `tail_extension_replacement` builds a source-bound replacement from
+the frozen address-space/mapping identity and a same-start, strictly larger
+range while preserving the registration/fault epoch. It is safe to feed into
+the table's mapping-replacement preflight before the MM transaction. The
+adapter remains responsible for proving that the source registration reaches
+the old mapping end and for publishing the replacement only after the mapping
+grow succeeds.
+
 REGISTER and UNREGISTER consume the same VMA-profile validator: API
 initialization, one address space, anonymous-private kind, page geometry,
 strict ordering, non-overlap, and actual intersection remain Layer 2 policy.

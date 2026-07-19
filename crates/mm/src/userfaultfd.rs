@@ -463,6 +463,46 @@ impl UffdRegistration {
         UffdIoctls::MISSING_RANGE_PROFILE
     }
 
+    /// Builds the source-bound replacement for a preflighted in-place tail grow.
+    ///
+    /// Unlike [`Self::refreshed_fragment`], this helper does not require a
+    /// post-grow [`MappingSnapshot`]. It accepts only the identity that the
+    /// adapter froze before its MM transaction and a strictly larger range
+    /// with the same start and page geometry. The replacement preserves this
+    /// registration's handler, address space, mapping, registration/fault
+    /// epoch, and mode, and can therefore be passed directly to
+    /// [`UffdRegistrationTable::preflight_mapping_replace`].
+    ///
+    /// This method does not prove that the source registration reaches the old
+    /// mapping end, nor that the mapping grow commits. The adapter owns both
+    /// proofs and must not publish the replacement unless its MM transaction
+    /// succeeds.
+    pub fn tail_extension_replacement(
+        self,
+        address_space: AddressSpaceId,
+        mapping: MappingId,
+        new_range: PageRange,
+    ) -> Result<UffdRegistrationReplacement, MmError> {
+        if self.address_space() != address_space || self.mapping() != mapping {
+            return Err(MmError::StaleGeneration);
+        }
+        let old_range = self.range();
+        if old_range.page_size() != new_range.page_size()
+            || new_range.start() != old_range.start()
+            || !new_range.contains(old_range)
+            || new_range.end() <= old_range.end()
+        {
+            return Err(MmError::RangeNotMapped);
+        }
+        Ok(UffdRegistrationReplacement::new(
+            self.id(),
+            UffdRegistrationRequest {
+                range: new_range,
+                ..self.request
+            },
+        ))
+    }
+
     /// Builds one split/trim/grow refresh fragment without adopting a topology
     /// snapshot's generation or access.
     ///
