@@ -12,11 +12,12 @@
   zero-protocol inheritance, stale-plan rejection, and caller-supplied
   normalized get-name metadata.
 - Add pure RAW/DGRAM frame views and `MSG_PEEK`/`MSG_TRUNC` copy, return-length,
-  output-flag, and queue-consumption decisions.
+  output-flag, and queue-consumption decisions, including ordinary
+  claim-before-copy versus PEEK retain-on-copy-fault ordering.
 - Add `PACKET_IGNORE_OUTGOING`, Linux's `ETH_P_ALL`-only outgoing decision,
-  strict known-unsupported/unknown option classification, and a saturating
-  typed mapping of the Layer 1 endpoint's single destructive statistics
-  snapshot.
+  strict known-unsupported/unknown option classification, and an exact typed
+  mapping of the Layer 1 endpoint's single destructive aggregate statistics
+  snapshot without invented drop attribution.
 - Keep packet buffers, taps, device registries, queue storage, locks, waiters,
   readiness, usercopy, FD/task/namespace state, TPACKET, fanout, and errno
   conversion in their owning layers.

@@ -132,6 +132,10 @@ impl PacketView {
     }
 
     /// Produces the pure copy/return/queue decision for one receive call.
+    ///
+    /// The adapter must apply the queue disposition before usercopy. Ordinary
+    /// receive claims the record and never requeues it after a copy fault;
+    /// `MSG_PEEK` leaves the record queued even when copying fails.
     pub const fn receive_decision(
         self,
         copy_buffer_len: usize,
@@ -166,10 +170,17 @@ impl PacketView {
 /// Whether an ordinary queued packet remains after a receive operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueDisposition {
-    /// `MSG_PEEK`: keep the packet queued after a successful copy.
+    /// `MSG_PEEK`: never claim the packet, including when usercopy fails.
     Retain,
-    /// Ordinary receive: consume the packet after a successful copy.
+    /// Ordinary receive: claim before usercopy and do not requeue on failure.
     Consume,
+}
+
+impl QueueDisposition {
+    /// Returns whether the queue adapter must claim the record before usercopy.
+    pub const fn claims_before_copy(self) -> bool {
+        matches!(self, Self::Consume)
+    }
 }
 
 /// Pure receive result used by usercopy and queue adapters.
@@ -215,7 +226,7 @@ impl ReceiveDecision {
         self.message_truncated
     }
 
-    /// Whether the queue adapter retains or consumes the packet.
+    /// Whether the queue adapter retains or claims the packet before usercopy.
     pub const fn queue_disposition(self) -> QueueDisposition {
         self.queue_disposition
     }
@@ -252,12 +263,14 @@ mod tests {
         assert_eq!(ordinary.returned_len(), 32);
         assert!(ordinary.message_truncated());
         assert_eq!(ordinary.queue_disposition(), QueueDisposition::Consume);
+        assert!(ordinary.queue_disposition().claims_before_copy());
 
         let flags = ReceiveFlags::PEEK.union(ReceiveFlags::TRUNC);
         let peek = view.receive_decision(32, flags);
         assert_eq!(peek.copy_len(), 32);
         assert_eq!(peek.returned_len(), 80);
         assert_eq!(peek.queue_disposition(), QueueDisposition::Retain);
+        assert!(!peek.queue_disposition().claims_before_copy());
         assert_eq!(peek.original_len(), 100);
     }
 

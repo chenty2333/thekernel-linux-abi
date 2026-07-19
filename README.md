@@ -33,7 +33,7 @@ The 0.1.0 line contains ten packages:
   explicit close and drain transitions.
 - `thekernel-linux-packet` 0.1.0: normalized AF_PACKET protocol/address values,
   stale-safe bind publication, RAW/DGRAM ordinary receive decisions,
-  exact Linux outgoing policy, mapping of endpoint-owned destructive reasoned
+  exact Linux outgoing policy, mapping of endpoint-owned destructive aggregate
   statistics, and strict unsupported-option reporting without packet-buffer
   or device ownership.
 - `thekernel-linux-seccomp` 0.1.0: a Linux v6.12 classic-BPF profile over the

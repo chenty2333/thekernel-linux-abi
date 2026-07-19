@@ -2,101 +2,65 @@
 ///
 /// The Layer 1 packet endpoint remains the sole owner of live counters and
 /// resets them exactly once. This value only maps that already-destructive
-/// snapshot into Linux packet/drop totals plus reasoned diagnostics.
+/// snapshot without inventing event attribution the endpoint did not record.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PacketStatistics {
     packets: u64,
     drops: u64,
-    accepted: u64,
-    queue_drops: u64,
-    allocation_drops: u64,
-    filter_rejects: u64,
-    saturated: bool,
+    filter_rejected: u64,
+    filter_errors: u64,
 }
 
 impl PacketStatistics {
     /// Maps one endpoint-owned destructive snapshot without taking ownership
     /// of the counters or introducing a second reset point.
     ///
-    /// Accepted packets and both post-filter drop categories contribute to the
-    /// Linux packet total. Queue and allocation failures contribute to drops.
-    /// Filter rejects contribute to neither. Aggregates saturate instead of
-    /// failing a receive path; `source_saturated` propagates a lower counter's
-    /// diagnostic marker.
+    /// `packets` and `drops` are already the endpoint's Linux-compatible
+    /// aggregates. Filter outcomes remain diagnostics and are not added to
+    /// either total. The values are copied exactly because the endpoint does
+    /// not currently expose drop reasons or a saturation marker.
     pub const fn from_destructive_snapshot(
-        accepted: u64,
-        queue_drops: u64,
-        allocation_drops: u64,
-        filter_rejects: u64,
-        source_saturated: bool,
+        packets: u64,
+        drops: u64,
+        filter_rejected: u64,
+        filter_errors: u64,
     ) -> Self {
-        let (drops, drop_saturated) = saturating_sum(queue_drops, allocation_drops);
-        let (packets, packet_saturated) = saturating_sum(accepted, drops);
         Self {
             packets,
             drops,
-            accepted,
-            queue_drops,
-            allocation_drops,
-            filter_rejects,
-            saturated: source_saturated || drop_saturated || packet_saturated,
+            filter_rejected,
+            filter_errors,
         }
     }
 
-    /// Packets seen by the socket after filtering, including accounted drops.
+    /// Endpoint-provided Linux-visible packet aggregate, including its drops.
     pub const fn packets(self) -> u64 {
         self.packets
     }
 
-    /// Queue-full plus allocation-failure drops.
+    /// Endpoint-provided Linux-visible drop aggregate.
     pub const fn drops(self) -> u64 {
         self.drops
-    }
-
-    /// Packets successfully admitted to the ordinary queue.
-    pub const fn accepted(self) -> u64 {
-        self.accepted
-    }
-
-    /// Packets dropped because the bounded queue was full.
-    pub const fn queue_drops(self) -> u64 {
-        self.queue_drops
-    }
-
-    /// Packets dropped because packet storage allocation failed.
-    pub const fn allocation_drops(self) -> u64 {
-        self.allocation_drops
     }
 
     /// Packets rejected by an attached filter before admission.
     ///
     /// This diagnostic counter is intentionally excluded from Linux-visible
     /// `packets` and `drops`.
-    pub const fn filter_rejects(self) -> u64 {
-        self.filter_rejects
+    pub const fn filter_rejected(self) -> u64 {
+        self.filter_rejected
     }
 
-    /// Whether the endpoint or aggregate conversion saturated a counter.
-    pub const fn saturated(self) -> bool {
-        self.saturated
+    /// Attached-filter executions that returned an internal mechanism error.
+    ///
+    /// This Layer 1 diagnostic is also excluded from Linux-visible totals.
+    pub const fn filter_errors(self) -> u64 {
+        self.filter_errors
     }
 
-    /// Returns whether every counter and diagnostic marker is zero.
+    /// Returns whether every aggregate and diagnostic counter is zero.
     pub const fn is_empty(self) -> bool {
-        self.packets == 0
-            && self.drops == 0
-            && self.accepted == 0
-            && self.queue_drops == 0
-            && self.allocation_drops == 0
-            && self.filter_rejects == 0
-            && !self.saturated
-    }
-}
-
-const fn saturating_sum(left: u64, right: u64) -> (u64, bool) {
-    match left.checked_add(right) {
-        Some(sum) => (sum, false),
-        None => (u64::MAX, true),
+        self.packets == 0 && self.drops == 0 && self.filter_rejected == 0 && self.filter_errors == 0
     }
 }
 
@@ -105,26 +69,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mapping_excludes_filter_rejects_from_linux_totals() {
-        let stats = PacketStatistics::from_destructive_snapshot(1, 2, 3, 5, false);
+    fn aggregate_snapshot_is_mapped_without_reason_invention() {
+        let stats = PacketStatistics::from_destructive_snapshot(6, 5, 7, 11);
         assert_eq!(stats.packets(), 6);
         assert_eq!(stats.drops(), 5);
-        assert_eq!(stats.accepted(), 1);
-        assert_eq!(stats.queue_drops(), 2);
-        assert_eq!(stats.allocation_drops(), 3);
-        assert_eq!(stats.filter_rejects(), 5);
-        assert!(!stats.saturated());
+        assert_eq!(stats.filter_rejected(), 7);
+        assert_eq!(stats.filter_errors(), 11);
     }
 
     #[test]
-    fn aggregation_saturates_without_creating_a_receive_error() {
-        let stats = PacketStatistics::from_destructive_snapshot(u64::MAX, u64::MAX, 1, 0, false);
+    fn aggregate_values_are_preserved_even_without_reason_decomposition() {
+        let stats = PacketStatistics::from_destructive_snapshot(u64::MAX, u64::MAX, 0, 0);
         assert_eq!(stats.packets(), u64::MAX);
         assert_eq!(stats.drops(), u64::MAX);
-        assert!(stats.saturated());
+        assert!(!stats.is_empty());
 
-        let lower = PacketStatistics::from_destructive_snapshot(0, 0, 0, 0, true);
-        assert!(lower.saturated());
-        assert!(!lower.is_empty());
+        assert!(PacketStatistics::from_destructive_snapshot(0, 0, 0, 0).is_empty());
     }
 }

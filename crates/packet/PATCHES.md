@@ -12,12 +12,14 @@
 - Include the link header in RAW views and remove it from DGRAM views.
 - Make `MSG_PEEK` retain a queue entry and make input `MSG_TRUNC` return the
   complete captured length while independently reporting output truncation.
+  Ordinary receive claims before usercopy and remains consumed on `EFAULT`;
+  `MSG_PEEK` retains the entry on the same failure.
 - Deliver locally observed outgoing packets only to `ETH_P_ALL` sockets, then
   suppress them when `PACKET_IGNORE_OUTGOING` is enabled. An exact protocol
   may still receive a later looped-back incoming HOST copy.
 - Classify the statistics option as destructive while leaving the single reset
-  and live counters in the queue-owning endpoint; include queue/allocation
-  drops in mapped packet totals and exclude pre-admission filter rejects.
+  and live counters in the queue-owning endpoint; map its packet/drop
+  aggregates exactly and exclude filter rejection/error diagnostics.
 
 ## 0.1.0 extraction changes
 
@@ -35,10 +37,11 @@
 - Require get-name link metadata as an immutable caller snapshot matching the
   exact bound interface; no global device lookup is hidden in the crate.
 - Separate packet layout, captured snap length, copy length, syscall return
-  length, output truncation, and queue disposition into a pure decision.
-- Map the endpoint's accepted, queue-full, allocation-failure, filter-reject,
-  and saturation snapshot into typed Linux totals. Aggregate overflow
-  saturates with a diagnostic marker and cannot fail packet admission.
+  length, output truncation, and queue disposition into a pure decision whose
+  claim-before-copy ordering is explicit.
+- Map the endpoint's packet/drop aggregates and filter diagnostics exactly.
+  Do not infer accepted counts, drop reasons, or saturation state that the
+  destructive Layer 1 snapshot does not expose.
 - Classify the pinned `SOL_PACKET` option vocabulary while implementing only
   ignore-outgoing set/get and destructive statistics get.
 

@@ -25,10 +25,9 @@ Version 0.1.0 provides:
   output-truncation, and queue-consumption decisions;
 - `PACKET_IGNORE_OUTGOING` plus explicit delivery policy that preserves
   Linux's `ETH_P_ALL`-only outgoing tap exception;
-- a saturating typed mapping from the endpoint's single destructive statistics
-  snapshot, distinguishing accepted packets, queue-full drops,
-  allocation-failure drops, and filter rejects while excluding filter rejects
-  from Linux packet/drop totals; and
+- an exact typed mapping from the endpoint's single destructive aggregate
+  statistics snapshot, retaining filter rejection/error diagnostics without
+  inventing unavailable queue-versus-staging drop attribution; and
 - strict known-unsupported versus unknown packet-option errors.
 
 ## Layer boundary
@@ -64,19 +63,23 @@ wildcard bindings return zero hardware type and an empty address.
 begin at byte zero; DGRAM views begin at the network header. A caller supplies
 the post-filter captured length, then `receive_decision` determines copy length,
 successful return length, output `MSG_TRUNC`, and whether `MSG_PEEK` retains the
-queue entry. Waiting, signal interruption, nonblocking mode, queue ownership,
-and usercopy remain outside this pure decision.
+queue entry. The adapter applies that disposition before usercopy: ordinary
+receive claims/removes the record first and does not requeue it on `EFAULT`,
+while `MSG_PEEK` never claims it and therefore retains it on `EFAULT`. Waiting,
+signal interruption, nonblocking mode, queue ownership, and usercopy remain
+outside this pure decision.
 
-The Layer 1 endpoint is the sole live counter and reset owner. It records a
-packet only after filter acceptance and produces exactly one destructive
-snapshot for `PACKET_STATISTICS`. `PacketStatistics::from_destructive_snapshot`
-maps that result without storing or resetting counters a second time.
-Accepted, queue-full, and allocation-failure events contribute to the Linux
-packet total; the two failure categories contribute to drops. Filter rejects
-are a separate diagnostic counter and contribute to neither. Aggregate
-overflow saturates and sets a diagnostic marker rather than failing the packet
-path. The adapter owns copyout width and failure ordering for the concrete UAPI
-struct.
+The Layer 1 endpoint is the sole live counter and reset owner. Successfully
+staged frames enter its aggregates after filter acceptance; selector-matched
+staging failures may instead enter `packets` and `drops` before a filter can
+run. It produces exactly one destructive snapshot for `PACKET_STATISTICS`.
+`PacketStatistics::from_destructive_snapshot` maps its already-aggregated
+`packets`, `drops`, `filter_rejected`, and `filter_errors` fields without
+storing or resetting counters a second time. The two filter diagnostics
+contribute to neither Linux-visible total. The current endpoint does not expose
+queue-versus-staging drop reasons or a saturation marker, so this crate
+deliberately does not synthesize them. The adapter owns copyout width and
+failure ordering for the concrete UAPI struct.
 
 ## Deliberate 0.1 limits
 

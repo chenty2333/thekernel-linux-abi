@@ -35,6 +35,11 @@ fn normalized_bind_receive_and_statistics_contract_is_public() {
     assert_eq!(receive.returned_len(), 96);
     assert!(receive.message_truncated());
     assert_eq!(receive.queue_disposition(), QueueDisposition::Retain);
+    assert!(!receive.queue_disposition().claims_before_copy());
+
+    let ordinary = view.receive_decision(32, ReceiveFlags::EMPTY);
+    assert_eq!(ordinary.queue_disposition(), QueueDisposition::Consume);
+    assert!(ordinary.queue_disposition().claims_before_copy());
 
     assert_eq!(
         socket.delivery_decision(
@@ -60,18 +65,15 @@ fn normalized_bind_receive_and_statistics_contract_is_public() {
         GetPacketOption::decode(PacketOption::Statistics.raw()),
         Ok(GetPacketOption::Statistics)
     );
-    let endpoint_snapshot = PacketStatistics::from_destructive_snapshot(1, 1, 1, 1, false);
+    let endpoint_snapshot = PacketStatistics::from_destructive_snapshot(3, 2, 1, 1);
     let stats = match PacketOptionValue::Statistics(endpoint_snapshot) {
         PacketOptionValue::Statistics(stats) => stats,
         PacketOptionValue::IgnoreOutgoing(_) => panic!("statistics value changed variant"),
     };
     assert_eq!(stats.packets(), 3);
     assert_eq!(stats.drops(), 2);
-    assert_eq!(stats.accepted(), 1);
-    assert_eq!(stats.queue_drops(), 1);
-    assert_eq!(stats.allocation_drops(), 1);
-    assert_eq!(stats.filter_rejects(), 1);
-    assert!(!stats.saturated());
+    assert_eq!(stats.filter_rejected(), 1);
+    assert_eq!(stats.filter_errors(), 1);
 }
 
 #[test]
