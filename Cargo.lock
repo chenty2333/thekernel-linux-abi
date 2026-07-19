@@ -918,6 +918,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-linux-seccomp"
+version = "0.1.0"
+
+[[package]]
 name = "thekernel-linux-signal"
 version = "0.1.0"
 dependencies = [
