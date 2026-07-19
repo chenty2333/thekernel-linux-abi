@@ -1,4 +1,4 @@
-use crate::FilterChain;
+use crate::{FilterChain, FilterDecision, SeccompData};
 
 /// Linux seccomp mode attached to one task.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -37,6 +37,20 @@ impl SeccompState {
     /// Returns an immutable snapshot of the filter ancestry.
     pub fn filters(&self) -> FilterChain {
         self.filters.clone()
+    }
+
+    /// Returns the number of immutable programs in the current ancestry
+    /// without cloning its leaf reference.
+    pub fn filter_count(&self) -> usize {
+        self.filters.filter_count()
+    }
+
+    /// Evaluates the current immutable ancestry without cloning its leaf.
+    ///
+    /// Kernel adapters first copy the complete task state at their single
+    /// publication point, then call this method after releasing that lock.
+    pub fn evaluate(&self, data: &SeccompData) -> FilterDecision {
+        self.filters.evaluate(data)
     }
 
     /// Enters strict mode. No later mode transition is permitted.
@@ -237,5 +251,18 @@ mod tests {
         let prepared = sibling.prepare_synchronized_from(&caller).unwrap();
         assert_eq!(sibling.mode(), SeccompMode::Disabled);
         assert!(prepared.filters().same_identity(&caller.filters()));
+        assert_eq!(prepared.filter_count(), 1);
+        assert_eq!(
+            prepared
+                .evaluate(&SeccompData {
+                    number: 0,
+                    architecture: crate::AUDIT_ARCH_RISCV64,
+                    instruction_pointer: 0,
+                    arguments: [0; 6],
+                })
+                .action
+                .raw(),
+            SECCOMP_RET_ALLOW
+        );
     }
 }
