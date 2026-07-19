@@ -988,6 +988,81 @@ fn userfaultfd_tail_extension_replacement_rejects_wrong_identity_or_shape() {
 }
 
 #[test]
+fn userfaultfd_head_extension_replacement_preflights_without_a_post_grow_snapshot() {
+    let api = initialized_uffd_api();
+    let old = uffd_snapshot(9, 90, 21, 0x6000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<1>::new(1).unwrap();
+    let registration = table
+        .register(&api, uffd_registration_request(12, old, old.range()))
+        .unwrap();
+    let grown_range = PageRange::new(0x2000, 8 * PAGE, PAGE).unwrap();
+
+    let replacement = registration
+        .head_extension_replacement(old.address_space(), old.mapping(), grown_range)
+        .unwrap();
+    assert_eq!(replacement.source(), registration.id());
+    let request = replacement.request();
+    assert_eq!(request.handler(), registration.handler());
+    assert_eq!(request.address_space(), registration.address_space());
+    assert_eq!(request.mapping(), registration.mapping());
+    assert_eq!(request.generation(), registration.generation());
+    assert_eq!(request.range(), grown_range);
+    assert_eq!(request.mode(), registration.mode());
+
+    let plan = table
+        .preflight_mapping_replace(&[registration.id()], &[replacement])
+        .unwrap();
+    let commit = table
+        .commit_mapping_replace(plan, &[registration.id()], &[replacement], |_| {})
+        .unwrap();
+    assert_eq!(commit.removed(), 1);
+    assert_eq!(commit.published(), 1);
+    let grown = table.iter().next().unwrap();
+    assert_eq!(grown.range(), grown_range);
+    assert_eq!(grown.generation(), registration.generation());
+}
+
+#[test]
+fn userfaultfd_head_extension_replacement_rejects_wrong_identity_or_shape() {
+    let api = initialized_uffd_api();
+    let old = uffd_snapshot(9, 90, 21, 0x6000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<1>::new(1).unwrap();
+    let registration = table
+        .register(&api, uffd_registration_request(12, old, old.range()))
+        .unwrap();
+    let grown_range = PageRange::new(0x2000, 8 * PAGE, PAGE).unwrap();
+
+    assert_eq!(
+        registration.head_extension_replacement(
+            AddressSpaceId::new(10).unwrap(),
+            old.mapping(),
+            grown_range,
+        ),
+        Err(MmError::StaleGeneration)
+    );
+    assert_eq!(
+        registration.head_extension_replacement(
+            old.address_space(),
+            MappingId::new(91).unwrap(),
+            grown_range,
+        ),
+        Err(MmError::StaleGeneration)
+    );
+
+    let same = old.range();
+    let shorter = PageRange::new(0x7000, 2 * PAGE, PAGE).unwrap();
+    let shifted_cover = PageRange::new(0x1000, 10 * PAGE, PAGE).unwrap();
+    let different_page_size = PageRange::new(0x2000, 8 * PAGE, 2 * PAGE).unwrap();
+    for invalid in [same, shorter, shifted_cover, different_page_size] {
+        assert_eq!(
+            registration.head_extension_replacement(old.address_space(), old.mapping(), invalid,),
+            Err(MmError::RangeNotMapped)
+        );
+    }
+    assert_eq!(table.iter().collect::<Vec<_>>(), vec![registration]);
+}
+
+#[test]
 fn userfaultfd_mapping_epoch_lookup_fails_closed_on_inconsistent_fragments() {
     let api = initialized_uffd_api();
     let first = uffd_snapshot(8, 80, 11, 0x1000, PAGE, MappingKind::AnonymousPrivate);

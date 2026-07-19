@@ -503,6 +503,45 @@ impl UffdRegistration {
         ))
     }
 
+    /// Builds the source-bound replacement for a preflighted grow-down head
+    /// extension.
+    ///
+    /// This is the lower-bound counterpart of
+    /// [`Self::tail_extension_replacement`]. The adapter supplies the frozen
+    /// address-space/mapping identity and a strictly larger same-end range.
+    /// The replacement keeps the source handler, logical mapping,
+    /// registration/fault epoch, and mode without requiring a post-growth VMA
+    /// snapshot.
+    ///
+    /// The adapter must prove that the source registration begins at the old
+    /// mapping boundary and must commit this replacement only after the
+    /// concrete grow-down mapping transaction succeeds.
+    pub fn head_extension_replacement(
+        self,
+        address_space: AddressSpaceId,
+        mapping: MappingId,
+        new_range: PageRange,
+    ) -> Result<UffdRegistrationReplacement, MmError> {
+        if self.address_space() != address_space || self.mapping() != mapping {
+            return Err(MmError::StaleGeneration);
+        }
+        let old_range = self.range();
+        if old_range.page_size() != new_range.page_size()
+            || new_range.end() != old_range.end()
+            || !new_range.contains(old_range)
+            || new_range.start() >= old_range.start()
+        {
+            return Err(MmError::RangeNotMapped);
+        }
+        Ok(UffdRegistrationReplacement::new(
+            self.id(),
+            UffdRegistrationRequest {
+                range: new_range,
+                ..self.request
+            },
+        ))
+    }
+
     /// Builds one split/trim/grow refresh fragment without adopting a topology
     /// snapshot's generation or access.
     ///

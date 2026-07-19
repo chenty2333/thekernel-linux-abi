@@ -121,12 +121,13 @@ validation deliberately does not: a MISSING fault blocked before
 protection.
 
 An adapter planning an in-place mapping grow may not yet have a post-grow VMA
-snapshot. `tail_extension_replacement` builds a source-bound replacement from
-the frozen address-space/mapping identity and a same-start, strictly larger
-range while preserving the registration/fault epoch. It is safe to feed into
-the table's mapping-replacement preflight before the MM transaction. The
-adapter remains responsible for proving that the source registration reaches
-the old mapping end and for publishing the replacement only after the mapping
+snapshot. `tail_extension_replacement` and `head_extension_replacement` build
+source-bound replacements from the frozen address-space/mapping identity and a
+same-start or same-end strictly larger range while preserving the
+registration/fault epoch. They are safe to feed into the table's
+mapping-replacement preflight before the MM transaction. The adapter remains
+responsible for proving that the source registration reaches the corresponding
+old mapping boundary and for publishing the replacement only after the mapping
 grow succeeds.
 
 REGISTER and UNREGISTER consume the same VMA-profile validator: API
