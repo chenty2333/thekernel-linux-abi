@@ -1,4 +1,5 @@
 /target/
+/.ci-deps/
 *.swp
 *.swo
 .DS_Store

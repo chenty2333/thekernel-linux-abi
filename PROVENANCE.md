@@ -27,6 +27,18 @@ research. It reimplements those public contracts without copying Linux code
 and does not move the concrete queue, waiter, readiness, page installer,
 usercopy, FD, or syscall adapter into the crate.
 
+The `thekernel-linux-seccomp` record pins its initial TheKernel consumer
+baseline, Linux v6.12 `adc218676eef25575469234709c2d87185ca223a`, and the
+Apache-2.0 `thekernel-axcbpf` 0.1.0 mechanism implementation at
+`a2b4f6f7e0bfbb1ca4bdf4fef45e104185749705` and its tree-identical package
+release commit `5c34536fd766b5f84f2fb8e6b18a2ab340659582`. The generic dependency owns the
+ordinary classic-BPF verifier/interpreter; the Linux-ABI package reimplements
+only the seccomp profile, filter ancestry, bounded accounting, action
+selection, and reusable task-state policy. Neither provenance record implies
+copied Linux implementation nor ownership of usercopy, task/thread-group
+locking, signals, ptrace, audit, listener FDs, readiness, or all-or-none TSYNC
+publication.
+
 Original metadata remains in Git even when it is excluded as package source.
 Published packages include the human-readable provenance and patch ledger, but
 exclude the vendored upstream Cargo marker and manifest. Cargo reserves those

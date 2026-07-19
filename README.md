@@ -4,7 +4,7 @@
 owned by TheKernel. It is deliberately separate from generic ArceOS
 mechanisms and from TheKernel's syscall and evaluator layers.
 
-The 0.1.0 line contains eight packages:
+The 0.1.0 line contains nine packages:
 
 - `thekernel-linux-usercopy` 0.1.0: explicit-context, bounded, fallible access
   to a caller-provided userspace memory implementation.
@@ -31,10 +31,15 @@ The 0.1.0 line contains eight packages:
   SQE/registration decoding, bounded generation-safe
   request/completion/cancellation state, and registered-file leases with
   explicit close and drain transitions.
+- `thekernel-linux-seccomp` 0.1.0: a Linux v6.12 classic-BPF profile over the
+  generic `thekernel-axcbpf` mechanism, immutable bounded filter ancestry,
+  aggregate live-program accounting, action precedence, and prepared
+  task-state transitions.
 
-Signal depends on usercopy. Process remains independent; task ownership and
-process-to-signal integration stay with the caller rather than becoming hidden
-workspace-global state.
+Signal depends on usercopy. Seccomp depends on the separately packaged
+`thekernel-axcbpf` 0.1.0 mechanism package. Process remains independent; task
+ownership and process-to-signal or process-to-seccomp integration stay with
+the caller rather than becoming hidden workspace-global state.
 
 The workspace name is not a facade package. The MM package exposes policy and
 lifecycle contracts, including reusable userfaultfd negotiation/registration
@@ -46,10 +51,19 @@ dual-architecture gates remain required before a release tag.
 
 The repository pins the same nightly used by its initial TheKernel consumer.
 The usercopy, VFS, FD, MM, and io_uring crates are additionally checked against
-stable Rust 1.85 or newer. The process, signal, and credential crates are
-explicitly nightly-only because preserving fallible standard `Arc` allocation
-currently requires `allocator_api`; none inherits or claims a stable
-`rust-version`.
+stable Rust 1.85 or newer. The process, signal, credential, and seccomp crates
+are explicitly nightly-only because preserving fallible standard `Arc`
+allocation currently requires `allocator_api`; none inherits or claims a
+stable `rust-version`. The policy-neutral `thekernel-axcbpf` dependency itself
+supports Rust 1.85.
+
+Before the first registry release, the workspace resolves `thekernel-axcbpf`
+from a sibling `../thekernel-ax` checkout. CI pins that checkout to the
+package/release commit recorded in `crates/seccomp/VENDOR.md`;
+`scripts/test-package.sh` also proves its crate tree is identical to the
+reviewed implementation commit, rejects source drift, and packages the
+dependency from its real Git worktree. The path is development wiring only and
+must not survive in a normalized seccomp archive.
 
 ```bash
 cargo test --workspace --all-features
@@ -60,6 +74,7 @@ cargo check -p thekernel-linux-fd --no-default-features --locked
 cargo check -p thekernel-linux-cred --no-default-features --locked
 cargo check -p thekernel-linux-mm --no-default-features --locked
 cargo check -p thekernel-linux-io-uring --no-default-features --locked
+cargo check -p thekernel-linux-seccomp --no-default-features --locked
 CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh
 PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   ./scripts/test-package.sh
@@ -96,6 +111,12 @@ PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   embedding kernel still owns shared-page atomic access, UAPI copyin/copyout,
   mmap and FD lifetimes, VFS/readiness adapters, signal-mask restoration,
   execution, waiting, and errno conversion.
+- Seccomp policy consumes `thekernel-axcbpf` for generic classic-BPF
+  verification and execution. It owns the Linux input/opcode profile,
+  immutable filter ancestry, aggregate accounting, action selection, and
+  task-state transition values, but not usercopy, task/thread-group locks,
+  install permissions, signal/ptrace/audit handling, listener FDs, readiness,
+  or group-wide TSYNC commit.
 - Pathwalk, descriptor, watch, ready-queue, graph, and recovery work are all
   finite. Epoll payload preparation is lock-external and recovery is
   generation-tagged and incrementally bounded. Unsupported exclusive selection
@@ -104,6 +125,12 @@ PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   TheKernel.
 - Unsupported functionality is reported honestly; a package name is not a
   claim of complete Linux parity.
+
+The pre-publication package gate builds seccomp together with an exact packaged
+`thekernel-axcbpf` source artifact and tests only those unpacked archives. This
+does not pretend that the dependency already exists on crates.io. A final
+`cargo publish --dry-run` for seccomp remains deferred until
+`thekernel-axcbpf` 0.1.0 is visible to an ordinary registry client.
 
 See [GOVERNANCE.md](GOVERNANCE.md), [CONTRIBUTING.md](CONTRIBUTING.md),
 [PROVENANCE.md](PROVENANCE.md), and [RELEASING.md](RELEASING.md).

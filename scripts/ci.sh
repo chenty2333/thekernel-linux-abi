@@ -39,6 +39,7 @@ else
     run_cargo check -p thekernel-linux-process --no-default-features --lib --locked
     run_cargo check -p thekernel-linux-signal --no-default-features --lib --locked
     run_cargo check -p thekernel-linux-cred --no-default-features --lib --locked
+    run_cargo check -p thekernel-linux-seccomp --no-default-features --lib --locked
 fi
 
 run_cargo check -p thekernel-linux-usercopy --no-default-features --lib --locked
@@ -60,6 +61,7 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
         run_cargo check -p thekernel-linux-process --no-default-features --target "$target" --locked
         run_cargo check -p thekernel-linux-signal --features multitask --target "$target" --locked
         run_cargo check -p thekernel-linux-cred --no-default-features --target "$target" --locked
+        run_cargo check -p thekernel-linux-seccomp --no-default-features --target "$target" --locked
     fi
 done
 
@@ -76,6 +78,7 @@ else
         thekernel-linux-cred
         thekernel-linux-mm
         thekernel-linux-io-uring
+        thekernel-linux-seccomp
     )
 fi
 CARGO_TOOLCHAIN=${CARGO_TOOLCHAIN:-} \
@@ -91,6 +94,9 @@ if [ "$stable_only" = 1 ]; then
         thekernel-linux-io-uring
     )
 else
+    # Seccomp is intentionally absent until the independently packaged
+    # thekernel-axcbpf 0.1.0 dependency is visible in the registry. Its exact
+    # local pre-publication archive is exercised by test-package.sh above.
     publish_list=(
         thekernel-linux-usercopy
         thekernel-linux-process

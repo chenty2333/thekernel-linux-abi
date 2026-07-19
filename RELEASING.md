@@ -9,7 +9,8 @@ bump the minor version; compatible fixes bump the patch version.
 2. Run `CARGO_TOOLCHAIN=1.85.0 ./scripts/ci.sh` for stable packages and
    `CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh` for the complete
    workspace. Both gates enforce the lockfile; stable includes MM and
-   io_uring, while nightly also covers process, signal, and credentials.
+   io_uring, while nightly also covers process, signal, credentials, and
+   seccomp.
 3. Let `scripts/test-package.sh` unpack every archive, verify provenance files,
    reject dependency `path`, `git`, or `workspace` leakage from the
    Cargo-normalized manifest, and test the unpacked source. Cargo-generated
@@ -22,7 +23,8 @@ bump the minor version; compatible fixes bump the patch version.
 6. Update the workspace and crate `CHANGELOG.md`, README, and patch ledger.
 7. Run `scripts/test-publish-dry-run.sh`. Its default set is the seven
    independently resolvable packages: usercopy, process, VFS, FD, credentials,
-   MM, and io_uring.
+   MM, and io_uring. Signal and seccomp remain deferred until their first
+   dependencies are visible in the registry.
 8. Publish only with explicit maintainer authorization. A passing dry-run is
    not authorization to upload, tag, or create a release.
 9. Download each released archive, record its checksum, audit its normalized
@@ -30,18 +32,28 @@ bump the minor version; compatible fixes bump the patch version.
 
 ## Dependency order
 
-The 0.1.0 registry order is usercopy, process, VFS, FD, MM, credentials,
-io_uring, then signal. Signal is last because its registry manifest depends on
-the published usercopy version; the other seven packages are independent.
-Credentials require the pinned nightly for fallible `allocator_api`, but do
-not depend on `kspin` or another workspace package. MM and io_uring remain
-unpublished until their semantic, package, real-consumer, and dual-architecture
-gates all pass. No empty `thekernel-linux-abi` facade is published.
+The 0.1.0 registry order begins with the seven independent packages: usercopy,
+process, VFS, FD, MM, credentials, and io_uring. Signal follows usercopy because
+its registry manifest depends on that published version. Seccomp follows the
+separate `thekernel-axcbpf` 0.1.0 release from the `thekernel-ax` repository.
+Credentials and seccomp require the pinned nightly for fallible
+`allocator_api`; neither claims a stable `rust-version`. MM, io_uring, and
+seccomp remain unpublished until their semantic, package, real-consumer, and
+dual-architecture gates all pass. No empty `thekernel-linux-abi` facade is
+published.
 
 Before the first upload, the nightly package gate builds signal together with
 the packaged usercopy archive and patches the unpacked signal test to that
 archive. This proves the source/package relationship without pretending the
 unpublished dependency already exists in the registry.
+
+The same gate packages the reviewed `thekernel-axcbpf` commit from its real Git
+checkout with that crate's Rust 1.85.0 release toolchain, then packages the
+exact `thekernel-linux-seccomp` source against a temporary local registry
+source. It verifies that seccomp's registry-form lock checksum equals that real
+axcbpf archive, removes only that registry source/checksum while patching to
+the unpacked archive, and runs the seccomp tests and no-default-feature check
+offline. This is a pre-publication source/package proof, not a registry dry-run.
 
 After an explicitly authorized usercopy upload, wait until version 0.1.0 is
 actually visible to an ordinary registry client. Do not hide this propagation
@@ -55,3 +67,14 @@ SIGNAL_REGISTRY_READY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
 Only that registry-only signal dry-run closes its publication gate. If it
 cannot resolve usercopy from the registry, wait and retry manually; do not use
 a workspace path or source patch for the final dry-run.
+
+After an explicitly authorized `thekernel-axcbpf` upload, wait until 0.1.0 is
+visible to an ordinary registry client, then run:
+
+```bash
+AXCBPF_REGISTRY_READY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
+  ./scripts/test-publish-dry-run.sh thekernel-linux-seccomp
+```
+
+Only that registry-only seccomp dry-run closes its publication gate. Do not
+set `AXCBPF_REGISTRY_READY` while relying on a path patch or sibling checkout.

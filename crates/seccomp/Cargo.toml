@@ -2,7 +2,6 @@
 name = "thekernel-linux-seccomp"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
 description = "Bounded classic-BPF and seccomp policy state for no_std Linux ABI kernels"
 license.workspace = true

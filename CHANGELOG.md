@@ -3,7 +3,7 @@
 All notable workspace releases are recorded here. Each crate also maintains a
 crate-local change and provenance ledger.
 
-## 0.1.0 - 2026-07-13
+## 0.1.0 - 2026-07-19
 
 - Establish the Linux ABI monorepo governance, provenance, release, and CI
   baseline.
@@ -37,6 +37,17 @@ crate-local change and provenance ledger.
   Linux v6.12 MISSING-only userfaultfd negotiation, canonical partial-range
   registration, resolver policy, and remap/memlock planners without page-table,
   VFS, task, usercopy, raw-pointer, or concrete fault-broker dependencies.
+- Release `thekernel-linux-io-uring` 0.1.0 as a dependency-free stable policy
+  core with checked ring geometry and SQE/registration decoding, bounded
+  request/completion/cancellation ownership, registered-file leases, and
+  explicit close/drain transitions without shared-page, FD, VFS, readiness,
+  MM-pin, task, signal, or executor ownership.
+- Prepare `thekernel-linux-seccomp` 0.1.0 as a nightly Linux-policy package over
+  the separately packaged `thekernel-axcbpf` 0.1.0 mechanism, with a strict
+  seccomp classic-BPF profile, immutable bounded ancestry, aggregate logical
+  program accounting, action precedence, and prepared task-state transitions.
 - Gate every package archive with provenance checks, rustdoc warnings,
-  registry-only normalized manifests, dual-architecture builds, unpacked
-  tests, and independent publication dry-runs.
+  registry-normalized manifests, dual-architecture builds, and unpacked tests.
+  Dependent first releases use checksum-bound packaged dependency artifacts;
+  their registry-only publication dry-runs remain deferred until those exact
+  dependency versions are actually visible.

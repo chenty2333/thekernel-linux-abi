@@ -14,6 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check out the exact classic-BPF mechanism source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: chenty2333/thekernel-ax
+          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          path: .ci-deps/thekernel-ax
+      - name: Link the external path dependency
+        run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.85.0
@@ -31,6 +39,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check out the exact classic-BPF mechanism source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: chenty2333/thekernel-ax
+          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          path: .ci-deps/thekernel-ax
+      - name: Link the external path dependency
+        run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: stable
@@ -46,6 +62,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check out the exact classic-BPF mechanism source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: chenty2333/thekernel-ax
+          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          path: .ci-deps/thekernel-ax
+      - name: Link the external path dependency
+        run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
+      - name: Install the classic-BPF package toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.85.0
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly-2025-05-20

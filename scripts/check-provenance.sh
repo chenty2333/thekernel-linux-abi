@@ -11,6 +11,7 @@ fd_dir="$repo_root/crates/fd"
 cred_dir="$repo_root/crates/cred"
 mm_dir="$repo_root/crates/mm"
 io_uring_dir="$repo_root/crates/io-uring"
+seccomp_dir="$repo_root/crates/seccomp"
 
 check_sha256() {
     local expected=$1
@@ -110,5 +111,16 @@ grep -Fq 'f9e30c9f72e3f267621c2d36aafc83e65ab76568' "$io_uring_dir/VENDOR.md"
 grep -Fq '783cd2c3dca8b6c434e955b84c20c8940588dc68' "$io_uring_dir/VENDOR.md"
 grep -Fq '80272cbeb42bcd0b39a75685a50b0009b77cd380' "$io_uring_dir/VENDOR.md"
 grep -Fq '435916bf0714a61e0fd1ebab5f6486532dedd8e4' "$io_uring_dir/VENDOR.md"
+
+check_sha256 \
+    cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 \
+    "$seccomp_dir/LICENSE"
+grep -Fq '0c6d5e68acd274f2950ec1a66fdb7787f1ab291c' "$seccomp_dir/VENDOR.md"
+grep -Fq 'a2b4f6f7e0bfbb1ca4bdf4fef45e104185749705' "$seccomp_dir/VENDOR.md"
+grep -Fq '5c34536fd766b5f84f2fb8e6b18a2ab340659582' "$seccomp_dir/VENDOR.md"
+grep -Fq 'adc218676eef25575469234709c2d87185ca223a' "$seccomp_dir/VENDOR.md"
+grep -Fq \
+    'axcbpf = { package = "thekernel-axcbpf", path = "../thekernel-ax/crates/thekernel-axcbpf", version = "=0.1.0" }' \
+    "$repo_root/Cargo.toml"
 
 printf 'provenance: PASS\n'

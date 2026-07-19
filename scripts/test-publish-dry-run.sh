@@ -36,6 +36,13 @@ for package in "${packages[@]}"; do
     case "$package" in
         thekernel-linux-usercopy|thekernel-linux-process|thekernel-linux-vfs|thekernel-linux-fd|thekernel-linux-cred|thekernel-linux-mm|thekernel-linux-io-uring)
             ;;
+        thekernel-linux-seccomp)
+            if [ "${AXCBPF_REGISTRY_READY:-0}" != 1 ]; then
+                printf '%s\n' \
+                    'seccomp registry dry-run is deferred until thekernel-axcbpf 0.1.0 is visible; set AXCBPF_REGISTRY_READY=1 only after checking the registry' >&2
+                exit 1
+            fi
+            ;;
         thekernel-linux-signal)
             if [ "${SIGNAL_REGISTRY_READY:-0}" != 1 ]; then
                 printf '%s\n' \

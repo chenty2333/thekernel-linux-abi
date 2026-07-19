@@ -1,0 +1,11 @@
+This package is a new extraction of Linux-visible seccomp policy and lifecycle
+contracts designed for TheKernel and distributed under Apache-2.0.
+
+The Linux and TheKernel snapshots listed in VENDOR.md were consulted to
+understand observable UAPI, verifier-profile, filter-stack, action, inheritance,
+and thread-synchronization contracts. No Linux source text is copied into this
+package.
+
+`thekernel-axcbpf` is an independently packaged Apache-2.0 dependency which
+provides the policy-neutral classic-BPF verifier and interpreter mechanism. It
+is not vendored into this archive.
