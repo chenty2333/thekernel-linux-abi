@@ -33,24 +33,29 @@ Version 0.1.0 provides:
 ## Layer boundary
 
 The crate owns Linux-visible values and state transitions. A Layer 1 network
-mechanism owns device taps, borrowed packet snapshots, packet-buffer lifetime,
-bounded queues, waiters, fanout dispatch, transmit admission, and driver
-completion. The TheKernel adapter owns capability and namespace checks,
-usercopy, raw struct-size validation, FD/OFD lifetime, device lookup and
-generation leases, queue locking, readiness, cmsg construction, and errno
-mapping.
+mechanism owns device taps, immutable shared-frame lifetime, bounded queue
+storage and locking, waiters/readiness, fanout dispatch, and synchronous
+transmit admission. The TheKernel adapter owns capability and namespace
+checks, security-hook dispatch, usercopy, raw struct-size validation, FD/OFD
+lifetime, current device lookup, cmsg construction, and errno mapping. The
+ordinary-queue baseline does not yet claim a hotplug generation/revocation
+lease or driver completion-credit contract.
 
-Bind publication is intentionally two phase:
+Bind publication is intentionally transactional:
 
-1. copy only the bind-consumed address fields and build `PacketBindRequest`;
+1. after the security hook, decode only the bind-consumed address fields into
+   `PacketBindRequest`;
 2. call `prepare_bind` and retain its exact expected generation;
-3. prepare or replace the lower packet tap/device lease, rolling it back on
-   failure; and
-4. under the socket publication gate, call `publish_bind`.
+3. while holding the adapter's socket-state publication mutex, validate the
+   current exact device and replace the Layer 1 selector; and
+4. call `publish_bind` before releasing that mutex.
 
-If another writer changed the binding, publication returns `StaleBindPlan`
-without changing core state. The adapter then rolls back the lower prepared
-mechanism and retries only according to its bounded syscall policy.
+A lower selector failure leaves the Linux-visible state unchanged. The current
+adapter mutex excludes another writer between prepare and publish, so a stale
+plan is an internal invariant failure rather than an unbounded retry path.
+A future adapter which prepares a revocable device lease outside that mutex
+must roll it back if `publish_bind` returns `StaleBindPlan`; this package does
+not claim that future lease exists today.
 
 `get_name` returns a normalized `SockAddrLl`. It never performs an implicit
 native-endian conversion: adapters use `protocol_network_order` only at the
