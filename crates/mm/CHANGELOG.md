@@ -14,17 +14,19 @@
 - Add rollback-safe reservation, cross-VMA ordered revalidation, read/read
   coexistence, write-exclusive overlap, mutation admission, close/teardown,
   and non-wrapping tokens.
-- Add generation-safe fault keys, typed requests/dispositions, finite admission
-  values, stale-completion validation, and a lower broker port trait without
-  claiming a concrete broker or userfaultfd implementation.
+- Add generation-safe fault keys whose identity is the address space, mapping,
+  consumer fault epoch, absolute page address, and access; typed
+  requests/dispositions; finite admission values; access-aware admission;
+  identity/coverage-only completion validation; and a lower broker port trait
+  without claiming a concrete broker or userfaultfd implementation.
 - Add a Linux v6.12 userfaultfd policy core: copyout-aware one-shot API
   negotiation, a no-optional-feature initial profile, anonymous-private
   MISSING registration, O(1)-stack all-or-none multi-VMA registration and
   mixed-handler mapping-refresh transactions, allocation-free intersection
   queries, a canonical same-handler partial-registration delta planner,
-  fail-closed mapping-lineage revalidation, non-wrapping sealed-revision
-  retirement, stateless fault permits, and checked COPY/ZEROPAGE signed-prefix
-  results.
+  fail-closed mapping-lineage revalidation, fragment-refresh/fault-epoch
+  projection and consistency helpers, non-wrapping sealed-revision retirement,
+  stateless fault permits, and checked COPY/ZEROPAGE signed-prefix results.
 - Add affine relocation, whole-remap fragment geometry, page-covering, and
   incremental memlock planners.
 - Support dependency-free `no_std`, `forbid(unsafe_code)`, Rust 1.85, RISC-V 64,

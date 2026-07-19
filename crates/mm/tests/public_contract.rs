@@ -588,17 +588,219 @@ fn commit_uffd_register_delta<const CAPACITY: usize>(
 }
 
 #[test]
-fn fault_keys_keep_absolute_page_identity_and_reject_moved_ranges() {
-    let first = uffd_snapshot(1, 30, 7, 0x1000, 2 * PAGE, MappingKind::AnonymousPrivate);
-    let second = uffd_snapshot(1, 31, 7, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
-    let first_key = FaultKey::from_address(first, 0x2001, FaultAccess::Write).unwrap();
-    let second_key = FaultKey::from_address(second, 0x9001, FaultAccess::Write).unwrap();
-    assert_eq!(first_key.page(), second_key.page());
-    assert_ne!(first_key.page_address(), second_key.page_address());
-    assert_ne!(first_key, second_key);
+fn fault_keys_keep_absolute_page_identity_across_surviving_range_splits() {
+    let original = uffd_snapshot(1, 30, 7, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let key = FaultKey::from_address(original, 0x3001, FaultAccess::Write).unwrap();
+    assert_eq!(key.page_address().get(), 0x3000);
 
-    let moved = uffd_snapshot(1, 30, 7, 0x2000, 2 * PAGE, MappingKind::AnonymousPrivate);
-    assert_eq!(first_key.revalidate(moved), Err(MmError::StaleGeneration));
+    let shifted_survivor = uffd_snapshot(1, 30, 7, 0x2000, 3 * PAGE, MappingKind::AnonymousPrivate);
+    key.revalidate_admission(shifted_survivor).unwrap();
+    key.revalidate_completion(shifted_survivor).unwrap();
+    assert_eq!(
+        key,
+        FaultKey::from_address(shifted_survivor, 0x3001, FaultAccess::Write).unwrap()
+    );
+    assert_ne!(
+        key,
+        FaultKey::from_address(shifted_survivor, 0x4001, FaultAccess::Write).unwrap()
+    );
+    let split_survivor = uffd_snapshot(1, 30, 7, 0x3000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    key.revalidate_completion(split_survivor).unwrap();
+
+    let removed_page = uffd_snapshot(1, 30, 7, 0x4000, PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        key.revalidate_completion(removed_page),
+        Err(MmError::RangeNotMapped)
+    );
+}
+
+#[test]
+fn fault_key_revalidation_rejects_authority_access_and_alignment_changes() {
+    let original = uffd_snapshot(1, 30, 7, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let key = FaultKey::from_address(original, 0x3001, FaultAccess::Write).unwrap();
+    let different_access_key = FaultKey::from_address(original, 0x3001, FaultAccess::Read).unwrap();
+    assert_ne!(key, different_access_key);
+
+    let different_address_space =
+        uffd_snapshot(2, 30, 7, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        key.revalidate_completion(different_address_space),
+        Err(MmError::StaleGeneration)
+    );
+    let replacement = uffd_snapshot(1, 31, 7, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        key.revalidate_completion(replacement),
+        Err(MmError::StaleGeneration)
+    );
+    let new_epoch = uffd_snapshot(1, 30, 8, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        key.revalidate_completion(new_epoch),
+        Err(MmError::StaleGeneration)
+    );
+
+    let read_only = MappingSnapshot::from_raw(
+        1,
+        30,
+        7,
+        0x1000,
+        4 * PAGE,
+        PAGE,
+        access(true, false, false).bits(),
+        MappingKind::AnonymousPrivate,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        key.revalidate_admission(read_only),
+        Err(MmError::AccessDenied)
+    );
+    key.revalidate_completion(read_only).unwrap();
+
+    let larger_pages = MappingSnapshot::from_raw(
+        1,
+        30,
+        7,
+        0,
+        8 * PAGE,
+        2 * PAGE,
+        access(true, true, false).bits(),
+        MappingKind::AnonymousPrivate,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        key.revalidate_completion(larger_pages),
+        Err(MmError::Unaligned)
+    );
+}
+
+#[test]
+fn userfaultfd_refreshed_fragments_preserve_the_source_fault_epoch() {
+    let api = initialized_uffd_api();
+    let source = uffd_snapshot(7, 70, 11, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<2>::new(1).unwrap();
+    let registration = table
+        .register(&api, uffd_registration_request(9, source, source.range()))
+        .unwrap();
+    assert_eq!(
+        table
+            .epoch_for_mapping(source.address_space(), source.mapping())
+            .unwrap(),
+        Some(source.generation())
+    );
+
+    let survivor = MappingSnapshot::from_raw(
+        7,
+        70,
+        99,
+        0x3000,
+        2 * PAGE,
+        PAGE,
+        access(false, false, false).bits(),
+        MappingKind::AnonymousPrivate,
+        true,
+        false,
+    )
+    .unwrap();
+    let projected = survivor.with_generation(registration.generation());
+    assert_eq!(projected.address_space(), survivor.address_space());
+    assert_eq!(projected.mapping(), survivor.mapping());
+    assert_eq!(projected.generation(), registration.generation());
+    assert_eq!(projected.range(), survivor.range());
+    assert_eq!(projected.access(), survivor.access());
+    assert_eq!(projected.kind(), survivor.kind());
+    assert_eq!(
+        projected.long_term_pinnable(),
+        survivor.long_term_pinnable()
+    );
+    assert_eq!(
+        projected.writable_file_pin_supported(),
+        survivor.writable_file_pin_supported()
+    );
+    let retained_range = PageRange::new(0x3000, PAGE, PAGE).unwrap();
+    let retained = registration
+        .refreshed_fragment(survivor, retained_range)
+        .unwrap();
+    assert_eq!(retained.handler(), registration.handler());
+    assert_eq!(retained.address_space(), registration.address_space());
+    assert_eq!(retained.mapping(), registration.mapping());
+    assert_eq!(retained.generation(), registration.generation());
+    assert_ne!(retained.generation(), survivor.generation());
+    assert_eq!(retained.range(), retained_range);
+    assert_eq!(retained.mode(), registration.mode());
+
+    let replacement = UffdRegistrationReplacement::new(registration.id(), retained);
+    let plan = table
+        .preflight_mapping_replace(&[registration.id()], &[replacement])
+        .unwrap();
+    table
+        .commit_mapping_replace(plan, &[registration.id()], &[replacement], |_| {})
+        .unwrap();
+    assert_eq!(
+        table
+            .epoch_for_mapping(source.address_space(), source.mapping())
+            .unwrap(),
+        Some(source.generation())
+    );
+
+    let foreign_mapping = uffd_snapshot(7, 71, 99, 0x3000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        registration.refreshed_fragment(foreign_mapping, retained_range),
+        Err(MmError::StaleGeneration)
+    );
+    let outside_current = PageRange::new(0x5000, PAGE, PAGE).unwrap();
+    assert_eq!(
+        registration.refreshed_fragment(survivor, outside_current),
+        Err(MmError::RangeNotMapped)
+    );
+}
+
+#[test]
+fn userfaultfd_refreshed_fragment_preserves_epoch_across_in_place_grow() {
+    let api = initialized_uffd_api();
+    let old = uffd_snapshot(9, 90, 21, 0x1000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<1>::new(1).unwrap();
+    let registration = table
+        .register(&api, uffd_registration_request(12, old, old.range()))
+        .unwrap();
+    let grown = uffd_snapshot(9, 90, 22, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+
+    let refreshed = registration
+        .refreshed_fragment(grown, grown.range())
+        .unwrap();
+    assert_eq!(refreshed.range(), grown.range());
+    assert_eq!(refreshed.handler(), registration.handler());
+    assert_eq!(refreshed.mapping(), registration.mapping());
+    assert_eq!(refreshed.generation(), registration.generation());
+    assert_ne!(refreshed.generation(), grown.generation());
+    assert_eq!(refreshed.mode(), registration.mode());
+}
+
+#[test]
+fn userfaultfd_mapping_epoch_lookup_fails_closed_on_inconsistent_fragments() {
+    let api = initialized_uffd_api();
+    let first = uffd_snapshot(8, 80, 11, 0x1000, PAGE, MappingKind::AnonymousPrivate);
+    let second = uffd_snapshot(8, 80, 12, 0x2000, PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<2>::new(1).unwrap();
+    table
+        .register(&api, uffd_registration_request(9, first, first.range()))
+        .unwrap();
+    table
+        .register(&api, uffd_registration_request(9, second, second.range()))
+        .unwrap();
+
+    assert_eq!(
+        table.epoch_for_mapping(first.address_space(), first.mapping()),
+        Err(MmError::StaleGeneration)
+    );
+    assert_eq!(
+        table
+            .epoch_for_mapping(first.address_space(), MappingId::new(81).unwrap())
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -1335,6 +1537,35 @@ fn userfaultfd_fault_policy_uses_lower_broker_permits_without_queue_state() {
         UffdFaultPolicy::prepare_completion(request, mapping, FaultDisposition::ZeroFill).unwrap();
     assert_eq!(completion.request(), request);
     assert_eq!(completion.disposition(), FaultDisposition::ZeroFill);
+
+    let protected = MappingSnapshot::from_raw(
+        2,
+        60,
+        4,
+        0x8000,
+        2 * PAGE,
+        PAGE,
+        access(false, false, false).bits(),
+        MappingKind::AnonymousPrivate,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            protected,
+            request,
+            capacity,
+            FaultLoad::new(0, 0, 0),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::AccessDenied)
+    );
+    let protected_completion =
+        UffdFaultPolicy::prepare_completion(request, protected, FaultDisposition::Supply).unwrap();
+    assert_eq!(protected_completion.request(), request);
+    assert_eq!(protected_completion.disposition(), FaultDisposition::Supply);
 }
 
 #[test]

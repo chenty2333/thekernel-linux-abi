@@ -356,6 +356,10 @@ impl UffdRegistrationId {
 }
 
 /// Validated request to own one anonymous-private MISSING interval.
+///
+/// The mapping generation is the adapter-supplied registration/fault epoch.
+/// Refreshing fragments after `mprotect` or a topology-only split preserves
+/// this epoch; replacing the logical mapping must supply new authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UffdRegistrationRequest {
     handler: FaultHandlerId,
@@ -459,6 +463,38 @@ impl UffdRegistration {
         UffdIoctls::MISSING_RANGE_PROFILE
     }
 
+    /// Builds one split/trim/grow refresh fragment without adopting a topology
+    /// snapshot's generation or access.
+    ///
+    /// The fragment must be covered by the current anonymous-private mapping
+    /// snapshot and retain the source registration's page geometry. The
+    /// address-space and logical mapping identities must still match. The new
+    /// range may extend beyond the old interval for an in-place mapping grow.
+    /// On success the request preserves this registration's handler, mapping,
+    /// registration/fault epoch, and mode.
+    pub fn refreshed_fragment(
+        self,
+        current: MappingSnapshot,
+        range: PageRange,
+    ) -> Result<UffdRegistrationRequest, MmError> {
+        if self.address_space() != current.address_space() || self.mapping() != current.mapping() {
+            return Err(MmError::StaleGeneration);
+        }
+        if current.kind() != MappingKind::AnonymousPrivate {
+            return Err(MmError::UnsupportedUffdMapping);
+        }
+        if self.range().page_size() != range.page_size()
+            || current.range().page_size() != range.page_size()
+            || !current.range().contains(range)
+        {
+            return Err(MmError::RangeNotMapped);
+        }
+        Ok(UffdRegistrationRequest {
+            range,
+            ..self.request
+        })
+    }
+
     /// Revalidates the mapping before the adapter publishes or resolves a fault.
     pub fn revalidate(self, current: MappingSnapshot) -> Result<(), MmError> {
         if self.address_space() != current.address_space()
@@ -476,8 +512,9 @@ impl UffdRegistration {
         Ok(())
     }
 
-    /// Proves that a delegated MISSING request belongs to this exact interval.
-    pub fn validate_fault(
+    /// Proves at admission that a delegated MISSING request belongs to this
+    /// exact interval and that its recorded access is currently permitted.
+    pub fn validate_fault_admission(
         self,
         current: MappingSnapshot,
         request: FaultRequest,
@@ -495,7 +532,7 @@ impl UffdRegistration {
         {
             return Err(MmError::UffdRegistrationMismatch);
         }
-        request.key().revalidate(current)
+        request.key().revalidate_admission(current)
     }
 }
 
@@ -1345,6 +1382,28 @@ impl<const CAPACITY: usize> UffdRegistrationTable<CAPACITY> {
         self.records.iter().flatten().copied()
     }
 
+    /// Returns the single registration/fault epoch for one logical mapping.
+    ///
+    /// No matching registration returns `None`. If live fragments disagree on
+    /// the epoch, the table fails closed instead of choosing one lineage.
+    pub fn epoch_for_mapping(
+        &self,
+        address_space: AddressSpaceId,
+        mapping: MappingId,
+    ) -> Result<Option<MappingGeneration>, MmError> {
+        let mut epoch = None;
+        for registration in self.records.iter().flatten().copied() {
+            if registration.address_space() != address_space || registration.mapping() != mapping {
+                continue;
+            }
+            if epoch.is_some_and(|expected| expected != registration.generation()) {
+                return Err(MmError::StaleGeneration);
+            }
+            epoch = Some(registration.generation());
+        }
+        Ok(epoch)
+    }
+
     /// Live registrations intersecting one address-space range.
     ///
     /// The adapter can collect IDs into its own preallocated buffer before
@@ -1495,11 +1554,12 @@ impl UffdFaultPolicy {
         load: FaultLoad,
         lifecycle: FaultLifecycleState,
     ) -> Result<FaultAdmissionPermit, MmError> {
-        registration.validate_fault(current, request)?;
+        registration.validate_fault_admission(current, request)?;
         FaultAdmission::check(request, current, capacity, load, lifecycle)
     }
 
-    /// Revalidates one lower ticket's request before irreversible resolution.
+    /// Revalidates one lower ticket's identity and page coverage before
+    /// irreversible resolution, without rechecking post-admission access.
     pub fn prepare_completion(
         request: FaultRequest,
         current: MappingSnapshot,

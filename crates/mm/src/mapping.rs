@@ -175,6 +175,16 @@ impl MappingSnapshot {
         self.writable_file_pin_supported
     }
 
+    /// Returns the same mechanism/policy facts with a caller-selected
+    /// generation.
+    ///
+    /// A userfaultfd adapter can project a current VMA snapshot onto the
+    /// registration/fault epoch before key revalidation without rebuilding or
+    /// accidentally changing any other field.
+    pub const fn with_generation(self, generation: MappingGeneration) -> Self {
+        Self { generation, ..self }
+    }
+
     /// Creates the immutable identity/generation expectation for later revalidation.
     pub const fn expected(self) -> ExpectedMapping {
         ExpectedMapping {

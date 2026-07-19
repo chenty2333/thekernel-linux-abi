@@ -13,27 +13,11 @@ pub enum FaultAccess {
     Execute,
 }
 
-/// Page offset relative to the mapping's first page.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PageOffset(u64);
-
-impl PageOffset {
-    /// Builds an offset. Zero is the first page and is valid.
-    pub const fn new(pages: u64) -> Self {
-        Self(pages)
-    }
-
-    /// Relative page count.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
 /// Absolute, page-aligned userspace address identifying a delegated fault page.
 ///
-/// This is deliberately part of [`FaultKey`] identity. A relative page offset
-/// alone can collide when a consumer supplies an address-space-wide mapping
-/// identity for multiple VMAs.
+/// This is deliberately part of [`FaultKey`] identity. Unlike a VMA-relative
+/// offset, it remains stable when one logical mapping is split or its surviving
+/// range acquires a different start address.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FaultPageAddress(usize);
 
@@ -76,14 +60,20 @@ nonzero_fault_id!(
     "Consumer-owned identity of a queued fault request."
 );
 
-/// Stable mapping-generation key for one delegated fault page.
+/// Stable authority key for one delegated fault page.
+///
+/// Identity is exactly the address space, logical mapping, consumer-supplied
+/// fault epoch, absolute page address, and access. For a userfaultfd adapter,
+/// the generation is the registration/fault epoch: topology-only VMA splits
+/// and `mprotect` preserve it, while mapping replacement allocates a new epoch.
+/// Handler detach/close revokes the separate [`FaultHandlerId`] authority at
+/// the broker lifecycle boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FaultKey {
     address_space: crate::AddressSpaceId,
     mapping: crate::MappingId,
     generation: crate::MappingGeneration,
     page_address: FaultPageAddress,
-    page: PageOffset,
     access: FaultAccess,
 }
 
@@ -98,16 +88,11 @@ impl FaultKey {
             return Err(MmError::RangeNotMapped);
         }
         Self::check_access(snapshot, access)?;
-        let byte_offset = address
-            .checked_sub(snapshot.range().start())
-            .ok_or(MmError::Overflow)?;
-        let page = byte_offset / snapshot.range().page_size().bytes();
         Ok(Self {
             address_space: snapshot.address_space(),
             mapping: snapshot.mapping(),
             generation: snapshot.generation(),
             page_address: FaultPageAddress(snapshot.range().page_size().align_down(address)),
-            page: PageOffset::new(u64::try_from(page).map_err(|_| MmError::Overflow)?),
             access,
         })
     }
@@ -122,7 +107,7 @@ impl FaultKey {
         self.mapping
     }
 
-    /// Mapping generation frozen at fault admission.
+    /// Consumer-supplied mapping or registration/fault epoch frozen at admission.
     pub const fn generation(self) -> crate::MappingGeneration {
         self.generation
     }
@@ -132,18 +117,25 @@ impl FaultKey {
         self.page_address
     }
 
-    /// Relative page offset.
-    pub const fn page(self) -> PageOffset {
-        self.page
-    }
-
     /// Fault access.
     pub const fn access(self) -> FaultAccess {
         self.access
     }
 
-    /// Revalidates identity, generation, page coverage, and access.
-    pub fn revalidate(self, current: MappingSnapshot) -> Result<(), MmError> {
+    /// Revalidates authority, page coverage/alignment, and current fault access
+    /// before admitting a task to the lower broker.
+    pub fn revalidate_admission(self, current: MappingSnapshot) -> Result<(), MmError> {
+        self.revalidate_completion(current)?;
+        Self::check_access(current, self.access)
+    }
+
+    /// Revalidates authority and absolute page coverage/alignment before
+    /// irreversible resolver publication.
+    ///
+    /// This deliberately does not recheck current access. A userfaultfd
+    /// MISSING request may remain resolvable after `mprotect(PROT_NONE)`; the
+    /// blocked fault retries and observes the new protection after resolution.
+    pub fn revalidate_completion(self, current: MappingSnapshot) -> Result<(), MmError> {
         if self.address_space != current.address_space()
             || self.mapping != current.mapping()
             || self.generation != current.generation()
@@ -164,16 +156,7 @@ impl FaultKey {
         {
             return Err(MmError::Unaligned);
         }
-        let relative = self
-            .page_address
-            .get()
-            .checked_sub(current.range().start())
-            .ok_or(MmError::RangeNotMapped)?
-            / current.range().page_size().bytes();
-        if self.page.get() != u64::try_from(relative).map_err(|_| MmError::Overflow)? {
-            return Err(MmError::StaleGeneration);
-        }
-        Self::check_access(current, self.access)
+        Ok(())
     }
 
     fn check_access(snapshot: MappingSnapshot, access: FaultAccess) -> Result<(), MmError> {
@@ -385,7 +368,7 @@ impl FaultAdmission {
             FaultLifecycleState::Detached => return Err(MmError::TearingDown),
             FaultLifecycleState::Closed => return Err(MmError::Closed),
         }
-        request.key.revalidate(current)?;
+        request.key.revalidate_admission(current)?;
         if load.address_space >= capacity.per_address_space
             || load.handler >= capacity.per_handler
             || load.global >= capacity.global
@@ -436,7 +419,7 @@ pub fn validate_fault_completion(
     current: MappingSnapshot,
     disposition: FaultDisposition,
 ) -> Result<FaultCompletionPermit, MmError> {
-    request.key.revalidate(current)?;
+    request.key.revalidate_completion(current)?;
     Ok(FaultCompletionPermit {
         request,
         disposition,

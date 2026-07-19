@@ -26,9 +26,10 @@ Version 0.1.0 provides:
   non-wrapping tokens, and explicit close/teardown states;
 - cross-VMA pin publication through ordered `revalidate_next` calls, so an SG
   I/O range is not incorrectly forced into one backend or mapping snapshot;
-- generation-safe `FaultKey`, typed fault requests/dispositions, finite
-  capacity admission values, stale-reply validation, and a `FaultPort` seam for
-  a lower generic broker;
+- generation-safe `FaultKey` identity over address space, logical mapping,
+  consumer fault epoch, absolute page address, and access; typed fault
+  requests/dispositions; finite capacity admission values; stale-reply
+  validation; and a `FaultPort` seam for a lower generic broker;
 - a Linux v6.12 userfaultfd policy core with transactional API negotiation,
   anonymous-private MISSING registrations, O(1)-stack multi-VMA
   preflight/commit and mapping-refresh transactions, and checked
@@ -96,6 +97,21 @@ Allocation-free table/intersection iterators let the adapter collect affected
 IDs into its own bounded storage first. A saturated table revision is sealed
 against publication but still permits revalidated pure removal, unregister,
 detach, and final teardown without wrapping.
+
+For userfaultfd, the generation supplied to `FaultKey` is a
+registration/fault epoch, not the current VMA start. An `mprotect` or
+topology-only split refreshes the registration fragments while preserving that
+epoch, so a pending key continues to identify the same absolute page in a
+surviving fragment. A replacement mapping receives new mapping/epoch authority;
+handler detach or final close revokes the independent handler authority in the
+lower broker. `refreshed_fragment` constructs split/trim/grow requests without
+adopting a topology snapshot's generation or access, and `epoch_for_mapping`
+fails closed if live fragments disagree on their fault epoch. Revalidation
+still requires exact address-space, mapping, epoch, page coverage, and
+alignment. Admission additionally checks the fault access. Resolver/completion
+validation deliberately does not: a MISSING fault blocked before
+`mprotect(PROT_NONE)` may still be populated, then its retry observes the new
+protection.
 
 COPY accepts only zero or `DONTWAKE` mode; COPY-WP is recognized but rejected.
 ZEROPAGE likewise accepts only zero or `DONTWAKE`. Positive lower completion

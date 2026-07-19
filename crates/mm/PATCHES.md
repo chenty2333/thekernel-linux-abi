@@ -34,14 +34,20 @@
 - Add explicit mutation, close, and teardown admission instead of warning and
   clearing live pin state.
 - Keep the fault surface to typed values, finite policy admission, stale reply
-  validation, and a lower port trait. Concrete broker queues, waiters,
-  observers, wakeups, readiness, and coalescing remain generic VM mechanisms.
+  validation, and a lower port trait. Fault identity uses an absolute page plus
+  caller-owned mapping/fault epoch, so a surviving VMA split does not make an
+  unchanged page relative to a new range start. Admission checks current
+  access, while resolver/completion revalidates identity and coverage without
+  rejecting a page install solely because a later protection change will make
+  the retried fault fail. Concrete broker queues, waiters, observers, wakeups,
+  readiness, and coalescing remain generic VM mechanisms.
 - Add Linux v6.12 userfaultfd policy without importing a second queue:
   transactional API negotiation, bounded MISSING registration ownership,
   constant-stack multi-VMA preflight/commit, mixed-handler mapping
   split/trim/grow refresh, canonical subset/extension/bridge registration
-  deltas with fail-closed lineage checks, and COPY/ZEROPAGE mode/progress
-  classification all remain above the generic `FaultPort` broker.
+  deltas with fail-closed lineage checks, fragment-refresh/fault-epoch
+  projection, and COPY/ZEROPAGE mode/progress classification all remain above
+  the generic `FaultPort` broker.
 - Export canonical affine-origin relocation so consumers can remove duplicate
   syscall/backend arithmetic.
 
