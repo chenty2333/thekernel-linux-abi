@@ -139,6 +139,80 @@ impl PacketBindRequest {
     }
 }
 
+/// Validated address fields consumed by Linux's ordinary packet send path.
+///
+/// This is intentionally distinct from [`SockAddrLl`]. Receive/name output
+/// uses `sll_halen` to delimit a canonical address, while Linux packet send
+/// treats the complete `sll_addr` field as device input and uses `sll_halen`
+/// only for the enclosing sockaddr-length check. Keeping the raw bytes here
+/// prevents a declared zero length from erasing a valid cooked destination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketSendAddress {
+    interface: InterfaceIndex,
+    protocol: ProtocolSelector,
+    declared_address_len: u8,
+    raw_address: [u8; MAX_LINK_LAYER_ADDRESS_LEN],
+}
+
+impl PacketSendAddress {
+    /// Validates the bounded fields copied from an explicit `sockaddr_ll`.
+    ///
+    /// Address family, hardware type, and packet type are absent because the
+    /// Linux packet send path ignores them. A zero interface or protocol stays
+    /// zero; an explicit destination never inherits those fields from bind.
+    pub const fn try_from_network_order_fields(
+        protocol_network_order: u16,
+        interface_index: i32,
+        declared_address_len: u8,
+        raw_address: [u8; MAX_LINK_LAYER_ADDRESS_LEN],
+    ) -> Result<Self, PacketError> {
+        if declared_address_len as usize > MAX_LINK_LAYER_ADDRESS_LEN {
+            return Err(PacketError::InvalidHardwareAddressLength);
+        }
+        let interface = match InterfaceIndex::from_raw(interface_index) {
+            Ok(interface) => interface,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            interface,
+            protocol: ProtocolSelector::from_network_order_u16(protocol_network_order),
+            declared_address_len,
+            raw_address,
+        })
+    }
+
+    /// Explicit wildcard/positive interface copied from `sll_ifindex`.
+    pub const fn interface(self) -> InterfaceIndex {
+        self.interface
+    }
+
+    /// Explicit protocol copied from `sll_protocol`, including zero.
+    pub const fn protocol(self) -> ProtocolSelector {
+        self.protocol
+    }
+
+    /// Caller-declared `sll_halen`, retained for length-contract evidence.
+    pub const fn declared_address_len(self) -> u8 {
+        self.declared_address_len
+    }
+
+    /// Complete raw `sll_addr` bytes, independent of `sll_halen`.
+    pub const fn raw_address(self) -> [u8; MAX_LINK_LAYER_ADDRESS_LEN] {
+        self.raw_address
+    }
+
+    /// Selects exactly the address width required by the target device.
+    ///
+    /// Linux passes `sll_addr` to the device header builder, whose address
+    /// width is a device property rather than the caller's `sll_halen` value.
+    pub fn address_for_device(
+        self,
+        device_address_len: u8,
+    ) -> Result<LinkLayerAddress, PacketError> {
+        LinkLayerAddress::new(self.raw_address, device_address_len)
+    }
+}
+
 /// Canonical length-delimited link-layer address.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LinkLayerAddress {
@@ -358,6 +432,25 @@ mod tests {
         assert_eq!(extension.packet_type().raw(), 0xff);
         assert_eq!(
             SockAddrLl::try_from_network_order_fields(AF_PACKET, 0, 0, 0, 0, 9, [0; 8]),
+            Err(PacketError::InvalidHardwareAddressLength)
+        );
+    }
+
+    #[test]
+    fn send_address_preserves_raw_bytes_independent_of_declared_halen() {
+        let raw = [2, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xcc, 0xdd];
+        let address = PacketSendAddress::try_from_network_order_fields(0, 0, 0, raw).unwrap();
+        assert!(address.interface().is_any());
+        assert_eq!(address.protocol(), ProtocolSelector::Disabled);
+        assert_eq!(address.declared_address_len(), 0);
+        assert_eq!(address.raw_address(), raw);
+        assert_eq!(address.address_for_device(6).unwrap().as_bytes(), &raw[..6]);
+        assert_eq!(
+            PacketSendAddress::try_from_network_order_fields(0, -1, 0, raw),
+            Err(PacketError::InvalidInterfaceIndex)
+        );
+        assert_eq!(
+            PacketSendAddress::try_from_network_order_fields(0, 1, 9, raw),
             Err(PacketError::InvalidHardwareAddressLength)
         );
     }

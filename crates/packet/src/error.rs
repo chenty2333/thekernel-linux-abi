@@ -14,6 +14,8 @@ pub enum PacketError {
     InvalidInterfaceIndex,
     /// A copied link-layer address length exceeds `sockaddr_ll::sll_addr`.
     InvalidHardwareAddressLength,
+    /// A supported packet option value is outside its Linux UAPI domain.
+    InvalidPacketOptionValue,
     /// A caller attempted to construct the reserved zero binding generation.
     InvalidBindingGeneration,
     /// A network-header offset lies beyond the complete frame.

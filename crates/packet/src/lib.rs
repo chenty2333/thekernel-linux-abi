@@ -21,7 +21,7 @@ mod statistics;
 
 pub use address::{
     AF_PACKET, InterfaceIndex, LinkLayerAddress, LinkLayerInfo, MAX_LINK_LAYER_ADDRESS_LEN,
-    PacketBindRequest, PacketType, SockAddrLl,
+    PacketBindRequest, PacketSendAddress, PacketType, SockAddrLl,
 };
 pub use error::PacketError;
 pub use options::{

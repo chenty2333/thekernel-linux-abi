@@ -1,9 +1,9 @@
 use thekernel_linux_packet::{
     AF_PACKET, BindPublication, DeliveryDecision, DeliveryDirection, FrameLayout, GetPacketOption,
     InterfaceIndex, LinkLayerAddress, LinkLayerInfo, MSG_PEEK, MSG_TRUNC, PacketBindRequest,
-    PacketError, PacketOption, PacketOptionOperation, PacketOptionValue, PacketSocketState,
-    PacketSocketType, PacketStatistics, ProtocolSelector, QueueDisposition, ReceiveFlags,
-    SetPacketOption,
+    PacketError, PacketOption, PacketOptionOperation, PacketOptionValue, PacketSendAddress,
+    PacketSocketState, PacketSocketType, PacketStatistics, ProtocolSelector, QueueDisposition,
+    ReceiveFlags, SetPacketOption,
 };
 
 #[test]
@@ -24,6 +24,15 @@ fn normalized_bind_receive_and_statistics_contract_is_public() {
     assert_eq!(name.protocol().host_order(), 0x0800);
     assert_eq!(name.protocol_network_order(), 0x0800_u16.to_be());
     assert_eq!(name.address().as_bytes(), &[2, 0, 0, 0, 0, 1]);
+
+    let raw_destination = [2, 0x66, 0x77, 0x88, 0x99, 0xaa, 7, 8];
+    let send_address =
+        PacketSendAddress::try_from_network_order_fields(0, 11, 0, raw_destination).unwrap();
+    assert_eq!(send_address.protocol(), ProtocolSelector::Disabled);
+    assert_eq!(
+        send_address.address_for_device(6).unwrap().as_bytes(),
+        &raw_destination[..6]
+    );
 
     let flags = ReceiveFlags::from_bits(MSG_PEEK | MSG_TRUNC).unwrap();
     let view = FrameLayout::new(128, 14)
@@ -60,6 +69,10 @@ fn normalized_bind_receive_and_statistics_contract_is_public() {
 
     socket.set_option(SetPacketOption::decode(PacketOption::IgnoreOutgoing.raw(), 1).unwrap());
     assert!(socket.ignore_outgoing());
+    assert_eq!(
+        SetPacketOption::decode(PacketOption::IgnoreOutgoing.raw(), 2),
+        Err(PacketError::InvalidPacketOptionValue)
+    );
 
     assert_eq!(
         GetPacketOption::decode(PacketOption::Statistics.raw()),

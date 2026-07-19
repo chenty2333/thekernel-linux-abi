@@ -101,7 +101,7 @@ pub enum PacketOptionOperation {
 /// Supported first-stage packet option mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SetPacketOption {
-    /// Set `PACKET_IGNORE_OUTGOING`; Linux treats every nonzero int as true.
+    /// Set `PACKET_IGNORE_OUTGOING`; Linux accepts only integer zero or one.
     IgnoreOutgoing(bool),
 }
 
@@ -113,7 +113,11 @@ impl SetPacketOption {
             Err(error) => return Err(error),
         };
         match option {
-            PacketOption::IgnoreOutgoing => Ok(Self::IgnoreOutgoing(integer_value != 0)),
+            PacketOption::IgnoreOutgoing => match integer_value {
+                0 => Ok(Self::IgnoreOutgoing(false)),
+                1 => Ok(Self::IgnoreOutgoing(true)),
+                _ => Err(PacketError::InvalidPacketOptionValue),
+            },
             _ => Err(PacketError::UnsupportedPacketOption {
                 option,
                 operation: PacketOptionOperation::Set,
@@ -165,8 +169,12 @@ mod tests {
     #[test]
     fn supported_and_known_unsupported_options_are_distinct() {
         assert_eq!(
-            SetPacketOption::decode(PacketOption::IgnoreOutgoing.raw(), -7),
+            SetPacketOption::decode(PacketOption::IgnoreOutgoing.raw(), 1),
             Ok(SetPacketOption::IgnoreOutgoing(true))
+        );
+        assert_eq!(
+            SetPacketOption::decode(PacketOption::IgnoreOutgoing.raw(), -7),
+            Err(PacketError::InvalidPacketOptionValue)
         );
         assert_eq!(
             GetPacketOption::decode(PacketOption::Statistics.raw()),
