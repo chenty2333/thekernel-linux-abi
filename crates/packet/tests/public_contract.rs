@@ -108,3 +108,36 @@ fn unsupported_surface_is_never_silently_accepted() {
         Err(PacketError::UnsupportedSocketType)
     );
 }
+
+#[test]
+fn public_interface_indexes_have_one_validated_representation() {
+    assert_eq!(InterfaceIndex::default(), InterfaceIndex::Any);
+    assert!(matches!(InterfaceIndex::default(), InterfaceIndex::Any));
+    assert_eq!(format!("{:?}", InterfaceIndex::Any), "Any");
+    assert!(InterfaceIndex::Any.is_any());
+    assert_eq!(InterfaceIndex::Any.raw(), 0);
+    assert_eq!(InterfaceIndex::Any.exact_value(), None);
+
+    let first = InterfaceIndex::from_raw(1).unwrap();
+    assert!(!first.is_any());
+    assert_eq!(first.raw(), 1);
+    assert_eq!(first.exact_value(), Some(1));
+    assert_eq!(format!("{first:?}"), "Exact(1)");
+
+    let maximum = InterfaceIndex::exact(i32::MAX as u32).unwrap();
+    assert_eq!(maximum.raw(), i32::MAX);
+    assert_eq!(maximum.exact_value(), Some(i32::MAX as u32));
+
+    assert_eq!(
+        InterfaceIndex::from_raw(-1),
+        Err(PacketError::InvalidInterfaceIndex)
+    );
+    assert_eq!(
+        InterfaceIndex::exact(0),
+        Err(PacketError::InvalidInterfaceIndex)
+    );
+    assert_eq!(
+        InterfaceIndex::exact(i32::MAX as u32 + 1),
+        Err(PacketError::InvalidInterfaceIndex)
+    );
+}

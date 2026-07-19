@@ -13,7 +13,7 @@ Version 0.1.0 provides:
   validated `Exact` states, while network byte order appears only in explicitly
   named conversion functions and the socket integer keeps Linux's low-16-bit
   cast behavior;
-- validated `InterfaceIndex`, canonical bounded link addresses, forward-
+- opaque, validated `InterfaceIndex`, canonical bounded link addresses, forward-
   compatible packet-type bytes, and normalized `SockAddrLl` values;
 - bind-only decoding which consumes only family, protocol, and interface so
   ignored `sockaddr_ll` fields cannot make bind stricter than Linux;

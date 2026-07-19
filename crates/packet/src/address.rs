@@ -1,4 +1,4 @@
-use core::num::NonZeroI32;
+use core::{fmt, num::NonZeroI32};
 
 use crate::{PacketError, ProtocolSelector};
 
@@ -8,23 +8,32 @@ pub const AF_PACKET: u16 = 17;
 pub const MAX_LINK_LAYER_ADDRESS_LEN: usize = 8;
 
 /// Wildcard or exact positive Linux interface index.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum InterfaceIndex {
-    /// Bind to every current interface.
-    #[default]
-    Any,
-    /// Bind to one positive interface index.
-    Exact(NonZeroI32),
-}
+///
+/// The representation is private so callers cannot bypass [`Self::exact`] or
+/// [`Self::from_raw`] with a negative `NonZeroI32`.
+///
+/// ```compile_fail
+/// use core::num::NonZeroI32;
+/// use thekernel_linux_packet::InterfaceIndex;
+///
+/// let negative = NonZeroI32::new(-1).unwrap();
+/// let _ = InterfaceIndex::Exact(negative);
+/// ```
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InterfaceIndex(Option<NonZeroI32>);
 
 impl InterfaceIndex {
+    /// Bind to every current interface.
+    #[allow(non_upper_case_globals)]
+    pub const Any: Self = Self(None);
+
     /// Validates a copied signed Linux interface index.
     pub const fn from_raw(raw: i32) -> Result<Self, PacketError> {
         if raw < 0 {
             return Err(PacketError::InvalidInterfaceIndex);
         }
         match NonZeroI32::new(raw) {
-            Some(index) => Ok(Self::Exact(index)),
+            Some(index) => Ok(Self(Some(index))),
             None => Ok(Self::Any),
         }
     }
@@ -35,22 +44,45 @@ impl InterfaceIndex {
             return Err(PacketError::InvalidInterfaceIndex);
         }
         match NonZeroI32::new(raw as i32) {
-            Some(index) => Ok(Self::Exact(index)),
+            Some(index) => Ok(Self(Some(index))),
             None => Err(PacketError::InvalidInterfaceIndex),
         }
     }
 
     /// Returns zero for wildcard or the positive Linux interface index.
     pub const fn raw(self) -> i32 {
-        match self {
-            Self::Any => 0,
-            Self::Exact(index) => index.get(),
+        match self.0 {
+            Some(index) => index.get(),
+            None => 0,
         }
     }
 
     /// Returns whether this is the wildcard interface selection.
     pub const fn is_any(self) -> bool {
-        matches!(self, Self::Any)
+        self.0.is_none()
+    }
+
+    /// Returns the exact positive interface index, or `None` for wildcard.
+    pub const fn exact_value(self) -> Option<u32> {
+        match self.0 {
+            Some(index) => Some(index.get() as u32),
+            None => None,
+        }
+    }
+}
+
+impl Default for InterfaceIndex {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+impl fmt::Debug for InterfaceIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.exact_value() {
+            Some(index) => formatter.debug_tuple("Exact").field(&index).finish(),
+            None => formatter.write_str("Any"),
+        }
     }
 }
 
@@ -463,7 +495,16 @@ mod tests {
     #[test]
     fn exact_interface_is_positive_and_representable() {
         assert_eq!(InterfaceIndex::from_raw(0).unwrap(), InterfaceIndex::Any);
-        assert_eq!(InterfaceIndex::exact(1).unwrap().raw(), 1);
+        assert_eq!(InterfaceIndex::Any.exact_value(), None);
+        let first = InterfaceIndex::exact(1).unwrap();
+        assert_eq!(first.raw(), 1);
+        assert_eq!(first.exact_value(), Some(1));
+        let maximum = InterfaceIndex::from_raw(i32::MAX).unwrap();
+        assert_eq!(maximum.exact_value(), Some(i32::MAX as u32));
+        assert_eq!(
+            InterfaceIndex::from_raw(-1),
+            Err(PacketError::InvalidInterfaceIndex)
+        );
         assert_eq!(
             InterfaceIndex::exact(0),
             Err(PacketError::InvalidInterfaceIndex)
