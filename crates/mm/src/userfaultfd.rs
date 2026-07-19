@@ -813,6 +813,23 @@ impl<const CAPACITY: usize> UffdRegistrationTable<CAPACITY> {
         self.plan_register_delta(intent, vmas)
     }
 
+    /// Validates the API gate and current VMA profile for UFFDIO_UNREGISTER.
+    ///
+    /// `vmas` contains every current mapping fragment intersecting `range` in
+    /// strictly increasing, non-overlapping order. At least one compatible
+    /// anonymous-private fragment is required; gaps in the raw range are
+    /// allowed. The returned address-space identity is common to every
+    /// fragment and can bind the adapter's subsequent removal transaction.
+    pub fn validate_unregister_vmas(
+        &self,
+        api: &UffdApiState,
+        range: PageRange,
+        vmas: &[MappingSnapshot],
+    ) -> Result<AddressSpaceId, MmError> {
+        api.require_initialized()?;
+        Self::validate_vma_profile(range, vmas)
+    }
+
     /// Replays a preflighted canonical delta into caller-owned bounded storage.
     ///
     /// Both callbacks must be infallible. The adapter first checks its storage
@@ -1013,7 +1030,7 @@ impl<const CAPACITY: usize> UffdRegistrationTable<CAPACITY> {
         intent: UffdRegistrationIntent,
         vmas: &[MappingSnapshot],
     ) -> Result<UffdRegistrationDeltaPlan, MmError> {
-        self.validate_register_vmas(intent, vmas)?;
+        Self::validate_vma_profile(intent.range, vmas)?;
 
         let mut removed = 0usize;
         let mut replacements = 0usize;
@@ -1057,9 +1074,8 @@ impl<const CAPACITY: usize> UffdRegistrationTable<CAPACITY> {
         })
     }
 
-    fn validate_register_vmas(
-        &self,
-        intent: UffdRegistrationIntent,
+    fn validate_vma_profile(
+        range: PageRange,
         vmas: &[MappingSnapshot],
     ) -> Result<AddressSpaceId, MmError> {
         let first = vmas.first().copied().ok_or(MmError::RangeNotMapped)?;
@@ -1068,9 +1084,9 @@ impl<const CAPACITY: usize> UffdRegistrationTable<CAPACITY> {
         for snapshot in vmas.iter().copied() {
             if snapshot.address_space() != address_space
                 || snapshot.kind() != MappingKind::AnonymousPrivate
-                || snapshot.range().page_size() != intent.range.page_size()
+                || snapshot.range().page_size() != range.page_size()
                 || previous_end.is_some_and(|end| snapshot.range().start() < end)
-                || page_range_intersection(intent.range, snapshot.range()).is_none()
+                || page_range_intersection(range, snapshot.range()).is_none()
             {
                 return Err(MmError::InvalidUffdRegistrationBatch);
             }

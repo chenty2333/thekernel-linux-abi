@@ -882,6 +882,71 @@ fn userfaultfd_registration_modes_and_mapping_profile_are_explicit() {
 }
 
 #[test]
+fn userfaultfd_unregister_vma_validation_owns_api_and_profile_policy() {
+    let table = UffdRegistrationTable::<1>::new(1).unwrap();
+    let range = PageRange::new(0x1000, 9 * PAGE, PAGE).unwrap();
+    let first = uffd_snapshot(3, 40, 1, 0x1000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let second = uffd_snapshot(3, 41, 1, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
+
+    let uninitialized = UffdApiState::new();
+    assert_eq!(
+        table.validate_unregister_vmas(&uninitialized, range, &[first, second]),
+        Err(MmError::UffdNotInitialized)
+    );
+
+    let api = initialized_uffd_api();
+    assert_eq!(
+        table.validate_unregister_vmas(&api, range, &[]),
+        Err(MmError::RangeNotMapped)
+    );
+    assert_eq!(
+        table
+            .validate_unregister_vmas(&api, range, &[first, second])
+            .unwrap(),
+        first.address_space()
+    );
+
+    let foreign_address_space =
+        uffd_snapshot(4, 41, 1, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        table.validate_unregister_vmas(&api, range, &[first, foreign_address_space]),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+    let incompatible_kind = uffd_snapshot(3, 41, 1, 0x8000, 2 * PAGE, MappingKind::Device);
+    assert_eq!(
+        table.validate_unregister_vmas(&api, range, &[first, incompatible_kind]),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+    let overlap = uffd_snapshot(3, 42, 1, 0x2000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        table.validate_unregister_vmas(&api, range, &[first, overlap]),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+    let outside = uffd_snapshot(3, 43, 1, 0xb000, PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        table.validate_unregister_vmas(&api, range, &[outside]),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+    let larger_pages = MappingSnapshot::from_raw(
+        3,
+        44,
+        1,
+        0,
+        2 * PAGE,
+        2 * PAGE,
+        access(true, true, false).bits(),
+        MappingKind::AnonymousPrivate,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        table.validate_unregister_vmas(&api, range, &[larger_pages]),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+}
+
+#[test]
 fn userfaultfd_registration_batch_is_atomic_idempotent_and_owner_aware() {
     let api = initialized_uffd_api();
     let first = uffd_snapshot(1, 50, 1, 0x1000, PAGE, MappingKind::AnonymousPrivate);

@@ -25,8 +25,9 @@
   mixed-handler mapping-refresh transactions, allocation-free intersection
   queries, a canonical same-handler partial-registration delta planner,
   fail-closed mapping-lineage revalidation, fragment-refresh/fault-epoch
-  projection and consistency helpers, non-wrapping sealed-revision retirement,
-  stateless fault permits, and checked COPY/ZEROPAGE signed-prefix results.
+  projection and consistency helpers, shared REGISTER/UNREGISTER VMA-profile
+  validation, non-wrapping sealed-revision retirement, stateless fault permits,
+  and checked COPY/ZEROPAGE signed-prefix results.
 - Add affine relocation, whole-remap fragment geometry, page-covering, and
   incremental memlock planners.
 - Support dependency-free `no_std`, `forbid(unsafe_code)`, Rust 1.85, RISC-V 64,

@@ -113,6 +113,12 @@ validation deliberately does not: a MISSING fault blocked before
 `mprotect(PROT_NONE)` may still be populated, then its retry observes the new
 protection.
 
+REGISTER and UNREGISTER consume the same VMA-profile validator: API
+initialization, one address space, anonymous-private kind, page geometry,
+strict ordering, non-overlap, and actual intersection remain Layer 2 policy.
+Raw ioctl ranges may contain unmapped gaps; the adapter only supplies the
+ordered fragments that exist.
+
 COPY accepts only zero or `DONTWAKE` mode; COPY-WP is recognized but rejected.
 ZEROPAGE likewise accepts only zero or `DONTWAKE`. Positive lower completion
 is a page-aligned prefix: a full prefix returns success, a short positive
