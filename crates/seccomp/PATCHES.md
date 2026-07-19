@@ -8,8 +8,10 @@
 - Accept only the Linux seccomp classic-BPF profile: aligned in-bounds word
   loads, sixteen scratch words, bounded forward control flow, and no packet,
   indirect, ancillary, halfword, byte, MSH, or modulo operations.
-- Bound one program to 4096 instructions and a stacked filter path to 32768
-  instructions, charging four extra instructions for each inherited program.
+- Bound one source program to 4096 classic-BPF instructions. Separately model
+  Linux v6.12's unblinded cBPF-to-eBPF migration length and bound a stacked
+  path to 32768 converted instructions, charging four extra instructions for
+  each inherited program.
 - Evaluate immutable filters newest to oldest, select the most restrictive
   signed full action, and retain the newest filter's data and metadata on a
   precedence tie.
@@ -25,6 +27,10 @@
   Linux seccomp opcode and input policy in this Layer 2 package.
 - Replace raw `sock_filter` pointers with caller-owned immutable instruction
   vectors or slices and fallible verification before publication.
+- Retain source length and converted path charge as distinct immutable values.
+  The latter reproduces the v6.12 three-instruction migration prologue and the
+  opcode-dependent expansion of `RET_K`, register division, signed-immediate
+  compares, and conditional branches without allocating an eBPF program.
 - Represent a filter stack as exact immutable ancestry. Appending returns a
   prepared child which a consumer can publish only after revalidating the
   expected task-local leaf.
@@ -56,5 +62,7 @@
 - process-wide TSYNC serialization, sibling enumeration, all-or-none state and
   credential publication, positive failing-TID reporting, and ESRCH mapping;
   and
-- JITs, eBPF, BTF, maps, helpers, packet sockets, socket-filter attachment,
-  concrete locks, schedulers, executors, or RCU/epoch reclamation.
+- JITs, executable-image accounting, constant blinding and the configuration-
+  dependent path expansion caused by `bpf_jit_harden`, eBPF execution, BTF,
+  maps, helpers, packet sockets, socket-filter attachment, concrete locks,
+  schedulers, executors, or RCU/epoch reclamation.

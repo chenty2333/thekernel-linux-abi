@@ -9,9 +9,14 @@
   in-bounds word loads, forward-only control flow, all-path scratch
   initialization, checked immediate arithmetic, and explicit rejection of
   packet loads, ancillary extensions, and `BPF_MOD`.
-- Add immutable filter ancestry with Linux's 32768-instruction path limit,
+- Add immutable filter ancestry with Linux v6.12's 32768-instruction path
+  limit over the unblinded post-cBPF-to-eBPF migration length, a
   four-instruction ancestor penalty, signed action precedence, newest-filter
   data on equal-precedence results, and exact identity-based ancestry checks.
+- Keep source length, converted path charge, and logical live-byte accounting
+  distinct; cover `RET_K`, register division, reversible and non-reversible
+  conditional expansion, and the exactly-32768 acceptance boundary without
+  claiming JIT-hardening or native-code-memory parity.
 - Add an explicit aggregate logical live-program byte budget, fallible
   publication preparation, cross-budget splice rejection, final-owner refunds,
   and iterative deep-chain teardown.

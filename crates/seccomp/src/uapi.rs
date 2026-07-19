@@ -57,7 +57,7 @@ pub const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 pub const BPF_MAXINSNS: usize = axcbpf::MAX_INSTRUCTIONS;
 /// Number of classic-BPF scratch words.
 pub const BPF_MEMWORDS: usize = axcbpf::SCRATCH_WORDS;
-/// Maximum Linux seccomp path cost in classic-BPF instructions.
+/// Maximum Linux v6.12 seccomp path cost in converted execution instructions.
 pub const MAX_INSNS_PER_PATH: usize = 32_768;
 /// Per-ancestor path penalty used by Linux when stacking filters.
 pub const FILTER_PATH_PENALTY: usize = 4;

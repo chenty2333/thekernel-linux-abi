@@ -74,7 +74,7 @@ impl FilterChain {
         self.leaf.as_ref().map_or(0, |leaf| leaf.filter_count)
     }
 
-    /// Returns Linux's instruction path accounting value.
+    /// Returns the Linux v6.12 unblinded migration path-accounting value.
     pub fn path_cost(&self) -> usize {
         self.leaf.as_ref().map_or(0, |leaf| leaf.path_cost)
     }
@@ -123,10 +123,10 @@ impl FilterChain {
         budget: &FilterBudget,
     ) -> Result<Self, FilterInstallError> {
         let path_cost = if self.is_empty() {
-            program.len()
+            program.path_charge()
         } else {
             program
-                .len()
+                .path_charge()
                 .checked_add(self.path_cost())
                 .and_then(|cost| cost.checked_add(FILTER_PATH_PENALTY))
                 .ok_or(FilterInstallError::PathTooLong)?
@@ -203,7 +203,8 @@ impl FilterChain {
 pub enum FilterInstallError {
     /// Allocation for the shared leaf failed.
     NoMemory,
-    /// Linux's 32768-instruction ancestry budget would be exceeded.
+    /// Linux v6.12's 32768 converted-instruction ancestry budget would be
+    /// exceeded.
     PathTooLong,
     /// The aggregate live-program byte budget cannot cover the new node.
     BudgetExceeded,
@@ -221,6 +222,11 @@ mod tests {
         ClassicBpfInstruction, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
         SECCOMP_RET_LOG, SECCOMP_RET_TRAP,
     };
+
+    const RET_K_PATH_CHARGE: usize = 5;
+    const STACKED_RET_K_INCREMENT: usize = RET_K_PATH_CHARGE + FILTER_PATH_PENALTY;
+    const MAX_RET_K_CHAIN_DEPTH: usize =
+        1 + (MAX_INSNS_PER_PATH - RET_K_PATH_CHARGE) / STACKED_RET_K_INCREMENT;
 
     fn returning(value: u32) -> VerifiedProgram {
         VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(opcode::RET_K, 0, 0, value)])
@@ -358,22 +364,25 @@ mod tests {
                 &budget,
             )
             .unwrap();
-        assert_eq!(first.path_cost(), 1);
-        assert_eq!(second.path_cost(), 6);
+        assert_eq!(first.path_cost(), 5);
+        assert_eq!(second.path_cost(), 14);
         assert_eq!(second.filter_count(), 2);
     }
 
     #[test]
     fn exact_path_limit_is_accepted_and_next_append_is_atomic() {
         let budget = budget();
+        let first = returning_with_len(4, SECCOMP_RET_ALLOW);
+        let first_charge = first.path_charge();
+        assert_eq!(first_charge, 8);
+        assert_eq!(
+            (MAX_INSNS_PER_PATH - first_charge) % STACKED_RET_K_INCREMENT,
+            0
+        );
         let mut chain = FilterChain::empty()
-            .try_append(
-                returning_with_len(3, SECCOMP_RET_ALLOW),
-                FilterMetadata::default(),
-                &budget,
-            )
+            .try_append(first, FilterMetadata::default(), &budget)
             .unwrap();
-        for _ in 1..6_554 {
+        for _ in 0..(MAX_INSNS_PER_PATH - first_charge) / STACKED_RET_K_INCREMENT {
             chain = chain
                 .try_append(
                     returning(SECCOMP_RET_ALLOW),
@@ -402,7 +411,7 @@ mod tests {
             .spawn(|| {
                 let budget = budget();
                 let mut chain = FilterChain::empty();
-                for _ in 0..6_554 {
+                for _ in 0..MAX_RET_K_CHAIN_DEPTH {
                     chain = chain
                         .try_append(
                             returning(SECCOMP_RET_ALLOW),
@@ -426,7 +435,7 @@ mod tests {
         const WORKERS: usize = 8;
         let budget = budget();
         let mut chain = FilterChain::empty();
-        for _ in 0..6_554 {
+        for _ in 0..MAX_RET_K_CHAIN_DEPTH {
             chain = chain
                 .try_append(
                     returning(SECCOMP_RET_ALLOW),

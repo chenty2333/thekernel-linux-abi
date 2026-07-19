@@ -139,6 +139,7 @@ impl ProgramError {
 #[derive(Debug)]
 pub struct VerifiedProgram {
     program: Program,
+    path_charge: usize,
 }
 
 impl VerifiedProgram {
@@ -146,8 +147,12 @@ impl VerifiedProgram {
     /// allocating a second instruction buffer.
     pub fn try_from_vec(instructions: Vec<ClassicBpfInstruction>) -> Result<Self, ProgramError> {
         verify_seccomp_profile(&instructions)?;
+        let path_charge = linux_v6_12_unblinded_migration_charge(&instructions);
         let program = Program::try_from_vec(instructions).map_err(map_mechanism_error)?;
-        Ok(Self { program })
+        Ok(Self {
+            program,
+            path_charge,
+        })
     }
 
     /// Fallibly copies and validates a program.
@@ -155,8 +160,12 @@ impl VerifiedProgram {
         instructions: &[ClassicBpfInstruction],
     ) -> Result<Self, ProgramError> {
         verify_seccomp_profile(instructions)?;
+        let path_charge = linux_v6_12_unblinded_migration_charge(instructions);
         let program = Program::verify(instructions).map_err(map_mechanism_error)?;
-        Ok(Self { program })
+        Ok(Self {
+            program,
+            path_charge,
+        })
     }
 
     /// Returns the classic-BPF instruction count.
@@ -170,6 +179,16 @@ impl VerifiedProgram {
         self.program.is_empty()
     }
 
+    /// Returns the Linux v6.12 unblinded cBPF-to-eBPF migration charge used
+    /// for stacked seccomp path accounting.
+    ///
+    /// Linux accounts the converted `bpf_prog::len`, not the userspace cBPF
+    /// length. TheKernel has no eBPF JIT or constant blinding, so this stable
+    /// baseline deliberately excludes architecture-specific JIT hardening.
+    pub fn path_charge(&self) -> usize {
+        self.path_charge
+    }
+
     /// Returns the immutable verified instruction sequence.
     pub fn instructions(&self) -> &[ClassicBpfInstruction] {
         self.program.instructions()
@@ -178,6 +197,48 @@ impl VerifiedProgram {
     /// Evaluates the program without allocation or unbounded control flow.
     pub fn evaluate(&self, data: &SeccompData) -> u32 {
         self.program.evaluate(data)
+    }
+}
+
+const LINUX_V6_12_CLASSIC_MIGRATION_PROLOGUE: usize = 3;
+
+fn linux_v6_12_unblinded_migration_charge(instructions: &[ClassicBpfInstruction]) -> usize {
+    LINUX_V6_12_CLASSIC_MIGRATION_PROLOGUE
+        + instructions
+            .iter()
+            .map(linux_v6_12_unblinded_instruction_charge)
+            .sum::<usize>()
+}
+
+fn linux_v6_12_unblinded_instruction_charge(instruction: &ClassicBpfInstruction) -> usize {
+    match instruction.code {
+        // Linux guards register division by zero before the converted ALU
+        // instruction: normalize X, branch, zero A, exit, then divide.
+        opcode::ALU_DIV_X => 5,
+        // A constant return becomes MOV32 plus EXIT.
+        opcode::RET_K => 2,
+        opcode::JMP_JEQ_K | opcode::JMP_JGE_K | opcode::JMP_JGT_K | opcode::JMP_JSET_K => {
+            usize::from((instruction.k as i32) < 0) + converted_conditional_jump_charge(instruction)
+        }
+        opcode::JMP_JEQ_X | opcode::JMP_JGE_X | opcode::JMP_JGT_X | opcode::JMP_JSET_X => {
+            converted_conditional_jump_charge(instruction)
+        }
+        _ => 1,
+    }
+}
+
+fn converted_conditional_jump_charge(instruction: &ClassicBpfInstruction) -> usize {
+    if instruction.jf == 0
+        || (instruction.jt == 0
+            && !matches!(instruction.code, opcode::JMP_JSET_K | opcode::JMP_JSET_X))
+    {
+        1
+    } else {
+        // A conditional branch with two non-fallthrough targets becomes the
+        // conditional jump followed by an unconditional JA. JSET has no
+        // inverse form, so it also needs JA when only the true side falls
+        // through.
+        2
     }
 }
 
@@ -397,6 +458,63 @@ mod tests {
             .unwrap_err(),
             ProgramError::JumpOutOfRange { program_counter: 0 }
         );
+    }
+
+    #[test]
+    fn path_charge_matches_linux_v6_12_ret_k_and_div_x_expansion() {
+        let ret_k = VerifiedProgram::try_copy_from_slice(&[stmt(opcode::RET_K, SECCOMP_RET_ALLOW)])
+            .unwrap();
+        assert_eq!(ret_k.len(), 1);
+        assert_eq!(ret_k.path_charge(), 5); // Three-prologue + MOV32 + EXIT.
+
+        let mut maximum_ret_k = Vec::new();
+        maximum_ret_k.try_reserve_exact(BPF_MAXINSNS).unwrap();
+        maximum_ret_k.resize(BPF_MAXINSNS, stmt(opcode::RET_K, SECCOMP_RET_ALLOW));
+        let maximum_ret_k = VerifiedProgram::try_from_vec(maximum_ret_k).unwrap();
+        assert_eq!(maximum_ret_k.len(), BPF_MAXINSNS);
+        assert_eq!(maximum_ret_k.path_charge(), 3 + 2 * BPF_MAXINSNS);
+
+        let ret_a = VerifiedProgram::try_copy_from_slice(&[stmt(opcode::RET_A, 0)]).unwrap();
+        assert_eq!(ret_a.path_charge(), 4); // Three-prologue + EXIT.
+
+        let div_x = VerifiedProgram::try_copy_from_slice(&[
+            stmt(opcode::ALU_DIV_X, 0),
+            stmt(opcode::RET_A, 0),
+        ])
+        .unwrap();
+        assert_eq!(div_x.len(), 2);
+        assert_eq!(div_x.path_charge(), 9); // Three-prologue + five + EXIT.
+    }
+
+    #[test]
+    fn path_charge_distinguishes_reversible_and_non_reversible_conditionals() {
+        let reversible = VerifiedProgram::try_copy_from_slice(&[
+            jump(opcode::JMP_JEQ_K, 7, 0, 1),
+            stmt(opcode::RET_K, SECCOMP_RET_ALLOW),
+            stmt(opcode::RET_K, SECCOMP_RET_ERRNO),
+        ])
+        .unwrap();
+        assert_eq!(reversible.path_charge(), 8);
+
+        // Linux can invert JEQ when the true target falls through, but JSET
+        // has no inverse opcode and therefore also needs an unconditional JA.
+        let non_reversible = VerifiedProgram::try_copy_from_slice(&[
+            jump(opcode::JMP_JSET_K, 7, 0, 1),
+            stmt(opcode::RET_K, SECCOMP_RET_ALLOW),
+            stmt(opcode::RET_K, SECCOMP_RET_ERRNO),
+        ])
+        .unwrap();
+        assert_eq!(non_reversible.path_charge(), 9);
+
+        // A negative K compare first materializes the unsigned immediate in
+        // a temporary eBPF register, adding one more converted instruction.
+        let negative_immediate = VerifiedProgram::try_copy_from_slice(&[
+            jump(opcode::JMP_JEQ_K, u32::MAX, 0, 1),
+            stmt(opcode::RET_K, SECCOMP_RET_ALLOW),
+            stmt(opcode::RET_K, SECCOMP_RET_ERRNO),
+        ])
+        .unwrap();
+        assert_eq!(negative_immediate.path_charge(), 9);
     }
 
     #[test]

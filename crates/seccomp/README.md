@@ -13,8 +13,9 @@ Version 0.1.0 provides:
 - the seccomp-only classic-BPF profile over a fallible, immutable Layer 1
   program, with one-to-4096-instruction validation and allocation-free
   evaluation;
-- immutable exact-identity filter ancestry, Linux's 32768-instruction path
-  accounting, signed action precedence, and newest-filter data on a tie;
+- immutable exact-identity filter ancestry, Linux v6.12's 32768-instruction
+  post-migration path accounting, signed action precedence, and newest-filter
+  data on a tie;
 - an explicit aggregate logical byte budget for live programs and nodes,
   shared clone charges, rollback on failed construction, final-owner refunds,
   and iterative maximum-depth teardown;
@@ -68,6 +69,29 @@ mutates a sibling and does not make TSYNC all-or-none. A real TSYNC consumer
 must hold a process-wide seccomp mutation gate, freeze a stable sibling set,
 validate every sibling, preallocate all seccomp and `no_new_privs` state, and
 perform one infallible group commit with Linux failing-TID/ESRCH behavior.
+
+## Path-accounting baseline
+
+Linux v6.12 checks a stacked filter path after classic-BPF preparation and
+charges the stored `bpf_prog::len`, not the userspace `sock_fprog.len`.
+`VerifiedProgram::len` therefore remains the source cBPF length used for the
+per-program 4096-instruction limit and logical byte budget, while
+`VerifiedProgram::path_charge` records the separate unblinded cBPF-to-eBPF
+migration length used by `FilterChain`.
+
+The frozen conversion charge is three prologue instructions, two instructions
+for `RET_K`, five for `DIV_X`, and one or two for a conditional depending on
+whether Linux can make one target fall through. A negative immediate compare
+also materializes its value in a temporary register. Other accepted seccomp
+instructions charge one. Appending a filter adds its charge plus four for each
+existing ancestor; a resulting path of exactly 32768 is accepted and a larger
+path is rejected without publishing a leaf.
+
+This is an arithmetic compatibility contract, not an eBPF translator or JIT.
+It deliberately models the Linux v6.12 unblinded migration path used by the
+RISC-V 64 and LoongArch64 eBPF-JIT architecture families. Direct cBPF-JIT
+architectures, native JIT image bytes, `bpf_jit_limit`, and constant-blinding
+expansion under `bpf_jit_harden` are not claimed exact by version 0.1.
 
 ## Error and stability contract
 

@@ -61,6 +61,7 @@ Linux v6.12 tag, commit `adc218676eef25575469234709c2d87185ca223a`, especially:
 - `include/uapi/linux/filter.h`;
 - `include/uapi/linux/audit.h`;
 - `kernel/seccomp.c`;
+- `kernel/bpf/core.c`;
 - `net/core/filter.c`; and
 - `tools/testing/selftests/seccomp/seccomp_bpf.c`.
 
@@ -68,6 +69,18 @@ The reviewed contracts include the 64-byte `seccomp_data` layout, classic-BPF
 profile restrictions, program and ancestry limits, immutable newest-first
 filter stacking, signed action precedence, equal-action data selection,
 strict/filter mode transitions, inheritance, and TSYNC ancestry eligibility.
+In particular, `seccomp_attach_filter()` checks `filter->prog->len` only after
+`bpf_prog_create_from_user()` has prepared the program. On the reviewed eBPF
+migration path, `bpf_migrate_filter()` replaces the source length with the
+length calculated by `bpf_convert_filter()`: a three-instruction cBPF
+prologue, opcode-dependent expansion, and then runtime/JIT selection.
+
+Version 0.1 records only that v6.12 unblinded migration length. The review also
+confirmed that constant blinding can replace immediate operations with longer
+BPF instruction sequences before a successful JIT, while native `jited_len`
+and the byte-valued `bpf_jit_limit` are separate from seccomp's 32768 path
+formula. The package therefore does not claim exact accounting for
+`bpf_jit_harden`, direct cBPF-JIT architectures, or native executable memory.
 
 Linux is GPL-2.0-only, with Linux UAPI headers carrying their own syscall-note
 license expressions. This package reimplements public contracts and general
