@@ -46,6 +46,11 @@ crate-local change and provenance ledger.
   the separately packaged `thekernel-axcbpf` 0.1.0 mechanism, with a strict
   seccomp classic-BPF profile, immutable bounded ancestry, aggregate logical
   program accounting, action precedence, and prepared task-state transitions.
+- Prepare `thekernel-linux-packet` 0.1.0 as a dependency-free stable AF_PACKET
+  policy core with normalized protocol/address values, stale-safe bind
+  publication, RAW/DGRAM receive and outgoing decisions, mapping of
+  endpoint-owned destructive statistics, and strict unsupported option
+  handling.
 - Gate every package archive with provenance checks, rustdoc warnings,
   registry-normalized manifests, dual-architecture builds, and unpacked tests.
   Dependent first releases use checksum-bound packaged dependency artifacts;

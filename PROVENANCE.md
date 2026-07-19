@@ -27,6 +27,14 @@ research. It reimplements those public contracts without copying Linux code
 and does not move the concrete queue, waiter, readiness, page installer,
 usercopy, FD, or syscall adapter into the crate.
 
+The `thekernel-linux-packet` record pins the first TheKernel consumer baseline,
+Linux v6.12 for AF_PACKET UAPI/state research, and immutable gVisor/libpcap
+comparison snapshots. It reimplements normalized protocol/address, bind,
+ordinary receive, option, and statistics values without copying Linux GPL
+implementation/selftests or moving packet taps, buffers, queues, devices,
+readiness, capabilities, namespaces, usercopy, FDs, TPACKET, or fanout into the
+crate.
+
 The `thekernel-linux-seccomp` record pins its initial TheKernel consumer
 baseline, Linux v6.12 `adc218676eef25575469234709c2d87185ca223a`, and the
 Apache-2.0 `thekernel-axcbpf` 0.1.0 mechanism implementation at

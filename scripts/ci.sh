@@ -25,7 +25,7 @@ cd "$repo_root"
 run_cargo fmt --all -- --check
 
 if [ "$stable_only" = 1 ]; then
-    for package in thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd thekernel-linux-mm thekernel-linux-io-uring; do
+    for package in thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd thekernel-linux-mm thekernel-linux-io-uring thekernel-linux-packet; do
         run_cargo clippy -p "$package" --all-targets --all-features --locked -- -D warnings
         run_cargo test -p "$package" --all-features --locked
         RUSTDOCFLAGS='-D warnings' \
@@ -48,6 +48,7 @@ run_cargo check -p thekernel-linux-fd --no-default-features --lib --locked
 run_cargo check -p thekernel-linux-fd --features alloc --lib --locked
 run_cargo check -p thekernel-linux-mm --no-default-features --lib --locked
 run_cargo check -p thekernel-linux-io-uring --no-default-features --lib --locked
+run_cargo check -p thekernel-linux-packet --no-default-features --lib --locked
 
 for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
     run_cargo check -p thekernel-linux-usercopy --no-default-features --target "$target" --locked
@@ -57,6 +58,7 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
     run_cargo check -p thekernel-linux-fd --features alloc --target "$target" --locked
     run_cargo check -p thekernel-linux-mm --no-default-features --target "$target" --locked
     run_cargo check -p thekernel-linux-io-uring --no-default-features --target "$target" --locked
+    run_cargo check -p thekernel-linux-packet --no-default-features --target "$target" --locked
     if [ "$stable_only" = 0 ]; then
         run_cargo check -p thekernel-linux-process --no-default-features --target "$target" --locked
         run_cargo check -p thekernel-linux-signal --features multitask --target "$target" --locked
@@ -67,7 +69,7 @@ done
 
 "$script_dir/check-provenance.sh"
 if [ "$stable_only" = 1 ]; then
-    package_list=(thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd thekernel-linux-mm thekernel-linux-io-uring)
+    package_list=(thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd thekernel-linux-mm thekernel-linux-io-uring thekernel-linux-packet)
 else
     package_list=(
         thekernel-linux-usercopy
@@ -78,6 +80,7 @@ else
         thekernel-linux-cred
         thekernel-linux-mm
         thekernel-linux-io-uring
+        thekernel-linux-packet
         thekernel-linux-seccomp
     )
 fi
@@ -92,6 +95,7 @@ if [ "$stable_only" = 1 ]; then
         thekernel-linux-fd
         thekernel-linux-mm
         thekernel-linux-io-uring
+        thekernel-linux-packet
     )
 else
     # Seccomp is intentionally absent until the independently packaged
@@ -105,6 +109,7 @@ else
         thekernel-linux-cred
         thekernel-linux-mm
         thekernel-linux-io-uring
+        thekernel-linux-packet
     )
 fi
 CARGO_TOOLCHAIN=${CARGO_TOOLCHAIN:-} \

@@ -8,8 +8,8 @@ bump the minor version; compatible fixes bump the patch version.
 1. Confirm the release commit is clean and all provenance assets are present.
 2. Run `CARGO_TOOLCHAIN=1.85.0 ./scripts/ci.sh` for stable packages and
    `CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh` for the complete
-   workspace. Both gates enforce the lockfile; stable includes MM and
-   io_uring, while nightly also covers process, signal, credentials, and
+   workspace. Both gates enforce the lockfile; stable includes MM, io_uring,
+   and packet, while nightly also covers process, signal, credentials, and
    seccomp.
 3. Let `scripts/test-package.sh` unpack every archive, verify provenance files,
    reject dependency `path`, `git`, or `workspace` leakage from the
@@ -21,10 +21,10 @@ bump the minor version; compatible fixes bump the patch version.
 5. Build registry-only adapters and real TheKernel consumers for both
    architectures. A workspace-only compile is not a consumer gate.
 6. Update the workspace and crate `CHANGELOG.md`, README, and patch ledger.
-7. Run `scripts/test-publish-dry-run.sh`. Its default set is the seven
+7. Run `scripts/test-publish-dry-run.sh`. Its default set is the eight
    independently resolvable packages: usercopy, process, VFS, FD, credentials,
-   MM, and io_uring. Signal and seccomp remain deferred until their first
-   dependencies are visible in the registry.
+   MM, io_uring, and packet. Signal and seccomp remain deferred until their
+   first dependencies are visible in the registry.
 8. Publish only with explicit maintainer authorization. A passing dry-run is
    not authorization to upload, tag, or create a release.
 9. Download each released archive, record its checksum, audit its normalized
@@ -32,14 +32,15 @@ bump the minor version; compatible fixes bump the patch version.
 
 ## Dependency order
 
-The 0.1.0 registry order begins with the seven independent packages: usercopy,
-process, VFS, FD, MM, credentials, and io_uring. Signal follows usercopy because
-its registry manifest depends on that published version. Seccomp follows the
-separate `thekernel-axcbpf` 0.1.0 release from the `thekernel-ax` repository.
+The 0.1.0 registry order begins with the eight independent packages: usercopy,
+process, VFS, FD, MM, credentials, io_uring, and packet. Signal follows usercopy
+because its registry manifest depends on that published version. Seccomp
+follows the separate `thekernel-axcbpf` 0.1.0 release from the `thekernel-ax`
+repository.
 Credentials and seccomp require the pinned nightly for fallible
-`allocator_api`; neither claims a stable `rust-version`. MM, io_uring, and
-seccomp remain unpublished until their semantic, package, real-consumer, and
-dual-architecture gates all pass. No empty `thekernel-linux-abi` facade is
+`allocator_api`; neither claims a stable `rust-version`. MM, io_uring, packet,
+and seccomp remain unpublished until their semantic, package, real-consumer,
+and dual-architecture gates all pass. No empty `thekernel-linux-abi` facade is
 published.
 
 Before the first upload, the nightly package gate builds signal together with

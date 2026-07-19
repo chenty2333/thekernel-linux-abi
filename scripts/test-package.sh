@@ -22,6 +22,7 @@ if [ "$#" -eq 0 ]; then
         thekernel-linux-cred
         thekernel-linux-mm
         thekernel-linux-io-uring
+        thekernel-linux-packet
         thekernel-linux-seccomp
     )
 else
@@ -256,6 +257,10 @@ for package in "${packages[@]}"; do
         thekernel-linux-io-uring)
             version=0.1.0
             crate_path=crates/io-uring
+            ;;
+        thekernel-linux-packet)
+            version=0.1.0
+            crate_path=crates/packet
             ;;
         thekernel-linux-seccomp)
             version=0.1.0

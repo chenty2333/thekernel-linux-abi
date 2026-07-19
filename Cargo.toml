@@ -5,6 +5,7 @@ members = [
     "crates/fd",
     "crates/io-uring",
     "crates/mm",
+    "crates/packet",
     "crates/process",
     "crates/seccomp",
     "crates/signal",

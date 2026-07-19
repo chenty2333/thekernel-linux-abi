@@ -1,0 +1,22 @@
+[package]
+name = "thekernel-linux-packet"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Validated Linux AF_PACKET policy values and state for no_std kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "packet", "network"]
+categories = ["no-std", "network-programming", "os"]
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

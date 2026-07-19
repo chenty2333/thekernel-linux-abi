@@ -4,7 +4,7 @@
 owned by TheKernel. It is deliberately separate from generic ArceOS
 mechanisms and from TheKernel's syscall and evaluator layers.
 
-The 0.1.0 line contains nine packages:
+The 0.1.0 line contains ten packages:
 
 - `thekernel-linux-usercopy` 0.1.0: explicit-context, bounded, fallible access
   to a caller-provided userspace memory implementation.
@@ -31,6 +31,11 @@ The 0.1.0 line contains nine packages:
   SQE/registration decoding, bounded generation-safe
   request/completion/cancellation state, and registered-file leases with
   explicit close and drain transitions.
+- `thekernel-linux-packet` 0.1.0: normalized AF_PACKET protocol/address values,
+  stale-safe bind publication, RAW/DGRAM ordinary receive decisions,
+  exact Linux outgoing policy, mapping of endpoint-owned destructive reasoned
+  statistics, and strict unsupported-option reporting without packet-buffer
+  or device ownership.
 - `thekernel-linux-seccomp` 0.1.0: a Linux v6.12 classic-BPF profile over the
   generic `thekernel-axcbpf` mechanism, immutable bounded filter ancestry,
   aggregate live-program accounting, action precedence, and prepared
@@ -50,9 +55,9 @@ dual-architecture gates remain required before a release tag.
 ## Development
 
 The repository pins the same nightly used by its initial TheKernel consumer.
-The usercopy, VFS, FD, MM, and io_uring crates are additionally checked against
-stable Rust 1.85 or newer. The process, signal, credential, and seccomp crates
-are explicitly nightly-only because preserving fallible standard `Arc`
+The usercopy, VFS, FD, MM, io_uring, and packet crates are additionally checked
+against stable Rust 1.85 or newer. The process, signal, credential, and seccomp
+crates are explicitly nightly-only because preserving fallible standard `Arc`
 allocation currently requires `allocator_api`; none inherits or claims a
 stable `rust-version`. The policy-neutral `thekernel-axcbpf` dependency itself
 supports Rust 1.85.
@@ -74,6 +79,7 @@ cargo check -p thekernel-linux-fd --no-default-features --locked
 cargo check -p thekernel-linux-cred --no-default-features --locked
 cargo check -p thekernel-linux-mm --no-default-features --locked
 cargo check -p thekernel-linux-io-uring --no-default-features --locked
+cargo check -p thekernel-linux-packet --no-default-features --locked
 cargo check -p thekernel-linux-seccomp --no-default-features --locked
 CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh
 PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
@@ -111,6 +117,12 @@ PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
   embedding kernel still owns shared-page atomic access, UAPI copyin/copyout,
   mmap and FD lifetimes, VFS/readiness adapters, signal-mask restoration,
   execution, waiting, and errno conversion.
+- Packet policy owns normalized protocol/address values, generation-tagged
+  bind plans, ordinary RAW/DGRAM view and outgoing decisions, ignore-outgoing
+  state, and typed mapping of endpoint-owned destructive statistics. It does
+  not own packet taps/buffers, live/resettable counters, devices, queues,
+  allocation, waiters/readiness, capabilities/namespaces, usercopy, FDs,
+  TPACKET shared memory, fanout, or send execution.
 - Seccomp policy consumes `thekernel-axcbpf` for generic classic-BPF
   verification and execution. It owns the Linux input/opcode profile,
   immutable filter ancestry, aggregate accounting, action selection, and
