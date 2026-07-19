@@ -27,8 +27,9 @@ fn normalized_bind_receive_and_statistics_contract_is_public() {
 
     let raw_destination = [2, 0x66, 0x77, 0x88, 0x99, 0xaa, 7, 8];
     let send_address =
-        PacketSendAddress::try_from_network_order_fields(0, 11, 0, raw_destination).unwrap();
+        PacketSendAddress::try_from_network_order_fields(0, 11, 9, raw_destination).unwrap();
     assert_eq!(send_address.protocol(), ProtocolSelector::Disabled);
+    assert_eq!(send_address.declared_address_len(), 9);
     assert_eq!(
         send_address.address_for_device(6).unwrap().as_bytes(),
         &raw_destination[..6]

@@ -144,8 +144,10 @@ impl PacketBindRequest {
 /// This is intentionally distinct from [`SockAddrLl`]. Receive/name output
 /// uses `sll_halen` to delimit a canonical address, while Linux packet send
 /// treats the complete `sll_addr` field as device input and uses `sll_halen`
-/// only for the enclosing sockaddr-length check. Keeping the raw bytes here
-/// prevents a declared zero length from erasing a valid cooked destination.
+/// only for the enclosing sockaddr-length check. Linux also permits a declared
+/// length larger than the historical eight-byte inline field when the native
+/// sockaddr has a readable extension. Keeping the declaration and inline bytes
+/// separate prevents either fact from corrupting the other.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketSendAddress {
     interface: InterfaceIndex,
@@ -166,9 +168,6 @@ impl PacketSendAddress {
         declared_address_len: u8,
         raw_address: [u8; MAX_LINK_LAYER_ADDRESS_LEN],
     ) -> Result<Self, PacketError> {
-        if declared_address_len as usize > MAX_LINK_LAYER_ADDRESS_LEN {
-            return Err(PacketError::InvalidHardwareAddressLength);
-        }
         let interface = match InterfaceIndex::from_raw(interface_index) {
             Ok(interface) => interface,
             Err(error) => return Err(error),
@@ -192,6 +191,10 @@ impl PacketSendAddress {
     }
 
     /// Caller-declared `sll_halen`, retained for length-contract evidence.
+    ///
+    /// This can exceed [`MAX_LINK_LAYER_ADDRESS_LEN`]. The native adapter must
+    /// separately prove the complete declared sockaddr range readable; a
+    /// device may only request bytes represented by [`raw_address`](Self::raw_address).
     pub const fn declared_address_len(self) -> u8 {
         self.declared_address_len
     }
@@ -439,18 +442,20 @@ mod tests {
     #[test]
     fn send_address_preserves_raw_bytes_independent_of_declared_halen() {
         let raw = [2, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xcc, 0xdd];
-        let address = PacketSendAddress::try_from_network_order_fields(0, 0, 0, raw).unwrap();
+        let address = PacketSendAddress::try_from_network_order_fields(0, 0, 9, raw).unwrap();
         assert!(address.interface().is_any());
         assert_eq!(address.protocol(), ProtocolSelector::Disabled);
-        assert_eq!(address.declared_address_len(), 0);
+        assert_eq!(address.declared_address_len(), 9);
         assert_eq!(address.raw_address(), raw);
         assert_eq!(address.address_for_device(6).unwrap().as_bytes(), &raw[..6]);
         assert_eq!(
             PacketSendAddress::try_from_network_order_fields(0, -1, 0, raw),
             Err(PacketError::InvalidInterfaceIndex)
         );
+        let maximum = PacketSendAddress::try_from_network_order_fields(0, 1, u8::MAX, raw).unwrap();
+        assert_eq!(maximum.declared_address_len(), u8::MAX);
         assert_eq!(
-            PacketSendAddress::try_from_network_order_fields(0, 1, 9, raw),
+            maximum.address_for_device(9),
             Err(PacketError::InvalidHardwareAddressLength)
         );
     }

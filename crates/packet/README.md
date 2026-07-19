@@ -57,6 +57,11 @@ native-endian conversion: adapters use `protocol_network_order` only at the
 copyout boundary. Exact bindings require matching caller-owned link metadata;
 wildcard bindings return zero hardware type and an empty address.
 
+Ordinary send keeps the caller's `sll_halen` declaration separate from the
+eight inline `sll_addr` bytes. A native adapter may therefore accept Linux's
+extended-sockaddr convention after proving the whole declared range readable,
+while a concrete device still selects only its own supported address width.
+
 ## Receive and statistics contract
 
 `FrameLayout` validates a full link frame and network-header offset. RAW views
