@@ -758,6 +758,134 @@ fn userfaultfd_refreshed_fragments_preserve_the_source_fault_epoch() {
 }
 
 #[test]
+fn userfaultfd_canonical_replacement_union_is_source_bound_and_atomic() {
+    let api = initialized_uffd_api();
+    let source = uffd_snapshot(7, 70, 11, 0x1000, 3 * PAGE, MappingKind::AnonymousPrivate);
+    let post_vma = uffd_snapshot(7, 70, 99, 0x1000, 3 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<4>::new(1).unwrap();
+    let mut registered = Vec::new();
+    for start in [0x1000, 0x2000, 0x3000] {
+        let range = PageRange::new(start, PAGE, PAGE).unwrap();
+        registered.push(
+            table
+                .register(&api, uffd_registration_request(9, source, range))
+                .unwrap(),
+        );
+    }
+
+    let replacements = registered
+        .iter()
+        .copied()
+        .map(|registration| {
+            UffdRegistrationReplacement::new(
+                registration.id(),
+                registration
+                    .refreshed_fragment(post_vma, registration.range())
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let folded = replacements[0]
+        .canonical_union(replacements[1], post_vma)
+        .unwrap()
+        .unwrap()
+        .canonical_union(replacements[2], post_vma)
+        .unwrap()
+        .unwrap();
+    assert_eq!(folded.source(), registered[0].id());
+    assert_eq!(folded.request().range(), post_vma.range());
+    assert_eq!(folded.request().generation(), source.generation());
+    assert_ne!(folded.request().generation(), post_vma.generation());
+
+    // Keeping a folded source live would overlap the union. The one-shot
+    // mapping transaction must still retire every consumed source token even
+    // though the canonical replacement retains only one representative ID.
+    let incomplete_removed = [registered[0].id(), registered[2].id()];
+    assert_eq!(
+        table.preflight_mapping_replace(&incomplete_removed, &[folded]),
+        Err(MmError::UffdRegistrationOverlap)
+    );
+    assert_eq!(table.len(), 3);
+
+    let removed = registered
+        .iter()
+        .map(|registration| registration.id())
+        .collect::<Vec<_>>();
+    let plan = table
+        .preflight_mapping_replace(&removed, &[folded])
+        .unwrap();
+    assert_eq!(plan.removed(), 3);
+    assert_eq!(plan.published(), 1);
+    let commit = table
+        .commit_mapping_replace(plan, &removed, &[folded], |_| {})
+        .unwrap();
+    assert_eq!(commit.removed(), 3);
+    assert_eq!(commit.published(), 1);
+    assert_eq!(table.len(), 1);
+    let canonical = table.iter().next().unwrap();
+    assert_eq!(canonical.range(), post_vma.range());
+    assert_eq!(canonical.generation(), source.generation());
+}
+
+#[test]
+fn userfaultfd_canonical_replacement_union_rejects_bad_geometry_and_boundaries() {
+    let source = uffd_snapshot(7, 70, 11, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let post_vma = uffd_snapshot(7, 70, 99, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    let replacement = |id, handler, generation, start| {
+        let mapping = uffd_snapshot(
+            7,
+            70,
+            generation,
+            0x1000,
+            4 * PAGE,
+            MappingKind::AnonymousPrivate,
+        );
+        UffdRegistrationReplacement::new(
+            UffdRegistrationId::new(id).unwrap(),
+            uffd_registration_request(handler, mapping, PageRange::new(start, PAGE, PAGE).unwrap()),
+        )
+    };
+    let left = replacement(1, 9, source.generation().get(), 0x1000);
+
+    assert_eq!(
+        left.canonical_union(replacement(2, 10, 11, 0x2000), post_vma),
+        Ok(None)
+    );
+    assert_eq!(
+        left.canonical_union(replacement(2, 9, 12, 0x2000), post_vma),
+        Ok(None)
+    );
+    assert_eq!(
+        left.canonical_union(replacement(2, 9, 11, 0x3000), post_vma),
+        Ok(None)
+    );
+    assert_eq!(
+        left.canonical_union(replacement(2, 9, 11, 0x1000), post_vma),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+    assert_eq!(
+        replacement(2, 9, 11, 0x2000).canonical_union(left, post_vma),
+        Err(MmError::InvalidUffdRegistrationBatch)
+    );
+
+    let too_short = uffd_snapshot(7, 70, 99, 0x1000, PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        left.canonical_union(replacement(2, 9, 11, 0x2000), too_short),
+        Err(MmError::RangeNotMapped)
+    );
+    let foreign = uffd_snapshot(7, 71, 99, 0x1000, 4 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        left.canonical_union(replacement(2, 9, 11, 0x2000), foreign),
+        Err(MmError::StaleGeneration)
+    );
+    let file_vma = uffd_snapshot(7, 70, 99, 0x1000, 4 * PAGE, MappingKind::FilePrivate);
+    assert_eq!(
+        left.canonical_union(replacement(2, 9, 11, 0x2000), file_vma),
+        Err(MmError::UnsupportedUffdMapping)
+    );
+}
+
+#[test]
 fn userfaultfd_refreshed_fragment_preserves_epoch_across_in_place_grow() {
     let api = initialized_uffd_api();
     let old = uffd_snapshot(9, 90, 21, 0x1000, 2 * PAGE, MappingKind::AnonymousPrivate);

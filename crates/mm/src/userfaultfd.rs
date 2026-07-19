@@ -600,6 +600,73 @@ impl UffdRegistrationReplacement {
     pub const fn request(self) -> UffdRegistrationRequest {
         self.request
     }
+
+    /// Canonicalizes two ordered replacement fragments inside one post-state
+    /// anonymous-private VMA.
+    ///
+    /// This is a pure mapping-hook policy primitive: it neither allocates nor
+    /// mutates a registration table. The post-state snapshot proves that both
+    /// fragments remain in one logical mapping/VMA after the concrete MM
+    /// transaction. Its topology generation and access bits are deliberately
+    /// not adopted; the replacement keeps the registration/fault epoch and
+    /// owner frozen in the source requests.
+    ///
+    /// Incompatible handler, fault epoch, mode, or a gap returns `Ok(None)`.
+    /// Overlap or reversed input is an invalid adapter batch rather than a
+    /// merge opportunity. On success `self.source` remains the representative
+    /// source, but the caller must still remove `next.source` in the same
+    /// all-or-none mapping-replacement transaction.
+    pub fn canonical_union(
+        self,
+        next: Self,
+        post_vma: MappingSnapshot,
+    ) -> Result<Option<Self>, MmError> {
+        if post_vma.kind() != MappingKind::AnonymousPrivate {
+            return Err(MmError::UnsupportedUffdMapping);
+        }
+
+        let left = self.request;
+        let right = next.request;
+        if left.address_space != post_vma.address_space()
+            || right.address_space != post_vma.address_space()
+            || left.mapping != post_vma.mapping()
+            || right.mapping != post_vma.mapping()
+        {
+            return Err(MmError::StaleGeneration);
+        }
+        if left.range.page_size() != post_vma.range().page_size()
+            || right.range.page_size() != post_vma.range().page_size()
+            || !post_vma.range().contains(left.range)
+            || !post_vma.range().contains(right.range)
+        {
+            return Err(MmError::RangeNotMapped);
+        }
+
+        if left.range.end() > right.range.start() {
+            return Err(MmError::InvalidUffdRegistrationBatch);
+        }
+        if left.handler != right.handler
+            || left.generation != right.generation
+            || left.mode != right.mode
+            || left.range.end() < right.range.start()
+        {
+            return Ok(None);
+        }
+
+        let range = PageRange::with_page_size(
+            left.range.start(),
+            right
+                .range
+                .end()
+                .checked_sub(left.range.start())
+                .ok_or(MmError::Overflow)?,
+            left.range.page_size(),
+        )?;
+        Ok(Some(Self {
+            source: self.source,
+            request: UffdRegistrationRequest { range, ..left },
+        }))
+    }
 }
 
 /// One Linux UFFDIO_REGISTER range owned by a single userfaultfd handler.
@@ -1985,5 +2052,23 @@ mod tests {
         );
         assert_eq!(table.get(registered.id()), Ok(registered));
         assert_eq!(table.revision, u64::MAX);
+    }
+
+    #[test]
+    fn canonical_replacement_union_does_not_fold_different_modes() {
+        let post_vma = snapshot(30, 0x5000, 2 * PAGE);
+        let left = UffdRegistrationReplacement::new(
+            UffdRegistrationId::new(1).unwrap(),
+            request(12, 30, 0x5000),
+        );
+        let right = UffdRegistrationReplacement::new(
+            UffdRegistrationId::new(2).unwrap(),
+            UffdRegistrationRequest {
+                mode: UffdRegisterMode::WP,
+                ..request(12, 30, 0x6000)
+            },
+        );
+
+        assert_eq!(left.canonical_union(right, post_vma), Ok(None));
     }
 }

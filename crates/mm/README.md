@@ -93,6 +93,12 @@ changes use the matching replace transaction so old fragments remain visible
 until every replacement has passed preflight. Mapping-level replacement pairs
 each new fragment with its source token, allowing one all-or-none mutation to
 refresh several non-overlapping handler owners in the same address space.
+`canonical_union` lets that adapter fold strictly ordered adjacent replacement
+fragments only when one post-state anonymous-private VMA covers them and their
+handler, mapping, fault epoch, mode, and page geometry agree. It preserves one
+representative source but requires the eventual mixed-owner transaction to
+remove every consumed source token; overlap and reversed candidates fail
+closed instead of being normalized.
 Allocation-free table/intersection iterators let the adapter collect affected
 IDs into its own bounded storage first. A saturated table revision is sealed
 against publication but still permits revalidated pure removal, unregister,

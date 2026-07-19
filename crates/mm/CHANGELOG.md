@@ -26,7 +26,9 @@
   queries, a canonical same-handler partial-registration delta planner,
   fail-closed mapping-lineage revalidation, fragment-refresh/fault-epoch
   projection and consistency helpers, a source-bound preflight replacement for
-  in-place tail growth before a post-grow VMA snapshot exists, shared
+  in-place tail growth before a post-grow VMA snapshot exists, source-bound
+  canonical union for adjacent fragments covered by one post-state VMA without
+  adopting its topology generation or access, shared
   REGISTER/UNREGISTER VMA-profile validation, non-wrapping sealed-revision
   retirement, stateless fault permits, and checked COPY/ZEROPAGE signed-prefix
   results.

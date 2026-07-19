@@ -47,9 +47,10 @@
   split/trim/grow refresh, canonical subset/extension/bridge registration
   deltas with fail-closed lineage checks, fragment-refresh/fault-epoch
   projection, source-bound preflight of in-place tail growth without a
-  post-grow mapping snapshot, shared REGISTER/UNREGISTER VMA-profile
-  validation, and COPY/ZEROPAGE mode/progress classification all remain above
-  the generic `FaultPort` broker.
+  post-grow mapping snapshot, strict source-bound canonical union for adjacent
+  fragments covered by one post-state VMA, shared REGISTER/UNREGISTER
+  VMA-profile validation, and COPY/ZEROPAGE mode/progress classification all
+  remain above the generic `FaultPort` broker.
 - Export canonical affine-origin relocation so consumers can remove duplicate
   syscall/backend arithmetic.
 
