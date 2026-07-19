@@ -20,10 +20,10 @@ mod userfaultfd;
 
 pub use error::MmError;
 pub use fault::{
-    FaultAccess, FaultAdmission, FaultAdmissionPermit, FaultCapacity, FaultCompletionPermit,
-    FaultDisposition, FaultFailure, FaultHandlerId, FaultKey, FaultLifecycleState, FaultLoad,
-    FaultPageAddress, FaultPort, FaultRequest, FaultRequestId, FaultType,
-    validate_fault_completion,
+    FaultAccess, FaultAdmission, FaultAdmissionContext, FaultAdmissionKind, FaultAdmissionPermit,
+    FaultCapacity, FaultCompletionPermit, FaultDisposition, FaultFailure, FaultHandlerId, FaultKey,
+    FaultLifecycleState, FaultLoad, FaultPageAddress, FaultPort, FaultRequest, FaultRequestId,
+    FaultType, validate_fault_completion,
 };
 pub use identity::{AddressSpaceId, MappingGeneration, MappingId, PinOwner};
 pub use mapping::{

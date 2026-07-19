@@ -458,22 +458,28 @@ fn fault_admission_is_bounded_and_completion_rejects_stale_generation() {
     let permit = FaultAdmission::check(
         request,
         mapping,
-        capacity,
-        FaultLoad::new(1, 1, 3),
+        FaultAdmissionContext::new_request(capacity, FaultLoad::new(1, 1, 3)),
         FaultLifecycleState::Open,
     )
     .unwrap();
     assert_eq!(permit.request(), request);
-    assert_eq!(
-        FaultAdmission::check(
-            request,
-            mapping,
-            capacity,
-            FaultLoad::new(2, 1, 3),
-            FaultLifecycleState::Open,
-        ),
-        Err(MmError::QuotaExceeded)
-    );
+    assert_eq!(permit.kind(), FaultAdmissionKind::NewRequest);
+    assert!(permit.kind().consumes_request_credit());
+    for load in [
+        FaultLoad::new(2, 1, 3),
+        FaultLoad::new(1, 2, 3),
+        FaultLoad::new(1, 1, 4),
+    ] {
+        assert_eq!(
+            FaultAdmission::check(
+                request,
+                mapping,
+                FaultAdmissionContext::new_request(capacity, load),
+                FaultLifecycleState::Open,
+            ),
+            Err(MmError::QuotaExceeded)
+        );
+    }
 
     let completion = validate_fault_completion(
         mapping_request(request),
@@ -1757,19 +1763,19 @@ fn userfaultfd_fault_policy_uses_lower_broker_permits_without_queue_state() {
         registration,
         mapping,
         request,
-        capacity,
-        FaultLoad::new(1, 1, 3),
+        FaultAdmissionContext::new_request(capacity, FaultLoad::new(1, 1, 3)),
         FaultLifecycleState::Open,
     )
     .unwrap();
     assert_eq!(permit.request(), request);
+    assert_eq!(permit.kind(), FaultAdmissionKind::NewRequest);
+    assert!(permit.kind().consumes_request_credit());
     assert_eq!(
         UffdFaultPolicy::admit(
             registration,
             mapping,
             request,
-            capacity,
-            FaultLoad::new(2, 1, 3),
+            FaultAdmissionContext::new_request(capacity, FaultLoad::new(2, 1, 3)),
             FaultLifecycleState::Open,
         ),
         Err(MmError::QuotaExceeded)
@@ -1785,8 +1791,7 @@ fn userfaultfd_fault_policy_uses_lower_broker_permits_without_queue_state() {
             registration,
             mapping,
             wrong_handler,
-            capacity,
-            FaultLoad::new(0, 0, 0),
+            FaultAdmissionContext::new_request(capacity, FaultLoad::new(0, 0, 0)),
             FaultLifecycleState::Open,
         ),
         Err(MmError::UffdRegistrationMismatch)
@@ -1824,8 +1829,7 @@ fn userfaultfd_fault_policy_uses_lower_broker_permits_without_queue_state() {
             registration,
             protected,
             request,
-            capacity,
-            FaultLoad::new(0, 0, 0),
+            FaultAdmissionContext::new_request(capacity, FaultLoad::new(0, 0, 0)),
             FaultLifecycleState::Open,
         ),
         Err(MmError::AccessDenied)
@@ -1834,6 +1838,155 @@ fn userfaultfd_fault_policy_uses_lower_broker_permits_without_queue_state() {
         UffdFaultPolicy::prepare_completion(request, protected, FaultDisposition::Supply).unwrap();
     assert_eq!(protected_completion.request(), request);
     assert_eq!(protected_completion.disposition(), FaultDisposition::Supply);
+}
+
+#[test]
+fn userfaultfd_exact_coalescing_skips_only_request_quota() {
+    let api = initialized_uffd_api();
+    let mapping = uffd_snapshot(2, 61, 4, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    let mut table = UffdRegistrationTable::<1>::new(1).unwrap();
+    let registration = table
+        .register(&api, uffd_registration_request(9, mapping, mapping.range()))
+        .unwrap();
+    let request = FaultRequest::new(
+        FaultKey::from_address(mapping, 0x9001, FaultAccess::Write).unwrap(),
+        FaultHandlerId::new(9).unwrap(),
+        FaultType::Missing,
+    );
+    let other_page = FaultRequest::new(
+        FaultKey::from_address(mapping, 0x8001, FaultAccess::Write).unwrap(),
+        FaultHandlerId::new(9).unwrap(),
+        FaultType::Missing,
+    );
+    let capacity = FaultCapacity::new(2, 2, 4).unwrap();
+    let full_load = FaultLoad::new(2, 2, 4);
+
+    let coalesced = UffdFaultPolicy::admit(
+        registration,
+        mapping,
+        request,
+        FaultAdmissionContext::exact_request(request),
+        FaultLifecycleState::Open,
+    )
+    .unwrap();
+    assert_eq!(coalesced.request(), request);
+    assert_eq!(coalesced.kind(), FaultAdmissionKind::CoalescedWaiter);
+    assert!(!coalesced.kind().consumes_request_credit());
+
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            mapping,
+            other_page,
+            FaultAdmissionContext::new_request(capacity, full_load),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::QuotaExceeded)
+    );
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            mapping,
+            request,
+            FaultAdmissionContext::exact_request(other_page),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::FaultRequestMismatch)
+    );
+    let foreign_broker_request = FaultRequest::new(
+        request.key(),
+        FaultHandlerId::new(10).unwrap(),
+        FaultType::Missing,
+    );
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            mapping,
+            request,
+            FaultAdmissionContext::exact_request(foreign_broker_request),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::FaultRequestMismatch)
+    );
+
+    for (lifecycle, expected) in [
+        (FaultLifecycleState::Closing, MmError::Closing),
+        (FaultLifecycleState::Detached, MmError::TearingDown),
+        (FaultLifecycleState::Closed, MmError::Closed),
+    ] {
+        assert_eq!(
+            UffdFaultPolicy::admit(
+                registration,
+                mapping,
+                request,
+                FaultAdmissionContext::exact_request(request),
+                lifecycle,
+            ),
+            Err(expected)
+        );
+        assert_eq!(
+            UffdFaultPolicy::admit(
+                registration,
+                mapping,
+                request,
+                FaultAdmissionContext::new_request(capacity, FaultLoad::new(0, 0, 0)),
+                lifecycle,
+            ),
+            Err(expected)
+        );
+    }
+
+    let replacement = uffd_snapshot(2, 61, 5, 0x8000, 2 * PAGE, MappingKind::AnonymousPrivate);
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            replacement,
+            request,
+            FaultAdmissionContext::exact_request(request),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::StaleGeneration)
+    );
+
+    let protected = MappingSnapshot::from_raw(
+        2,
+        61,
+        4,
+        0x8000,
+        2 * PAGE,
+        PAGE,
+        access(true, false, false).bits(),
+        MappingKind::AnonymousPrivate,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            protected,
+            request,
+            FaultAdmissionContext::exact_request(request),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::AccessDenied)
+    );
+
+    let foreign_handler = FaultRequest::new(
+        request.key(),
+        FaultHandlerId::new(10).unwrap(),
+        FaultType::Missing,
+    );
+    assert_eq!(
+        UffdFaultPolicy::admit(
+            registration,
+            mapping,
+            foreign_handler,
+            FaultAdmissionContext::exact_request(foreign_handler),
+            FaultLifecycleState::Open,
+        ),
+        Err(MmError::UffdRegistrationMismatch)
+    );
 }
 
 #[test]

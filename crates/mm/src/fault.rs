@@ -302,7 +302,7 @@ impl FaultCapacity {
     }
 }
 
-/// Consumer-supplied current queue load before admitting one request.
+/// Consumer-supplied current queue load before admitting one new request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FaultLoad {
     address_space: u32,
@@ -336,6 +336,63 @@ impl FaultLoad {
     }
 }
 
+/// Caller-supplied lower-broker facts for one fault admission attempt.
+///
+/// A new request consumes one request slot and therefore carries exact current
+/// load for all three Layer 2 request quotas. An exact request snapshot comes
+/// from the lower broker's coalescing lookup and represents only one additional
+/// waiter on an already-accounted request. The policy compares the complete
+/// snapshot with the request being admitted; page-only matches are rejected.
+///
+/// This value is advisory until the lower broker atomically admits the waiter.
+/// The adapter must keep the lookup, policy check, and lower admission in the
+/// same broker critical section. Lower waiter capacity and request liveness
+/// remain Layer 1 mechanism responsibilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FaultAdmissionContext {
+    /// No exact request exists; admitting this fault would consume a request credit.
+    NewRequest {
+        /// Finite request limits enforced by Layer 2 policy.
+        capacity: FaultCapacity,
+        /// Exact current request counts before publication.
+        load: FaultLoad,
+    },
+    /// The lower broker reported one exact live request to coalesce with.
+    ExactRequest {
+        /// Complete immutable request snapshot returned by the lower broker.
+        broker_request: FaultRequest,
+    },
+}
+
+impl FaultAdmissionContext {
+    /// Describes admission of one request which is not present in the lower broker.
+    pub const fn new_request(capacity: FaultCapacity, load: FaultLoad) -> Self {
+        Self::NewRequest { capacity, load }
+    }
+
+    /// Describes one additional waiter on an exact lower-broker request.
+    pub const fn exact_request(broker_request: FaultRequest) -> Self {
+        Self::ExactRequest { broker_request }
+    }
+}
+
+/// Resource class admitted by [`FaultAdmission`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultAdmissionKind {
+    /// The lower broker must publish and account one new request plus one waiter.
+    NewRequest,
+    /// The lower broker must add only one waiter to an exact live request.
+    CoalescedWaiter,
+}
+
+impl FaultAdmissionKind {
+    /// Whether this admission must acquire a new request credit.
+    pub const fn consumes_request_credit(self) -> bool {
+        matches!(self, Self::NewRequest)
+    }
+}
+
 /// Consumer-owned broker lifecycle observed by policy admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultLifecycleState {
@@ -353,13 +410,13 @@ pub enum FaultLifecycleState {
 pub struct FaultAdmission;
 
 impl FaultAdmission {
-    /// Revalidates the mapping, then checks lifecycle and all three finite
-    /// counts before a task can sleep.
+    /// Checks lifecycle and revalidates the complete request before a task can
+    /// sleep. All three finite request quotas apply only when the lower broker
+    /// does not already contain this exact request.
     pub fn check(
         request: FaultRequest,
         current: MappingSnapshot,
-        capacity: FaultCapacity,
-        load: FaultLoad,
+        context: FaultAdmissionContext,
         lifecycle: FaultLifecycleState,
     ) -> Result<FaultAdmissionPermit, MmError> {
         match lifecycle {
@@ -369,27 +426,49 @@ impl FaultAdmission {
             FaultLifecycleState::Closed => return Err(MmError::Closed),
         }
         request.key.revalidate_admission(current)?;
-        if load.address_space >= capacity.per_address_space
-            || load.handler >= capacity.per_handler
-            || load.global >= capacity.global
-        {
-            return Err(MmError::QuotaExceeded);
-        }
-        Ok(FaultAdmissionPermit { request })
+        let kind = match context {
+            FaultAdmissionContext::NewRequest { capacity, load } => {
+                if load.address_space >= capacity.per_address_space
+                    || load.handler >= capacity.per_handler
+                    || load.global >= capacity.global
+                {
+                    return Err(MmError::QuotaExceeded);
+                }
+                FaultAdmissionKind::NewRequest
+            }
+            FaultAdmissionContext::ExactRequest { broker_request } => {
+                if broker_request != request {
+                    return Err(MmError::FaultRequestMismatch);
+                }
+                FaultAdmissionKind::CoalescedWaiter
+            }
+        };
+        Ok(FaultAdmissionPermit { request, kind })
     }
 }
 
-/// Opaque proof that lifecycle and finite queue limits admitted a request.
+/// Opaque proof that Layer 2 lifecycle, identity, access, and applicable
+/// request-quota checks admitted one fault attempt.
+///
+/// This permit does not prove that the lower broker successfully published a
+/// request or waiter. In particular, a coalesced permit remains subject to an
+/// atomic exact-match recheck and finite waiter capacity in Layer 1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "an admitted fault must be submitted or cancelled by the adapter"]
 pub struct FaultAdmissionPermit {
     request: FaultRequest,
+    kind: FaultAdmissionKind,
 }
 
 impl FaultAdmissionPermit {
     /// Admitted request.
     pub const fn request(self) -> FaultRequest {
         self.request
+    }
+
+    /// Request-credit class selected from the lower-broker facts.
+    pub const fn kind(self) -> FaultAdmissionKind {
+        self.kind
     }
 }
 
@@ -437,7 +516,11 @@ pub trait FaultPort {
     /// Lower mechanism error type.
     type Error;
 
-    /// Publishes one previously admitted request.
+    /// Atomically publishes one previously admitted request/waiter pair.
+    ///
+    /// [`FaultAdmissionKind::CoalescedWaiter`] must still match one exact live
+    /// lower request and acquire an independent waiter slot; the Layer 2 permit
+    /// is not mechanism-level proof that either condition still holds.
     fn submit(&mut self, permit: FaultAdmissionPermit) -> Result<Self::Ticket, Self::Error>;
 
     /// Completes one lower ticket after generation revalidation.

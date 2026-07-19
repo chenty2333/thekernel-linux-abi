@@ -16,7 +16,8 @@
   and non-wrapping tokens.
 - Add generation-safe fault keys whose identity is the address space, mapping,
   consumer fault epoch, absolute page address, and access; typed
-  requests/dispositions; finite admission values; access-aware admission;
+  requests/dispositions; distinct new-request and exact-coalesced-waiter
+  permits; finite request-quota values; access-aware admission;
   identity/coverage-only completion validation; and a lower broker port trait
   without claiming a concrete broker or userfaultfd implementation.
 - Add a Linux v6.12 userfaultfd policy core: copyout-aware one-shot API
@@ -30,8 +31,8 @@
   canonical union for adjacent fragments covered by one post-state VMA without
   adopting its topology generation or access, shared
   REGISTER/UNREGISTER VMA-profile validation, non-wrapping sealed-revision
-  retirement, stateless fault permits, and checked COPY/ZEROPAGE signed-prefix
-  results.
+  retirement, exact lower-request snapshot validation, and checked
+  COPY/ZEROPAGE signed-prefix results.
 - Add affine relocation, whole-remap fragment geometry, page-covering, and
   incremental memlock planners.
 - Support dependency-free `no_std`, `forbid(unsafe_code)`, Rust 1.85, RISC-V 64,

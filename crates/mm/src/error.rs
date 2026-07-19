@@ -56,6 +56,9 @@ pub enum MmError {
     Busy,
     /// A fault ticket no longer names a pending request.
     UnknownFault,
+    /// An exact lower-broker request snapshot does not match the fault being
+    /// admitted.
+    FaultRequestMismatch,
     /// Raw `userfaultfd(2)` creation flags contain an unknown bit.
     InvalidUffdFlags,
     /// The requested userfaultfd API number does not match Linux `UFFD_API`.

@@ -28,8 +28,9 @@ Version 0.1.0 provides:
   I/O range is not incorrectly forced into one backend or mapping snapshot;
 - generation-safe `FaultKey` identity over address space, logical mapping,
   consumer fault epoch, absolute page address, and access; typed fault
-  requests/dispositions; finite capacity admission values; stale-reply
-  validation; and a `FaultPort` seam for a lower generic broker;
+  requests/dispositions; distinct new-request versus exact-coalesced-waiter
+  admission; finite capacity values; stale-reply validation; and a `FaultPort`
+  seam for a lower generic broker;
 - a Linux v6.12 userfaultfd policy core with transactional API negotiation,
   anonymous-private MISSING registrations, O(1)-stack multi-VMA
   preflight/commit and mapping-refresh transactions, and checked
@@ -144,13 +145,24 @@ address-space capability and intentionally does not require the invoking
 handler to own the destination registration.
 
 The lower broker remains the sole source of truth for fault queues and credits.
-It must atomically claim FIFO `Pending -> Delivered` before copying one
+Its exact-match lookup supplies the complete existing `FaultRequest`, not only
+a page address. Layer 2 rechecks registration, current mapping, access, and
+lifecycle for every admission. A genuinely new request also checks
+per-address-space, per-handler, and system-wide request quotas; an exact
+existing request is already charged, so adding a waiter skips only those
+request quotas. The resulting permit reports which request-credit class was
+admitted, but does not prove that lower admission succeeded. Lookup, policy,
+and lower admission must share one externally serialized broker critical
+section, and the broker still atomically rechecks exact identity and enforces
+finite waiter capacity.
+
+The broker must atomically claim FIFO `Pending -> Delivered` before copying one
 `uffd_msg`; a failed message copyout leaves the request Delivered, not
 requeueable. Before API initialization, read returns `EINVAL` and poll reports
 `ERR`. Linux poll also reports `ERR` for a blocking FD; only an initialized
-`O_NONBLOCK` FD may report `IN` when a pending event exists. A read buffer
-must hold at least one 32-byte message, the first message may block, and
-subsequent messages in the same read are claimed without waiting.
+`O_NONBLOCK` FD may report `IN` when a pending event exists. A read buffer must
+hold at least one 32-byte message, the first message may block, and subsequent
+messages in the same read are claimed without waiting.
 
 ## Pin transaction
 

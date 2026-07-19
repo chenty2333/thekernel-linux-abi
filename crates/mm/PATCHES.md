@@ -37,10 +37,13 @@
   validation, and a lower port trait. Fault identity uses an absolute page plus
   caller-owned mapping/fault epoch, so a surviving VMA split does not make an
   unchanged page relative to a new range start. Admission checks current
-  access, while resolver/completion revalidates identity and coverage without
+  access and distinguishes a quota-consuming new request from an exact
+  lower-broker request which only adds a waiter. The full broker snapshot must
+  equal the fault request; no fabricated lower load is used to bypass request
+  quotas. Resolver/completion revalidates identity and coverage without
   rejecting a page install solely because a later protection change will make
-  the retried fault fail. Concrete broker queues, waiters, observers, wakeups,
-  readiness, and coalescing remain generic VM mechanisms.
+  the retried fault fail. Concrete broker queues, waiter limits, observers,
+  wakeups, readiness, and coalescing remain generic VM mechanisms.
 - Add Linux v6.12 userfaultfd policy without importing a second queue:
   transactional API negotiation, bounded MISSING registration ownership,
   constant-stack multi-VMA preflight/commit, mixed-handler mapping

@@ -1,8 +1,8 @@
 use core::num::NonZeroU64;
 
 use crate::{
-    AddressSpaceId, FaultAdmission, FaultAdmissionPermit, FaultCapacity, FaultCompletionPermit,
-    FaultDisposition, FaultHandlerId, FaultLifecycleState, FaultLoad, FaultRequest,
+    AddressSpaceId, FaultAdmission, FaultAdmissionContext, FaultAdmissionPermit,
+    FaultCompletionPermit, FaultDisposition, FaultHandlerId, FaultLifecycleState, FaultRequest,
     MappingGeneration, MappingId, MappingKind, MappingSnapshot, MmError, PageRange, UserRange,
     validate_fault_completion,
 };
@@ -1668,17 +1668,16 @@ fn page_range_intersection(left: PageRange, right: PageRange) -> Option<PageRang
 pub struct UffdFaultPolicy;
 
 impl UffdFaultPolicy {
-    /// Validates registration ownership and finite lower-broker admission.
+    /// Validates registration ownership and typed lower-broker admission.
     pub fn admit(
         registration: UffdRegistration,
         current: MappingSnapshot,
         request: FaultRequest,
-        capacity: FaultCapacity,
-        load: FaultLoad,
+        context: FaultAdmissionContext,
         lifecycle: FaultLifecycleState,
     ) -> Result<FaultAdmissionPermit, MmError> {
         registration.validate_fault_admission(current, request)?;
-        FaultAdmission::check(request, current, capacity, load, lifecycle)
+        FaultAdmission::check(request, current, context, lifecycle)
     }
 
     /// Revalidates one lower ticket's identity and page coverage before
