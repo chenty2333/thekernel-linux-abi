@@ -88,17 +88,14 @@ impl SeccompState {
         }
     }
 
-    /// Applies a caller state after a successful group-wide eligibility scan.
+    /// Prepares the caller state for a later group-wide synchronized commit.
     ///
-    /// Task-group locking and all-or-nothing publication are adapter-owned.
-    /// Calling this on an ineligible state is rejected without mutation.
-    pub fn try_synchronize_from(&mut self, caller: &Self) -> Result<(), StateTransitionError> {
+    /// This method never mutates the sibling. Task-group locking, fallible
+    /// storage preparation, `no_new_privs` propagation, and the final
+    /// all-or-nothing publication remain adapter-owned.
+    pub fn prepare_synchronized_from(&self, caller: &Self) -> Result<Self, StateTransitionError> {
         match self.sync_eligibility(caller) {
-            SyncEligibility::Eligible => {
-                self.mode = SeccompMode::Filter;
-                self.filters = caller.filters.clone();
-                Ok(())
-            }
+            SyncEligibility::Eligible => Ok(caller.clone()),
             SyncEligibility::CallerNotFiltered => Err(StateTransitionError::InvalidPreparedState),
             SyncEligibility::ModeConflict | SyncEligibility::DivergentFilter => {
                 Err(StateTransitionError::ModeConflict)
@@ -136,9 +133,11 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::{ClassicBpfInstruction, FilterMetadata, SECCOMP_RET_ALLOW, VerifiedProgram};
+    use crate::{
+        ClassicBpfInstruction, FilterBudget, FilterMetadata, SECCOMP_RET_ALLOW, VerifiedProgram,
+    };
 
-    fn append(chain: &FilterChain) -> FilterChain {
+    fn append(chain: &FilterChain, budget: &FilterBudget) -> FilterChain {
         chain
             .try_append(
                 VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
@@ -149,6 +148,7 @@ mod tests {
                 )])
                 .unwrap(),
                 FilterMetadata::default(),
+                budget,
             )
             .unwrap()
     }
@@ -156,11 +156,12 @@ mod tests {
     #[test]
     fn prepared_publication_detects_stale_and_wrong_parent() {
         let mut state = SeccompState::disabled();
+        let budget = FilterBudget::try_new(usize::MAX).unwrap();
         let root = state.filters();
-        let first = append(&root);
+        let first = append(&root, &budget);
         state.try_publish_filter(&root, &first).unwrap();
 
-        let divergent = append(&root);
+        let divergent = append(&root, &budget);
         assert_eq!(
             state.try_publish_filter(&root, &divergent),
             Err(StateTransitionError::Stale)
@@ -176,13 +177,14 @@ mod tests {
     #[test]
     fn strict_mode_is_irreversible() {
         let mut state = SeccompState::disabled();
+        let budget = FilterBudget::try_new(usize::MAX).unwrap();
         state.try_enter_strict().unwrap();
         assert_eq!(
             state.try_enter_strict(),
             Err(StateTransitionError::ModeConflict)
         );
         let root = FilterChain::empty();
-        let filter = append(&root);
+        let filter = append(&root, &budget);
         assert_eq!(
             state.try_publish_filter(&root, &filter),
             Err(StateTransitionError::ModeConflict)
@@ -192,8 +194,9 @@ mod tests {
     #[test]
     fn tsync_accepts_disabled_and_ancestor_but_rejects_divergence() {
         let root = FilterChain::empty();
-        let first = append(&root);
-        let second = append(&first);
+        let budget = FilterBudget::try_new(usize::MAX).unwrap();
+        let first = append(&root, &budget);
+        let second = append(&first, &budget);
 
         let mut caller = SeccompState::disabled();
         caller.try_publish_filter(&root, &first).unwrap();
@@ -211,7 +214,7 @@ mod tests {
             SyncEligibility::Eligible
         );
 
-        let divergent_leaf = append(&root);
+        let divergent_leaf = append(&root, &budget);
         let mut divergent = SeccompState::disabled();
         divergent
             .try_publish_filter(&root, &divergent_leaf)
@@ -223,13 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn sync_publication_shares_exact_leaf() {
+    fn sync_preparation_is_non_mutating_and_shares_exact_leaf() {
         let root = FilterChain::empty();
-        let leaf = append(&root);
+        let budget = FilterBudget::try_new(usize::MAX).unwrap();
+        let leaf = append(&root, &budget);
         let mut caller = SeccompState::disabled();
         caller.try_publish_filter(&root, &leaf).unwrap();
-        let mut sibling = SeccompState::disabled();
-        sibling.try_synchronize_from(&caller).unwrap();
-        assert!(sibling.filters().same_identity(&caller.filters()));
+        let sibling = SeccompState::disabled();
+        let prepared = sibling.prepare_synchronized_from(&caller).unwrap();
+        assert_eq!(sibling.mode(), SeccompMode::Disabled);
+        assert!(prepared.filters().same_identity(&caller.filters()));
     }
 }

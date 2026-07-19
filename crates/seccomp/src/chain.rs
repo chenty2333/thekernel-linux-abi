@@ -1,6 +1,10 @@
 use alloc::sync::Arc;
+use core::mem::size_of;
 
-use crate::{Action, FILTER_PATH_PENALTY, MAX_INSNS_PER_PATH, SeccompData, VerifiedProgram};
+use crate::{
+    Action, ClassicBpfInstruction, FILTER_PATH_PENALTY, FilterBudget, MAX_INSNS_PER_PATH,
+    SeccompData, VerifiedProgram, budget::FilterCharge,
+};
 
 /// Per-filter installation metadata retained with an immutable program.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -27,9 +31,25 @@ pub struct FilterDecision {
 struct FilterNode {
     program: VerifiedProgram,
     metadata: FilterMetadata,
-    previous: FilterChain,
+    previous: Option<Arc<FilterNode>>,
     path_cost: usize,
     filter_count: usize,
+    _charge: FilterCharge,
+}
+
+impl Drop for FilterNode {
+    fn drop(&mut self) {
+        let mut cursor = self.previous.take();
+        while let Some(node) = cursor {
+            match Arc::try_unwrap(node) {
+                Ok(mut unique) => cursor = unique.previous.take(),
+                Err(shared) => {
+                    drop(shared);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// An immutable, reference-counted seccomp filter ancestry.
@@ -77,16 +97,16 @@ impl FilterChain {
         if self.leaf.is_none() {
             return true;
         }
-        let mut cursor = descendant.clone();
-        while let Some(node) = cursor.leaf.as_ref() {
+        let mut cursor = descendant.leaf.as_deref();
+        while let Some(node) = cursor {
             if self
                 .leaf
                 .as_ref()
-                .is_some_and(|ancestor| Arc::ptr_eq(ancestor, node))
+                .is_some_and(|ancestor| core::ptr::eq(ancestor.as_ref(), node))
             {
                 return true;
             }
-            cursor = node.previous.clone();
+            cursor = node.previous.as_deref();
         }
         false
     }
@@ -100,6 +120,7 @@ impl FilterChain {
         &self,
         program: VerifiedProgram,
         metadata: FilterMetadata,
+        budget: &FilterBudget,
     ) -> Result<Self, FilterInstallError> {
         let path_cost = if self.is_empty() {
             program.len()
@@ -117,12 +138,28 @@ impl FilterChain {
             .filter_count()
             .checked_add(1)
             .ok_or(FilterInstallError::PathTooLong)?;
+        if self
+            .leaf
+            .as_ref()
+            .is_some_and(|leaf| !leaf._charge.belongs_to(budget))
+        {
+            return Err(FilterInstallError::BudgetMismatch);
+        }
+        let charge_bytes = program
+            .len()
+            .checked_mul(size_of::<ClassicBpfInstruction>())
+            .and_then(|bytes| bytes.checked_add(size_of::<FilterNode>()))
+            .ok_or(FilterInstallError::BudgetExceeded)?;
+        let charge = budget
+            .try_reserve(charge_bytes)
+            .map_err(|_| FilterInstallError::BudgetExceeded)?;
         let node = Arc::try_new(FilterNode {
             program,
             metadata,
-            previous: self.clone(),
+            previous: self.leaf.clone(),
             path_cost,
             filter_count,
+            _charge: charge,
         })
         .map_err(|_| FilterInstallError::NoMemory)?;
         Ok(Self { leaf: Some(node) })
@@ -133,7 +170,11 @@ impl FilterChain {
     pub fn directly_extends(&self, previous: &Self) -> bool {
         self.leaf
             .as_ref()
-            .is_some_and(|leaf| leaf.previous.same_identity(previous))
+            .is_some_and(|leaf| match (&leaf.previous, &previous.leaf) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            })
     }
 
     /// Runs every filter newest-to-oldest without allocation or mutation.
@@ -148,7 +189,7 @@ impl FilterChain {
                 selected = current;
                 matched_filter = Some(node.metadata);
             }
-            cursor = node.previous.leaf.as_ref();
+            cursor = node.previous.as_ref();
         }
         FilterDecision {
             action: selected,
@@ -164,11 +205,15 @@ pub enum FilterInstallError {
     NoMemory,
     /// Linux's 32768-instruction ancestry budget would be exceeded.
     PathTooLong,
+    /// The aggregate live-program byte budget cannot cover the new node.
+    BudgetExceeded,
+    /// An append attempted to splice nodes from different budget domains.
+    BudgetMismatch,
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     use super::*;
     use crate::{
@@ -195,17 +240,54 @@ mod tests {
         }
     }
 
+    fn budget() -> FilterBudget {
+        FilterBudget::try_new(usize::MAX).unwrap()
+    }
+
+    fn returning_with_len(length: usize, value: u32) -> VerifiedProgram {
+        let mut instructions = Vec::new();
+        instructions.try_reserve_exact(length).unwrap();
+        for _ in 1..length {
+            instructions.push(ClassicBpfInstruction::new(
+                crate::BPF_LD | crate::BPF_IMM,
+                0,
+                0,
+                0,
+            ));
+        }
+        instructions.push(ClassicBpfInstruction::new(
+            crate::BPF_RET | crate::BPF_K,
+            0,
+            0,
+            value,
+        ));
+        VerifiedProgram::try_from_vec(instructions).unwrap()
+    }
+
     #[test]
     fn immutable_identity_distinguishes_divergent_equal_programs() {
         let root = FilterChain::empty();
+        let budget = budget();
         let left = root
-            .try_append(returning(SECCOMP_RET_ALLOW), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap();
         let right = root
-            .try_append(returning(SECCOMP_RET_ALLOW), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap();
         let child = left
-            .try_append(returning(SECCOMP_RET_ALLOW), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap();
         assert!(root.is_ancestor_of(&left));
         assert!(left.is_ancestor_of(&child));
@@ -216,17 +298,31 @@ mod tests {
     #[test]
     fn signed_precedence_is_order_independent() {
         let root = FilterChain::empty();
+        let budget = budget();
         let chain = root
-            .try_append(returning(SECCOMP_RET_LOG), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_LOG),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap()
-            .try_append(returning(SECCOMP_RET_ERRNO | 9), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_ERRNO | 9),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap()
             .try_append(
                 returning(SECCOMP_RET_KILL_PROCESS),
                 FilterMetadata::default(),
+                &budget,
             )
             .unwrap()
-            .try_append(returning(SECCOMP_RET_TRAP | 7), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_TRAP | 7),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap();
         assert_eq!(
             chain.evaluate(&data()).action.raw(),
@@ -236,6 +332,7 @@ mod tests {
 
     #[test]
     fn equal_precedence_keeps_newest_data_and_metadata() {
+        let budget = budget();
         let older = FilterChain::empty()
             .try_append(
                 returning(SECCOMP_RET_ERRNO | 3),
@@ -243,6 +340,7 @@ mod tests {
                     log: false,
                     speculative_execution_allowed: false,
                 },
+                &budget,
             )
             .unwrap();
         let newest_metadata = FilterMetadata {
@@ -250,7 +348,7 @@ mod tests {
             speculative_execution_allowed: true,
         };
         let chain = older
-            .try_append(returning(SECCOMP_RET_ERRNO | 11), newest_metadata)
+            .try_append(returning(SECCOMP_RET_ERRNO | 11), newest_metadata, &budget)
             .unwrap();
         let decision = chain.evaluate(&data());
         assert_eq!(decision.action.raw(), SECCOMP_RET_ERRNO | 11);
@@ -259,14 +357,180 @@ mod tests {
 
     #[test]
     fn path_cost_includes_four_instruction_ancestor_penalty() {
+        let budget = budget();
         let first = FilterChain::empty()
-            .try_append(returning(SECCOMP_RET_ALLOW), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap();
         let second = first
-            .try_append(returning(SECCOMP_RET_ALLOW), FilterMetadata::default())
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
             .unwrap();
         assert_eq!(first.path_cost(), 1);
         assert_eq!(second.path_cost(), 6);
         assert_eq!(second.filter_count(), 2);
+    }
+
+    #[test]
+    fn exact_path_limit_is_accepted_and_next_append_is_atomic() {
+        let budget = budget();
+        let mut chain = FilterChain::empty()
+            .try_append(
+                returning_with_len(3, SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
+            .unwrap();
+        for _ in 1..6_554 {
+            chain = chain
+                .try_append(
+                    returning(SECCOMP_RET_ALLOW),
+                    FilterMetadata::default(),
+                    &budget,
+                )
+                .unwrap();
+        }
+        assert_eq!(chain.path_cost(), MAX_INSNS_PER_PATH);
+        let identity = chain.clone();
+        assert!(matches!(
+            chain.try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            ),
+            Err(FilterInstallError::PathTooLong)
+        ));
+        assert!(chain.same_identity(&identity));
+    }
+
+    #[test]
+    fn maximum_depth_drops_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let budget = budget();
+                let mut chain = FilterChain::empty();
+                for _ in 0..6_554 {
+                    chain = chain
+                        .try_append(
+                            returning(SECCOMP_RET_ALLOW),
+                            FilterMetadata::default(),
+                            &budget,
+                        )
+                        .unwrap();
+                }
+                drop(chain);
+                assert_eq!(budget.used_bytes(), 0);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_last_owners_release_a_deep_chain_iteratively() {
+        use std::sync::{Arc as StdArc, Barrier};
+
+        const WORKERS: usize = 8;
+        let budget = budget();
+        let mut chain = FilterChain::empty();
+        for _ in 0..6_554 {
+            chain = chain
+                .try_append(
+                    returning(SECCOMP_RET_ALLOW),
+                    FilterMetadata::default(),
+                    &budget,
+                )
+                .unwrap();
+        }
+        let barrier = StdArc::new(Barrier::new(WORKERS + 1));
+        let mut handles = Vec::new();
+        handles.try_reserve_exact(WORKERS).unwrap();
+        for _ in 0..WORKERS {
+            let owned = chain.clone();
+            let barrier = barrier.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(64 * 1024)
+                    .spawn(move || {
+                        barrier.wait();
+                        drop(owned);
+                    })
+                    .unwrap(),
+            );
+        }
+        drop(chain);
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn aggregate_budget_rolls_back_and_refunds_on_final_drop() {
+        let probe_budget = budget();
+        let probe = FilterChain::empty()
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &probe_budget,
+            )
+            .unwrap();
+        let one_node_bytes = probe_budget.used_bytes();
+        drop(probe);
+        assert_eq!(probe_budget.used_bytes(), 0);
+
+        let budget = FilterBudget::try_new(one_node_bytes).unwrap();
+        let first = FilterChain::empty()
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
+            .unwrap();
+        let shared = first.clone();
+        assert_eq!(budget.used_bytes(), one_node_bytes);
+        assert!(matches!(
+            first.try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            ),
+            Err(FilterInstallError::BudgetExceeded)
+        ));
+        assert_eq!(budget.used_bytes(), one_node_bytes);
+        drop(first);
+        assert_eq!(budget.used_bytes(), one_node_bytes);
+        drop(shared);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn chain_rejects_cross_budget_splicing() {
+        let first_budget = budget();
+        let second_budget = budget();
+        let chain = FilterChain::empty()
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &first_budget,
+            )
+            .unwrap();
+        assert!(matches!(
+            chain.try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &second_budget,
+            ),
+            Err(FilterInstallError::BudgetMismatch)
+        ));
+        assert_eq!(second_budget.used_bytes(), 0);
     }
 }

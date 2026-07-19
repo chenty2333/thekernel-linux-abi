@@ -13,15 +13,19 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod action;
 mod bpf;
+mod budget;
 mod chain;
 mod state;
 mod uapi;
 
 pub use action::{Action, ActionClass, MAX_ERRNO};
 pub use bpf::{ClassicBpfInstruction, ProgramError, SeccompData, VerifiedProgram};
+pub use budget::{FilterBudget, FilterBudgetCreateError};
 pub use chain::{FilterChain, FilterDecision, FilterInstallError, FilterMetadata};
 pub use state::{SeccompMode, SeccompState, StateTransitionError, SyncEligibility};
 pub use uapi::*;

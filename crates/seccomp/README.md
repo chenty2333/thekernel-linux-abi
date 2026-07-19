@@ -4,6 +4,7 @@
 
 - validation and allocation-free execution of the seccomp classic-BPF subset;
 - immutable, bounded filter chains with Linux action precedence;
+- aggregate live-program byte accounting with final-owner refunds;
 - explicit per-task mode, inheritance, and thread-sync eligibility rules; and
 - Linux UAPI values used by a kernel adapter.
 
@@ -11,9 +12,15 @@ It deliberately does not dereference userspace, own task/thread-group locks,
 deliver signals, stop tasks, allocate file descriptors, or implement seccomp
 user notification. A consumer copies an entire `sock_fprog`, prepares a
 verified immutable program before its publication gate, and then atomically
-publishes the resulting `FilterChain` to one task or an eligible thread group.
+publishes the resulting `FilterChain` to one task. The core can validate and
+prepare an eligible sibling state for thread synchronization, but the consumer
+must provide the stable thread-set gate, preallocate every filter and
+`no_new_privs` transition, and perform the all-or-nothing group commit.
 
 The interpreter has no backwards branches and performs no allocation. Filter
 installation is bounded by Linux's 4096-instruction per-program limit and
 32768-instruction path accounting, including the four-instruction stacking
-penalty for every inherited program.
+penalty for every inherited program. Every new immutable node is also charged
+to an explicit shared `FilterBudget`; clone and fork share the existing charge,
+and the final owner refunds it. Maximum-depth and concurrent-final-owner tests
+exercise iterative teardown on a 64 KiB host thread stack.
