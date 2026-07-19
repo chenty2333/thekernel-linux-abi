@@ -89,7 +89,7 @@ pub enum MmError {
     UnsupportedUffdDisposition,
     /// Raw UFFDIO_COPY mode contains a bit outside Linux v6.12.
     InvalidUffdCopyMode,
-    /// UFFDIO_COPY requests a known mode outside the bounded initial profile.
+    /// A consumer rejects a known UFFDIO_COPY mode outside its bounded profile.
     UnsupportedUffdCopyMode,
     /// Raw UFFDIO_ZEROPAGE mode contains an unsupported bit.
     InvalidUffdZeroPageMode,

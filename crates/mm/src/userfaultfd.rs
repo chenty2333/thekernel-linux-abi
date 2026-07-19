@@ -1736,7 +1736,7 @@ impl UffdFaultPolicy {
     }
 }
 
-/// Checked first-profile UFFDIO_COPY mode.
+/// Checked Linux v6.12 UFFDIO_COPY mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UffdCopyMode(u64);
 
@@ -1745,13 +1745,16 @@ impl UffdCopyMode {
     const WP: u64 = 1 << 1;
     const LINUX_V6_12: u64 = Self::DONTWAKE | Self::WP;
 
-    /// Accepts zero or DONTWAKE; recognizes but rejects WP in this profile.
+    /// Accepts every Linux v6.12 COPY mode bit.
+    ///
+    /// This pure-policy type distinguishes a recognized request from an
+    /// unknown raw bit. A consumer that has not implemented write-protected
+    /// publication must reject [`Self::write_protect`] only after resolving
+    /// the target-mm/range error precedence and must report that lower error
+    /// through Linux's signed `uffdio_copy.copy` result field.
     pub const fn from_bits(bits: u64) -> Result<Self, MmError> {
         if bits & !Self::LINUX_V6_12 != 0 {
             return Err(MmError::InvalidUffdCopyMode);
-        }
-        if bits & Self::WP != 0 {
-            return Err(MmError::UnsupportedUffdCopyMode);
         }
         Ok(Self(bits))
     }
@@ -1762,6 +1765,11 @@ impl UffdCopyMode {
 
     pub const fn dontwake(self) -> bool {
         self.0 & Self::DONTWAKE != 0
+    }
+
+    /// Requests atomic write protection together with page installation.
+    pub const fn write_protect(self) -> bool {
+        self.0 & Self::WP != 0
     }
 }
 

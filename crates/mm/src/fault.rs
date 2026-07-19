@@ -341,8 +341,10 @@ impl FaultLoad {
 /// A new request consumes one request slot and therefore carries exact current
 /// load for all three Layer 2 request quotas. An exact request snapshot comes
 /// from the lower broker's coalescing lookup and represents only one additional
-/// waiter on an already-accounted request. The policy compares the complete
-/// snapshot with the request being admitted; page-only matches are rejected.
+/// waiter on an already-accounted, still-coalescible request. The policy
+/// compares the complete snapshot with the request being admitted; page-only
+/// matches are rejected. A visible terminal must not be supplied through this
+/// context: its later same-key fault is a new request.
 ///
 /// This value is advisory until the lower broker atomically admits the waiter.
 /// The adapter must keep the lookup, policy check, and lower admission in the
@@ -358,7 +360,7 @@ pub enum FaultAdmissionContext {
         /// Exact current request counts before publication.
         load: FaultLoad,
     },
-    /// The lower broker reported one exact live request to coalesce with.
+    /// The lower broker reported one exact non-visible request to coalesce with.
     ExactRequest {
         /// Complete immutable request snapshot returned by the lower broker.
         broker_request: FaultRequest,
@@ -411,8 +413,8 @@ pub struct FaultAdmission;
 
 impl FaultAdmission {
     /// Checks lifecycle and revalidates the complete request before a task can
-    /// sleep. All three finite request quotas apply only when the lower broker
-    /// does not already contain this exact request.
+    /// sleep. All three finite request quotas apply unless the lower broker
+    /// reports this exact request as still coalescible.
     pub fn check(
         request: FaultRequest,
         current: MappingSnapshot,
@@ -518,9 +520,10 @@ pub trait FaultPort {
 
     /// Atomically publishes one previously admitted request/waiter pair.
     ///
-    /// [`FaultAdmissionKind::CoalescedWaiter`] must still match one exact live
-    /// lower request and acquire an independent waiter slot; the Layer 2 permit
-    /// is not mechanism-level proof that either condition still holds.
+    /// [`FaultAdmissionKind::CoalescedWaiter`] must still match one exact
+    /// non-visible lower request and acquire an independent waiter slot; the
+    /// Layer 2 permit is not mechanism-level proof that either condition still
+    /// holds.
     fn submit(&mut self, permit: FaultAdmissionPermit) -> Result<Self::Ticket, Self::Error>;
 
     /// Completes one lower ticket after generation revalidation.

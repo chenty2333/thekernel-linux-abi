@@ -32,7 +32,10 @@
   post-state VMA without adopting its topology generation or access, shared
   REGISTER/UNREGISTER VMA-profile validation, non-wrapping sealed-revision
   retirement, exact lower-request snapshot validation, and checked
-  COPY/ZEROPAGE signed-prefix results.
+  COPY/ZEROPAGE signed-prefix results. COPY mode parsing recognizes every Linux
+  v6.12 bit, including `WP`, so consumers can preserve target-mm/range error
+  precedence before reporting a bounded-profile rejection through the signed
+  result field.
 - Add affine relocation, whole-remap fragment geometry, page-covering, and
   incremental memlock planners.
 - Support dependency-free `no_std`, `forbid(unsafe_code)`, Rust 1.85, RISC-V 64,

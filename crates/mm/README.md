@@ -55,8 +55,11 @@ owns raw ABI decoding and all userspace copyin/copyout.
 `FaultPort` is only a dependency-inversion seam. The crate does not contain a
 queue, waiter table, observer list, wakeup implementation, readiness source, or
 userfaultfd file. Its userfaultfd types are reusable Linux policy for a future
-adapter, not a claim that the embedding kernel already exposes a complete
-`userfaultfd(2)` syscall.
+adapter. TheKernel currently composes them with `thekernel-axfault` and its own
+MM/file/syscall adapters to expose a bounded anonymous-private 4-KiB MISSING
+profile. That consumer integration is not part of this crate, does not make it
+available to every embedding kernel, and is not a claim of complete
+`userfaultfd(2)` coverage.
 
 ## Initial userfaultfd profile
 
@@ -136,26 +139,32 @@ strict ordering, non-overlap, and actual intersection remain Layer 2 policy.
 Raw ioctl ranges may contain unmapped gaps; the adapter only supplies the
 ordered fragments that exist.
 
-COPY accepts only zero or `DONTWAKE` mode; COPY-WP is recognized but rejected.
-ZEROPAGE likewise accepts only zero or `DONTWAKE`. Positive lower completion
-is a page-aligned prefix: a full prefix returns success, a short positive
-prefix is reported and returns `EAGAIN`, and a zero-page failure reports the
+COPY policy recognizes every Linux v6.12 mode bit, including `DONTWAKE` and
+`WP`; this distinguishes a known request from malformed raw bits. A consumer
+without write-protected publication, including TheKernel's current
+MISSING-only adapter, must first resolve target-mm/range error precedence and
+then report its profile rejection through the signed `uffdio_copy.copy` field.
+ZEROPAGE accepts only zero or `DONTWAKE`. Positive lower completion is a
+page-aligned prefix: a full prefix returns success, a short positive prefix is
+reported and returns `EAGAIN`, and a zero-page failure reports the
 adapter-mapped negative errno. Installed pages survive result-copyout failure;
 wake happens only after successful result copyout. Resolver lookup is an
 address-space capability and intentionally does not require the invoking
 handler to own the destination registration.
 
 The lower broker remains the sole source of truth for fault queues and credits.
-Its exact-match lookup supplies the complete existing `FaultRequest`, not only
-a page address. Layer 2 rechecks registration, current mapping, access, and
-lifecycle for every admission. A genuinely new request also checks
-per-address-space, per-handler, and system-wide request quotas; an exact
-existing request is already charged, so adding a waiter skips only those
-request quotas. The resulting permit reports which request-credit class was
-admitted, but does not prove that lower admission succeeded. Lookup, policy,
-and lower admission must share one externally serialized broker critical
-section, and the broker still atomically rechecks exact identity and enforces
-finite waiter capacity.
+Its coalescing lookup supplies the complete exact, still-coalescible
+`FaultRequest`, not only a page address. Layer 2 rechecks registration, current
+mapping, access, and lifecycle for every admission. A genuinely new request
+also checks per-address-space, per-handler, and system-wide request quotas; an
+exact non-visible request is already charged, so adding a waiter skips only
+those request quotas. A visible terminal is not coalescible and must be
+classified as a new bounded request even while its older waiter retains it.
+The resulting permit reports which request-credit class was admitted, but does
+not prove that lower admission succeeded. Lookup, policy, and lower admission
+must share one externally serialized broker critical section, and the broker
+still atomically rechecks exact identity, coalescibility, and finite waiter
+capacity.
 
 The broker must atomically claim FIFO `Pending -> Delivered` before copying one
 `uffd_msg`; a failed message copyout leaves the request Delivered, not

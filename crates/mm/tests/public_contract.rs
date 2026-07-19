@@ -2087,10 +2087,12 @@ fn userfaultfd_resolver_is_bound_mm_capability_with_signed_prefix_progress() {
         UffdCopyMode::from_bits(1 << 2),
         Err(MmError::InvalidUffdCopyMode)
     );
-    assert_eq!(
-        UffdCopyMode::from_bits(1 << 1),
-        Err(MmError::UnsupportedUffdCopyMode)
-    );
+    let copy_wp = UffdCopyMode::from_bits(1 << 1).unwrap();
+    assert!(copy_wp.write_protect());
+    assert!(!copy_wp.dontwake());
+    let copy_wp_dontwake = UffdCopyMode::from_bits((1 << 1) | 1).unwrap();
+    assert!(copy_wp_dontwake.write_protect());
+    assert!(copy_wp_dontwake.dontwake());
     assert_eq!(
         UffdZeroPageMode::from_bits(1 << 1),
         Err(MmError::InvalidUffdZeroPageMode)
