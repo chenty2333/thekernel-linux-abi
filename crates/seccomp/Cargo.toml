@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["kernel", "linux", "no-std", "seccomp", "bpf"]
 categories = ["no-std", "os"]
 
+[dependencies]
+axcbpf.workspace = true
+
 [features]
 default = []
 

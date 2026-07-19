@@ -25,6 +25,7 @@ repository = "https://github.com/chenty2333/thekernel-linux-abi"
 homepage = "https://github.com/chenty2333/thekernel-linux-abi"
 
 [workspace.dependencies]
+axcbpf = { package = "thekernel-axcbpf", path = "../thekernel-ax/crates/thekernel-axcbpf", version = "=0.1.0" }
 axcpu = { version = "=0.3.0-preview.8", features = ["uspace"] }
 axsync = { version = "=0.3.0-preview.2", default-features = false }
 bitflags = "2.6"

@@ -131,6 +131,7 @@ pub enum StateTransitionError {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use axcbpf::opcode;
 
     use super::*;
     use crate::{
@@ -141,7 +142,7 @@ mod tests {
         chain
             .try_append(
                 VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
-                    crate::BPF_RET | crate::BPF_K,
+                    opcode::RET_K,
                     0,
                     0,
                     SECCOMP_RET_ALLOW,

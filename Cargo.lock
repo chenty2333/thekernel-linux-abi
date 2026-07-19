@@ -891,6 +891,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-axcbpf"
+version = "0.1.0"
+
+[[package]]
 name = "thekernel-linux-cred"
 version = "0.1.0"
 dependencies = [
@@ -920,6 +924,9 @@ dependencies = [
 [[package]]
 name = "thekernel-linux-seccomp"
 version = "0.1.0"
+dependencies = [
+ "thekernel-axcbpf",
+]
 
 [[package]]
 name = "thekernel-linux-signal"

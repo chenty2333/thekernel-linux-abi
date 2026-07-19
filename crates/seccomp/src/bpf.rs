@@ -1,38 +1,11 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
-use crate::{
-    BPF_A, BPF_ABS, BPF_ADD, BPF_ALU, BPF_AND, BPF_CLASS_MASK, BPF_DIV, BPF_IMM, BPF_JA, BPF_JEQ,
-    BPF_JGE, BPF_JGT, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_LDX, BPF_LEN, BPF_LSH, BPF_MAXINSNS,
-    BPF_MEM, BPF_MEMWORDS, BPF_MISC, BPF_MUL, BPF_NEG, BPF_OP_MASK, BPF_OR, BPF_RET, BPF_RSH,
-    BPF_RVAL_MASK, BPF_SRC_MASK, BPF_ST, BPF_STX, BPF_SUB, BPF_TAX, BPF_TXA, BPF_W, BPF_X, BPF_XOR,
-    SECCOMP_DATA_SIZE, SECCOMP_RET_KILL_PROCESS,
-};
+use axcbpf::{Input, LoadWidth, Program, VerifyError, opcode};
+
+use crate::{BPF_MAXINSNS, SECCOMP_DATA_SIZE};
 
 /// Linux `struct sock_filter`, the eight-byte classic-BPF instruction format.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-#[repr(C)]
-pub struct ClassicBpfInstruction {
-    /// Encoded class, operation, source, size, and addressing mode.
-    pub code: u16,
-    /// Relative forward offset when a conditional branch is true.
-    pub jump_true: u8,
-    /// Relative forward offset when a conditional branch is false.
-    pub jump_false: u8,
-    /// Immediate, absolute byte offset, scratch index, or jump distance.
-    pub value: u32,
-}
-
-impl ClassicBpfInstruction {
-    /// Creates one instruction from its Linux UAPI fields.
-    pub const fn new(code: u16, jump_true: u8, jump_false: u8, value: u32) -> Self {
-        Self {
-            code,
-            jump_true,
-            jump_false,
-            value,
-        }
-    }
-}
+pub use axcbpf::Instruction as ClassicBpfInstruction;
 
 /// Immutable syscall facts visible to a seccomp filter.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -67,6 +40,19 @@ impl SeccompData {
     }
 }
 
+impl Input for SeccompData {
+    fn len(&self) -> u32 {
+        SECCOMP_DATA_SIZE as u32
+    }
+
+    fn load(&self, offset: u32, width: LoadWidth) -> Option<u32> {
+        if width != LoadWidth::Word {
+            return None;
+        }
+        self.load_word(offset as usize)
+    }
+}
+
 #[cfg(target_endian = "little")]
 const fn native_u64_word(value: u64, byte_offset: usize) -> u32 {
     if byte_offset == 0 {
@@ -85,14 +71,14 @@ const fn native_u64_word(value: u64, byte_offset: usize) -> u32 {
     }
 }
 
-/// Rejection reason produced while validating an untrusted cBPF program.
+/// Rejection reason produced while validating an untrusted seccomp program.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ProgramError {
     /// The program contains no instructions.
     Empty,
     /// The program exceeds Linux's 4096-instruction limit.
     TooLong,
-    /// Allocation for validation metadata failed.
+    /// Allocation for validation metadata or the immutable program failed.
     NoMemory,
     /// An opcode is not in Linux's seccomp cBPF subset.
     InvalidOpcode {
@@ -138,312 +124,180 @@ pub enum ProgramError {
     },
     /// The final instruction is not `RET K` or `RET A`.
     MissingReturn,
+    /// A future mechanism rejection has no seccomp-specific mapping yet.
+    MechanismRejected,
+}
+
+impl ProgramError {
+    /// Returns whether validation failed because an allocation was unavailable.
+    pub const fn is_no_memory(self) -> bool {
+        matches!(self, Self::NoMemory)
+    }
 }
 
 /// A verified immutable seccomp classic-BPF program.
+#[derive(Debug)]
 pub struct VerifiedProgram {
-    instructions: Box<[ClassicBpfInstruction]>,
+    program: Program,
 }
 
 impl VerifiedProgram {
-    /// Validates and takes ownership of a complete userspace copy.
+    /// Validates and takes ownership of a complete userspace copy without
+    /// allocating a second instruction buffer.
     pub fn try_from_vec(instructions: Vec<ClassicBpfInstruction>) -> Result<Self, ProgramError> {
-        verify_program(&instructions)?;
-        Ok(Self {
-            instructions: instructions.into_boxed_slice(),
-        })
+        verify_seccomp_profile(&instructions)?;
+        let program = Program::try_from_vec(instructions).map_err(map_mechanism_error)?;
+        Ok(Self { program })
     }
 
     /// Fallibly copies and validates a program.
     pub fn try_copy_from_slice(
         instructions: &[ClassicBpfInstruction],
     ) -> Result<Self, ProgramError> {
-        let mut copied = Vec::new();
-        copied
-            .try_reserve_exact(instructions.len())
-            .map_err(|_| ProgramError::NoMemory)?;
-        copied.extend_from_slice(instructions);
-        Self::try_from_vec(copied)
+        verify_seccomp_profile(instructions)?;
+        let program = Program::verify(instructions).map_err(map_mechanism_error)?;
+        Ok(Self { program })
     }
 
     /// Returns the classic-BPF instruction count.
     pub fn len(&self) -> usize {
-        self.instructions.len()
+        self.program.len()
     }
 
     /// Returns whether this program is empty. Verified programs are never
     /// empty; this method is provided alongside [`Self::len`].
-    pub const fn is_empty(&self) -> bool {
-        false
+    pub fn is_empty(&self) -> bool {
+        self.program.is_empty()
+    }
+
+    /// Returns the immutable verified instruction sequence.
+    pub fn instructions(&self) -> &[ClassicBpfInstruction] {
+        self.program.instructions()
     }
 
     /// Evaluates the program without allocation or unbounded control flow.
     pub fn evaluate(&self, data: &SeccompData) -> u32 {
-        run_verified(&self.instructions, data)
+        self.program.evaluate(data)
     }
 }
 
-fn allowed_opcode(code: u16) -> bool {
-    matches!(
-        code,
-        x if x == BPF_LD | BPF_W | BPF_ABS
-            || x == BPF_LD | BPF_W | BPF_LEN
-            || x == BPF_LDX | BPF_W | BPF_LEN
-            || x == BPF_RET | BPF_K
-            || x == BPF_RET | BPF_A
-            || x == BPF_ALU | BPF_ADD | BPF_K
-            || x == BPF_ALU | BPF_ADD | BPF_X
-            || x == BPF_ALU | BPF_SUB | BPF_K
-            || x == BPF_ALU | BPF_SUB | BPF_X
-            || x == BPF_ALU | BPF_MUL | BPF_K
-            || x == BPF_ALU | BPF_MUL | BPF_X
-            || x == BPF_ALU | BPF_DIV | BPF_K
-            || x == BPF_ALU | BPF_DIV | BPF_X
-            || x == BPF_ALU | BPF_AND | BPF_K
-            || x == BPF_ALU | BPF_AND | BPF_X
-            || x == BPF_ALU | BPF_OR | BPF_K
-            || x == BPF_ALU | BPF_OR | BPF_X
-            || x == BPF_ALU | BPF_XOR | BPF_K
-            || x == BPF_ALU | BPF_XOR | BPF_X
-            || x == BPF_ALU | BPF_LSH | BPF_K
-            || x == BPF_ALU | BPF_LSH | BPF_X
-            || x == BPF_ALU | BPF_RSH | BPF_K
-            || x == BPF_ALU | BPF_RSH | BPF_X
-            || x == BPF_ALU | BPF_NEG
-            || x == BPF_LD | BPF_IMM
-            || x == BPF_LDX | BPF_IMM
-            || x == BPF_MISC | BPF_TAX
-            || x == BPF_MISC | BPF_TXA
-            || x == BPF_LD | BPF_MEM
-            || x == BPF_LDX | BPF_MEM
-            || x == BPF_ST
-            || x == BPF_STX
-            || x == BPF_JMP | BPF_JA
-            || x == BPF_JMP | BPF_JEQ | BPF_K
-            || x == BPF_JMP | BPF_JEQ | BPF_X
-            || x == BPF_JMP | BPF_JGE | BPF_K
-            || x == BPF_JMP | BPF_JGE | BPF_X
-            || x == BPF_JMP | BPF_JGT | BPF_K
-            || x == BPF_JMP | BPF_JGT | BPF_X
-            || x == BPF_JMP | BPF_JSET | BPF_K
-            || x == BPF_JMP | BPF_JSET | BPF_X
-    )
-}
-
-fn verify_program(instructions: &[ClassicBpfInstruction]) -> Result<(), ProgramError> {
-    let length = instructions.len();
-    if length == 0 {
+fn verify_seccomp_profile(instructions: &[ClassicBpfInstruction]) -> Result<(), ProgramError> {
+    if instructions.is_empty() {
         return Err(ProgramError::Empty);
     }
-    if length > BPF_MAXINSNS {
+    if instructions.len() > BPF_MAXINSNS {
         return Err(ProgramError::TooLong);
     }
-
     for (program_counter, instruction) in instructions.iter().enumerate() {
-        let code = instruction.code;
-        if !allowed_opcode(code) {
+        if !allowed_seccomp_opcode(instruction.code) {
             return Err(ProgramError::InvalidOpcode {
                 program_counter,
-                code,
+                code: instruction.code,
             });
         }
-        match code {
-            x if x == BPF_ALU | BPF_DIV | BPF_K => {
-                if instruction.value == 0 {
-                    return Err(ProgramError::DivisionByZero { program_counter });
-                }
+        if instruction.code == opcode::LD_W_ABS {
+            if instruction.k & 3 != 0 {
+                return Err(ProgramError::DataOffsetUnaligned { program_counter });
             }
-            x if x == BPF_ALU | BPF_LSH | BPF_K || x == BPF_ALU | BPF_RSH | BPF_K => {
-                if instruction.value >= 32 {
-                    return Err(ProgramError::ShiftOutOfRange { program_counter });
-                }
+            if instruction.k as usize >= SECCOMP_DATA_SIZE {
+                return Err(ProgramError::DataOffsetOutOfRange { program_counter });
             }
-            x if x == BPF_LD | BPF_MEM || x == BPF_LDX | BPF_MEM || x == BPF_ST || x == BPF_STX => {
-                if instruction.value as usize >= BPF_MEMWORDS {
-                    return Err(ProgramError::ScratchOutOfRange { program_counter });
-                }
-            }
-            x if x == BPF_JMP | BPF_JA => {
-                let remaining = length - program_counter - 1;
-                if instruction.value as usize >= remaining {
-                    return Err(ProgramError::JumpOutOfRange { program_counter });
-                }
-            }
-            x if x & BPF_CLASS_MASK == BPF_JMP && x & BPF_OP_MASK != BPF_JA => {
-                let base = program_counter + 1;
-                if base + instruction.jump_true as usize >= length
-                    || base + instruction.jump_false as usize >= length
-                {
-                    return Err(ProgramError::JumpOutOfRange { program_counter });
-                }
-            }
-            x if x == BPF_LD | BPF_W | BPF_ABS => {
-                if instruction.value & 3 != 0 {
-                    return Err(ProgramError::DataOffsetUnaligned { program_counter });
-                }
-                if instruction.value as usize >= SECCOMP_DATA_SIZE {
-                    return Err(ProgramError::DataOffsetOutOfRange { program_counter });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if !matches!(
-        instructions[length - 1].code,
-        x if x == BPF_RET | BPF_K || x == BPF_RET | BPF_A
-    ) {
-        return Err(ProgramError::MissingReturn);
-    }
-    verify_scratch_initialization(instructions)
-}
-
-fn verify_scratch_initialization(
-    instructions: &[ClassicBpfInstruction],
-) -> Result<(), ProgramError> {
-    let mut incoming = Vec::new();
-    incoming
-        .try_reserve_exact(instructions.len())
-        .map_err(|_| ProgramError::NoMemory)?;
-    incoming.resize(instructions.len(), u16::MAX);
-
-    let mut valid = 0u16;
-    for (program_counter, instruction) in instructions.iter().enumerate() {
-        valid &= incoming[program_counter];
-        match instruction.code {
-            x if x == BPF_ST || x == BPF_STX => valid |= 1 << instruction.value,
-            x if x == BPF_LD | BPF_MEM || x == BPF_LDX | BPF_MEM => {
-                if valid & (1 << instruction.value) == 0 {
-                    return Err(ProgramError::UninitializedScratch { program_counter });
-                }
-            }
-            x if x == BPF_JMP | BPF_JA => {
-                let target = program_counter + 1 + instruction.value as usize;
-                incoming[target] &= valid;
-                valid = u16::MAX;
-            }
-            x if x & BPF_CLASS_MASK == BPF_JMP && x & BPF_OP_MASK != BPF_JA => {
-                let base = program_counter + 1;
-                incoming[base + instruction.jump_true as usize] &= valid;
-                incoming[base + instruction.jump_false as usize] &= valid;
-                valid = u16::MAX;
-            }
-            _ => {}
         }
     }
     Ok(())
 }
 
-fn run_verified(instructions: &[ClassicBpfInstruction], data: &SeccompData) -> u32 {
-    let mut accumulator = 0u32;
-    let mut index = 0u32;
-    let mut scratch = [0u32; BPF_MEMWORDS];
-    let mut program_counter = 0usize;
+const fn allowed_seccomp_opcode(code: u16) -> bool {
+    matches!(
+        code,
+        opcode::LD_W_ABS
+            | opcode::LD_LEN
+            | opcode::LDX_LEN
+            | opcode::RET_K
+            | opcode::RET_A
+            | opcode::ALU_ADD_K
+            | opcode::ALU_ADD_X
+            | opcode::ALU_SUB_K
+            | opcode::ALU_SUB_X
+            | opcode::ALU_MUL_K
+            | opcode::ALU_MUL_X
+            | opcode::ALU_DIV_K
+            | opcode::ALU_DIV_X
+            | opcode::ALU_AND_K
+            | opcode::ALU_AND_X
+            | opcode::ALU_OR_K
+            | opcode::ALU_OR_X
+            | opcode::ALU_XOR_K
+            | opcode::ALU_XOR_X
+            | opcode::ALU_LSH_K
+            | opcode::ALU_LSH_X
+            | opcode::ALU_RSH_K
+            | opcode::ALU_RSH_X
+            | opcode::ALU_NEG
+            | opcode::LD_IMM
+            | opcode::LDX_IMM
+            | opcode::MISC_TAX
+            | opcode::MISC_TXA
+            | opcode::LD_MEM
+            | opcode::LDX_MEM
+            | opcode::ST
+            | opcode::STX
+            | opcode::JMP_JA
+            | opcode::JMP_JEQ_K
+            | opcode::JMP_JEQ_X
+            | opcode::JMP_JGE_K
+            | opcode::JMP_JGE_X
+            | opcode::JMP_JGT_K
+            | opcode::JMP_JGT_X
+            | opcode::JMP_JSET_K
+            | opcode::JMP_JSET_X
+    )
+}
 
-    while program_counter < instructions.len() {
-        let instruction = instructions[program_counter];
-        program_counter += 1;
-        match instruction.code & BPF_CLASS_MASK {
-            BPF_LD => match (
-                instruction.code & crate::BPF_MODE_MASK,
-                instruction.code & crate::BPF_SIZE_MASK,
-            ) {
-                (BPF_IMM, _) => accumulator = instruction.value,
-                (BPF_ABS, BPF_W) => {
-                    let Some(value) = data.load_word(instruction.value as usize) else {
-                        return SECCOMP_RET_KILL_PROCESS;
-                    };
-                    accumulator = value;
-                }
-                (BPF_MEM, _) => accumulator = scratch[instruction.value as usize],
-                (BPF_LEN, _) => accumulator = SECCOMP_DATA_SIZE as u32,
-                _ => return SECCOMP_RET_KILL_PROCESS,
-            },
-            BPF_LDX => match instruction.code & crate::BPF_MODE_MASK {
-                BPF_IMM => index = instruction.value,
-                BPF_MEM => index = scratch[instruction.value as usize],
-                BPF_LEN => index = SECCOMP_DATA_SIZE as u32,
-                _ => return SECCOMP_RET_KILL_PROCESS,
-            },
-            BPF_ST => scratch[instruction.value as usize] = accumulator,
-            BPF_STX => scratch[instruction.value as usize] = index,
-            BPF_ALU => {
-                let source = if instruction.code & BPF_SRC_MASK == BPF_X {
-                    index
-                } else {
-                    instruction.value
-                };
-                accumulator = match instruction.code & BPF_OP_MASK {
-                    BPF_ADD => accumulator.wrapping_add(source),
-                    BPF_SUB => accumulator.wrapping_sub(source),
-                    BPF_MUL => accumulator.wrapping_mul(source),
-                    BPF_DIV => {
-                        if source == 0 {
-                            return 0;
-                        }
-                        accumulator / source
-                    }
-                    BPF_OR => accumulator | source,
-                    BPF_AND => accumulator & source,
-                    BPF_LSH => accumulator.wrapping_shl(source & 31),
-                    BPF_RSH => accumulator.wrapping_shr(source & 31),
-                    BPF_NEG => accumulator.wrapping_neg(),
-                    BPF_XOR => accumulator ^ source,
-                    _ => return SECCOMP_RET_KILL_PROCESS,
-                };
-            }
-            BPF_JMP => {
-                if instruction.code & BPF_OP_MASK == BPF_JA {
-                    program_counter += instruction.value as usize;
-                    continue;
-                }
-                let source = if instruction.code & BPF_SRC_MASK == BPF_X {
-                    index
-                } else {
-                    instruction.value
-                };
-                let condition = match instruction.code & BPF_OP_MASK {
-                    BPF_JEQ => accumulator == source,
-                    BPF_JGT => accumulator > source,
-                    BPF_JGE => accumulator >= source,
-                    BPF_JSET => accumulator & source != 0,
-                    _ => return SECCOMP_RET_KILL_PROCESS,
-                };
-                program_counter += if condition {
-                    instruction.jump_true as usize
-                } else {
-                    instruction.jump_false as usize
-                };
-            }
-            BPF_RET => {
-                return if instruction.code & BPF_RVAL_MASK == BPF_A {
-                    accumulator
-                } else {
-                    instruction.value
-                };
-            }
-            BPF_MISC => match instruction.code & BPF_OP_MASK {
-                BPF_TAX => index = accumulator,
-                BPF_TXA => accumulator = index,
-                _ => return SECCOMP_RET_KILL_PROCESS,
-            },
-            _ => return SECCOMP_RET_KILL_PROCESS,
-        }
+fn map_mechanism_error(error: VerifyError) -> ProgramError {
+    match error {
+        VerifyError::Empty => ProgramError::Empty,
+        VerifyError::TooLong { .. } => ProgramError::TooLong,
+        VerifyError::NoMemory => ProgramError::NoMemory,
+        VerifyError::UnsupportedOpcode { pc, code } => ProgramError::InvalidOpcode {
+            program_counter: pc,
+            code,
+        },
+        VerifyError::ImmediateDivisionByZero { pc } => ProgramError::DivisionByZero {
+            program_counter: pc,
+        },
+        VerifyError::ImmediateShiftOutOfRange { pc, .. } => ProgramError::ShiftOutOfRange {
+            program_counter: pc,
+        },
+        VerifyError::ScratchOutOfRange { pc, .. } => ProgramError::ScratchOutOfRange {
+            program_counter: pc,
+        },
+        VerifyError::ScratchUninitialized { pc, .. } => ProgramError::UninitializedScratch {
+            program_counter: pc,
+        },
+        VerifyError::JumpOutOfRange { pc } => ProgramError::JumpOutOfRange {
+            program_counter: pc,
+        },
+        VerifyError::MissingFinalReturn => ProgramError::MissingReturn,
+        VerifyError::UnsupportedAncillaryLoad { .. } => ProgramError::MechanismRejected,
+        _ => ProgramError::MechanismRejected,
     }
-    SECCOMP_RET_KILL_PROCESS
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+    use core::mem::{align_of, offset_of, size_of};
+
     use super::*;
-    use crate::{AUDIT_ARCH_RISCV64, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO};
+    use crate::{AUDIT_ARCH_LOONGARCH64, AUDIT_ARCH_RISCV64, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO};
 
     const fn stmt(code: u16, value: u32) -> ClassicBpfInstruction {
-        ClassicBpfInstruction::new(code, 0, 0, value)
+        ClassicBpfInstruction::statement(code, value)
     }
 
     const fn jump(code: u16, value: u32, jt: u8, jf: u8) -> ClassicBpfInstruction {
-        ClassicBpfInstruction::new(code, jt, jf, value)
+        ClassicBpfInstruction::jump(code, value, jt, jf)
     }
 
     fn data() -> SeccompData {
@@ -456,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn seccomp_data_and_audit_arches_match_linux_64_bit_abi() {
+        assert_eq!(size_of::<SeccompData>(), 64);
+        assert_eq!(align_of::<SeccompData>(), 8);
+        assert_eq!(offset_of!(SeccompData, number), 0);
+        assert_eq!(offset_of!(SeccompData, architecture), 4);
+        assert_eq!(offset_of!(SeccompData, instruction_pointer), 8);
+        assert_eq!(offset_of!(SeccompData, arguments), 16);
+        assert_eq!(AUDIT_ARCH_RISCV64, 0xc000_00f3);
+        assert_eq!(AUDIT_ARCH_LOONGARCH64, 0xc000_0102);
+    }
+
+    #[test]
     fn rejects_empty_oversize_and_missing_return() {
         assert!(matches!(
             VerifiedProgram::try_copy_from_slice(&[]),
@@ -463,63 +329,87 @@ mod tests {
         ));
         let mut huge = Vec::new();
         huge.try_reserve_exact(BPF_MAXINSNS + 1).unwrap();
-        huge.resize(BPF_MAXINSNS + 1, stmt(BPF_RET | BPF_K, 0));
+        huge.resize(BPF_MAXINSNS + 1, stmt(opcode::RET_K, 0));
         assert!(matches!(
             VerifiedProgram::try_from_vec(huge),
             Err(ProgramError::TooLong)
         ));
         assert_eq!(
-            verify_program(&[stmt(BPF_LD | BPF_IMM, 7)]),
-            Err(ProgramError::MissingReturn)
+            VerifiedProgram::try_copy_from_slice(&[stmt(opcode::LD_IMM, 7)]).unwrap_err(),
+            ProgramError::MissingReturn
         );
     }
 
     #[test]
-    fn rejects_non_seccomp_loads_and_bad_offsets() {
-        assert!(matches!(
-            verify_program(&[stmt(BPF_LD | 0x10 | BPF_ABS, 0), stmt(BPF_RET | BPF_A, 0),]),
-            Err(ProgramError::InvalidOpcode { .. })
-        ));
+    fn rejects_non_seccomp_loads_modulo_and_bad_offsets() {
+        for code in [
+            opcode::LD_H_ABS,
+            opcode::LD_W_IND,
+            opcode::LDX_B_MSH,
+            opcode::ALU_MOD_K,
+        ] {
+            assert!(matches!(
+                VerifiedProgram::try_copy_from_slice(&[stmt(code, 0), stmt(opcode::RET_A, 0),]),
+                Err(ProgramError::InvalidOpcode { .. })
+            ));
+        }
         assert_eq!(
-            verify_program(&[stmt(BPF_LD | BPF_W | BPF_ABS, 2), stmt(BPF_RET | BPF_A, 0),]),
-            Err(ProgramError::DataOffsetUnaligned { program_counter: 0 })
+            VerifiedProgram::try_copy_from_slice(&[
+                stmt(opcode::LD_W_ABS, 2),
+                stmt(opcode::RET_A, 0),
+            ])
+            .unwrap_err(),
+            ProgramError::DataOffsetUnaligned { program_counter: 0 }
         );
         assert_eq!(
-            verify_program(&[stmt(BPF_LD | BPF_W | BPF_ABS, 64), stmt(BPF_RET | BPF_A, 0),]),
-            Err(ProgramError::DataOffsetOutOfRange { program_counter: 0 })
+            VerifiedProgram::try_copy_from_slice(&[
+                stmt(opcode::LD_W_ABS, 64),
+                stmt(opcode::RET_A, 0),
+            ])
+            .unwrap_err(),
+            ProgramError::DataOffsetOutOfRange { program_counter: 0 }
         );
     }
 
     #[test]
     fn rejects_bad_arithmetic_and_jumps() {
         assert_eq!(
-            verify_program(&[stmt(BPF_ALU | BPF_DIV | BPF_K, 0), stmt(BPF_RET | BPF_A, 0),]),
-            Err(ProgramError::DivisionByZero { program_counter: 0 })
+            VerifiedProgram::try_copy_from_slice(&[
+                stmt(opcode::ALU_DIV_K, 0),
+                stmt(opcode::RET_A, 0),
+            ])
+            .unwrap_err(),
+            ProgramError::DivisionByZero { program_counter: 0 }
         );
         assert_eq!(
-            verify_program(&[
-                stmt(BPF_ALU | BPF_LSH | BPF_K, 32),
-                stmt(BPF_RET | BPF_A, 0),
-            ]),
-            Err(ProgramError::ShiftOutOfRange { program_counter: 0 })
+            VerifiedProgram::try_copy_from_slice(&[
+                stmt(opcode::ALU_LSH_K, 32),
+                stmt(opcode::RET_A, 0),
+            ])
+            .unwrap_err(),
+            ProgramError::ShiftOutOfRange { program_counter: 0 }
         );
         assert_eq!(
-            verify_program(&[stmt(BPF_JMP | BPF_JA, 1), stmt(BPF_RET | BPF_K, 0),]),
-            Err(ProgramError::JumpOutOfRange { program_counter: 0 })
+            VerifiedProgram::try_copy_from_slice(&[
+                stmt(opcode::JMP_JA, 1),
+                stmt(opcode::RET_K, 0),
+            ])
+            .unwrap_err(),
+            ProgramError::JumpOutOfRange { program_counter: 0 }
         );
     }
 
     #[test]
     fn scratch_must_be_initialized_on_every_reachable_path() {
         let program = [
-            jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
-            stmt(BPF_ST, 0),
-            stmt(BPF_LD | BPF_MEM, 0),
-            stmt(BPF_RET | BPF_A, 0),
+            jump(opcode::JMP_JEQ_K, 0, 0, 1),
+            stmt(opcode::ST, 0),
+            stmt(opcode::LD_MEM, 0),
+            stmt(opcode::RET_A, 0),
         ];
         assert_eq!(
-            verify_program(&program),
-            Err(ProgramError::UninitializedScratch { program_counter: 2 })
+            VerifiedProgram::try_copy_from_slice(&program).unwrap_err(),
+            ProgramError::UninitializedScratch { program_counter: 2 }
         );
     }
 
@@ -537,8 +427,8 @@ mod tests {
         ];
         for (offset, expected) in cases {
             let program = VerifiedProgram::try_copy_from_slice(&[
-                stmt(BPF_LD | BPF_W | BPF_ABS, offset),
-                stmt(BPF_RET | BPF_A, 0),
+                stmt(opcode::LD_W_ABS, offset),
+                stmt(opcode::RET_A, 0),
             ])
             .unwrap();
             assert_eq!(program.evaluate(&data()), expected, "offset {offset}");
@@ -546,26 +436,27 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_branch_scratch_and_linux_action() {
+    fn evaluates_length_branch_scratch_and_linux_action() {
         let program = VerifiedProgram::try_copy_from_slice(&[
-            stmt(BPF_LD | BPF_W | BPF_ABS, 0),
-            stmt(BPF_ST, 3),
-            stmt(BPF_LDX | BPF_MEM, 3),
-            jump(BPF_JMP | BPF_JEQ | BPF_X, 0, 0, 1),
-            stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-            stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 13),
+            stmt(opcode::LD_LEN, 0),
+            stmt(opcode::ST, 3),
+            stmt(opcode::LDX_LEN, 0),
+            jump(opcode::JMP_JEQ_X, 0, 0, 1),
+            stmt(opcode::RET_K, SECCOMP_RET_ALLOW),
+            stmt(opcode::RET_K, SECCOMP_RET_ERRNO | 13),
         ])
         .unwrap();
         assert_eq!(program.evaluate(&data()), SECCOMP_RET_ALLOW);
+        assert_eq!(program.instructions().len(), 6);
     }
 
     #[test]
     fn register_divide_by_zero_returns_zero_like_linux_cbpf() {
         let program = VerifiedProgram::try_copy_from_slice(&[
-            stmt(BPF_LD | BPF_IMM, 99),
-            stmt(BPF_LDX | BPF_IMM, 0),
-            stmt(BPF_ALU | BPF_DIV | BPF_X, 0),
-            stmt(BPF_RET | BPF_A, 0),
+            stmt(opcode::LD_IMM, 99),
+            stmt(opcode::LDX_IMM, 0),
+            stmt(opcode::ALU_DIV_X, 0),
+            stmt(opcode::RET_A, 0),
         ])
         .unwrap();
         assert_eq!(program.evaluate(&data()), 0);

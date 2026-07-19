@@ -24,6 +24,7 @@ mod state;
 mod uapi;
 
 pub use action::{Action, ActionClass, MAX_ERRNO};
+pub use axcbpf::opcode as classic_bpf_opcode;
 pub use bpf::{ClassicBpfInstruction, ProgramError, SeccompData, VerifiedProgram};
 pub use budget::{FilterBudget, FilterBudgetCreateError};
 pub use chain::{FilterChain, FilterDecision, FilterInstallError, FilterMetadata};

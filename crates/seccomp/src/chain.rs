@@ -214,6 +214,7 @@ pub enum FilterInstallError {
 #[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
+    use axcbpf::opcode;
 
     use super::*;
     use crate::{
@@ -222,13 +223,8 @@ mod tests {
     };
 
     fn returning(value: u32) -> VerifiedProgram {
-        VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
-            crate::BPF_RET | crate::BPF_K,
-            0,
-            0,
-            value,
-        )])
-        .unwrap()
+        VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(opcode::RET_K, 0, 0, value)])
+            .unwrap()
     }
 
     fn data() -> SeccompData {
@@ -248,19 +244,9 @@ mod tests {
         let mut instructions = Vec::new();
         instructions.try_reserve_exact(length).unwrap();
         for _ in 1..length {
-            instructions.push(ClassicBpfInstruction::new(
-                crate::BPF_LD | crate::BPF_IMM,
-                0,
-                0,
-                0,
-            ));
+            instructions.push(ClassicBpfInstruction::new(opcode::LD_IMM, 0, 0, 0));
         }
-        instructions.push(ClassicBpfInstruction::new(
-            crate::BPF_RET | crate::BPF_K,
-            0,
-            0,
-            value,
-        ));
+        instructions.push(ClassicBpfInstruction::new(opcode::RET_K, 0, 0, value));
         VerifiedProgram::try_from_vec(instructions).unwrap()
     }
 
