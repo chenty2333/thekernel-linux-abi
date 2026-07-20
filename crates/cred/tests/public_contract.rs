@@ -12,11 +12,12 @@ use thekernel_linux_cred::{
     InodeMknodKind, InodeMknodOperation, InodePermissionAccess, InodePermissionContext,
     InodePostSetattrContext, InodeRenameContext, InodeRmdirContext, InodeSetattrContext,
     InodeSetattrIntent, InodeSetattrMode, InodeSetattrPrivilegeCleanup, InodeSetattrProposal,
-    InodeSymlinkContext, InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, Kgid, Kuid,
-    MemoryProtection, MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation,
-    MmapFileSecurityRef, MmapFileTarget, PreparedCredentialCapabilityOperation,
-    PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind, PtraceTracemeContext,
-    SECBIT_EXEC_DENY_INTERACTIVE, SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, SECBIT_EXEC_RESTRICT_FILE,
+    InodeSymlinkContext, InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, KeyPermission,
+    KeyPermissionMask, Kgid, Kuid, MemoryProtection, MmapAddressContext, MmapFileContext,
+    MmapFileFlags, MmapFileOperation, MmapFileSecurityRef, MmapFileTarget,
+    PreparedCredentialCapabilityOperation, PtraceAccessContext, PtraceAccessKind,
+    PtraceCredentialKind, PtraceTracemeContext, SECBIT_EXEC_DENY_INTERACTIVE,
+    SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, SECBIT_EXEC_RESTRICT_FILE,
     SECBIT_EXEC_RESTRICT_FILE_LOCKED, SECURE_ALL_UNPRIVILEGED, SECURITY_CAPABILITY_XATTR_NAME,
     SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
@@ -33,6 +34,40 @@ use thekernel_linux_cred::{
     plan_capset, plan_content_write_setid_cleanup, plan_group_id_transition,
     plan_user_id_transition,
 };
+
+#[test]
+fn key_permission_policy_is_public_and_uses_the_frozen_filesystem_identity() {
+    let namespace = TestNamespace::initial("key-permission");
+    let actor = Credential::try_root(namespace).unwrap();
+    let snapshot = actor.fs_credential_snapshot();
+    let permissions = KeyPermissionMask::try_from_raw(0x0003_0000).unwrap();
+    let requested = KeyPermission::VIEW | KeyPermission::READ;
+
+    assert_eq!(permissions.into_raw(), 0x0003_0000);
+    assert!(permissions.allows(
+        Kuid::INITIAL_ROOT,
+        Kgid::INITIAL_ROOT,
+        &snapshot,
+        false,
+        requested,
+    ));
+    assert!(!permissions.allows(
+        Kuid::from_raw(1000).unwrap(),
+        Kgid::from_raw(1000).unwrap(),
+        &snapshot,
+        false,
+        requested,
+    ));
+
+    let other_only = KeyPermissionMask::try_from_raw(0x0000_0001).unwrap();
+    assert!(other_only.allows(
+        Kuid::from_raw(1000).unwrap(),
+        Kgid::INITIAL_ROOT,
+        &snapshot,
+        false,
+        KeyPermission::VIEW,
+    ));
+}
 
 struct TestNamespace {
     label: &'static str,

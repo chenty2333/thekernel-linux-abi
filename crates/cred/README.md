@@ -26,6 +26,10 @@ leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 - a validated capability number, normalized audited/no-audit/set-ID operation,
   and field-private commoncap authorization context bound to the exact actor
   and target user namespace before stacked deny-first dispatch;
+- validated Linux key permission masks and non-empty typed access requests,
+  with pure user/group/other lane selection over one frozen filesystem-
+  credential snapshot and cumulative possessor rights supplied by the
+  embedding kernel;
 - typed signal source, delivery-scope, and validated-number values plus an
   opaque core-authorization proof bound to the exact actor/target credentials
   and caller-owned target identity;
@@ -73,6 +77,9 @@ type. In particular, the generic inode/file contexts neither look up an object
 nor decide whether a normal `O_CREAT` or unnamed `O_TMPFILE` transaction
 succeeded, and socket contexts neither resolve an fd nor operate a transport.
 A memory-mapping context likewise neither selects an address nor mutates a VMA.
+A key permission decision likewise neither resolves a serial nor walks a
+possession graph: the embedding kernel proves possession of the exact key and
+passes that fact together with immutable owner IDs and a validated mask.
 A kernel adapter selects the lock, prebuilds immutable replacement maps outside
 it, and attaches the remaining objects. Map publication borrows that
 caller-owned replacement and clones it into an empty slot, so the guarded

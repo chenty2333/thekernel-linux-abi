@@ -143,6 +143,11 @@
   only, and mprotect policy to the exact pre-change VMA, while leaving fd/OFD
   lookup, address selection, mmap locking and transactions, VMA mutation,
   registry dispatch, and errno mapping outside the crate.
+- Add validated key permission and permission-mask values plus a pure
+  permission-bit decision over one frozen filesystem-credential snapshot.
+  Preserve Linux's nonempty-group-lane fallback rule and cumulative possessor
+  rights while keeping possession traversal, key storage, request authority,
+  security-module dispatch, and errno mapping consumer-owned.
 - Remove the pre-release `try_with_user_ns` and `fs_dac_credentials`
   compatibility aliases before the 0.1 API freeze; consumers use
   `try_with_user_namespace` and `fs_credential_snapshot` exclusively.

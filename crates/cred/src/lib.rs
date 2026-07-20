@@ -17,6 +17,7 @@ mod error;
 mod exec;
 mod file_capability;
 mod idmap;
+mod key_security;
 mod mmap_security;
 mod namespace;
 mod security;
@@ -52,6 +53,7 @@ pub use idmap::{
     ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
     validate_id_map_input,
 };
+pub use key_security::{KeyPermission, KeyPermissionMask};
 pub use mmap_security::{
     FileMprotectContext, MemoryProtection, MmapAddressContext, MmapFileContext, MmapFileFlags,
     MmapFileOperation, MmapFileSecurityRef, MmapFileTarget,

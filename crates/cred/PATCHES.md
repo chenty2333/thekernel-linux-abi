@@ -51,6 +51,12 @@
   Bind the caller-supplied immutable actor and target namespace without
   `current()` lookup so an embedding registry can run commoncap first and then
   stop stacked module dispatch at the first denial.
+- Replace adapter-local raw key permission arithmetic with a validated four-
+  lane mask and non-empty typed access request. Select exactly one filesystem-
+  identity lane, add possessor rights cumulatively only when the embedding
+  kernel proves possession of the exact key, and leave serial lookup,
+  possession traversal, request authority, hook dispatch, and errno mapping
+  outside the policy leaf.
 - Move immutable namespace hierarchy/owner facts and UID/GID/setgroups
   publication state into a lock-neutral core. Publication borrows a fully
   built replacement and clones it into an unused slot, so no caller or prior
