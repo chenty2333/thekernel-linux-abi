@@ -46,14 +46,14 @@ fn key_permission_policy_is_public_and_uses_the_frozen_filesystem_identity() {
     assert_eq!(permissions.into_raw(), 0x0003_0000);
     assert!(permissions.allows(
         Kuid::INITIAL_ROOT,
-        Kgid::INITIAL_ROOT,
+        Some(Kgid::INITIAL_ROOT),
         &snapshot,
         false,
         requested,
     ));
     assert!(!permissions.allows(
         Kuid::from_raw(1000).unwrap(),
-        Kgid::from_raw(1000).unwrap(),
+        Some(Kgid::from_raw(1000).unwrap()),
         &snapshot,
         false,
         requested,
@@ -62,7 +62,7 @@ fn key_permission_policy_is_public_and_uses_the_frozen_filesystem_identity() {
     let other_only = KeyPermissionMask::try_from_raw(0x0000_0001).unwrap();
     assert!(other_only.allows(
         Kuid::from_raw(1000).unwrap(),
-        Kgid::INITIAL_ROOT,
+        None,
         &snapshot,
         false,
         KeyPermission::VIEW,

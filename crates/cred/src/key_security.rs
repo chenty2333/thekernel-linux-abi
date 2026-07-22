@@ -164,15 +164,17 @@ impl KeyPermissionMask {
     /// Tests the Linux key permission-bit gate for one actor and key.
     ///
     /// Exactly one identity lane is selected: user when the actor's filesystem
-    /// UID owns the key, otherwise group when that lane is nonempty and either
-    /// the filesystem GID or a supplementary GID matches, otherwise other.
-    /// When the embedding kernel has proven possession of the exact key,
-    /// possessor rights are added to that one selected identity lane. Final
-    /// security-module arbitration remains consumer-owned.
+    /// UID owns the key, otherwise group when the key has a valid group owner,
+    /// that lane is nonempty, and either the filesystem GID or a supplementary
+    /// GID matches, otherwise other. `None` represents Linux's `INVALID_GID`
+    /// and can never select the group lane. When the embedding kernel has
+    /// proven possession of the exact key, possessor rights are added to that
+    /// one selected identity lane. Final security-module arbitration remains
+    /// consumer-owned.
     pub fn allows(
         self,
         owner_uid: Kuid,
-        owner_gid: Kgid,
+        owner_gid: Option<Kgid>,
         actor: &FsCredentialSnapshot,
         possessed: bool,
         requested: KeyPermission,
@@ -180,11 +182,13 @@ impl KeyPermissionMask {
         let identity_shift = if actor.uid() == owner_uid {
             Self::USER_SHIFT
         } else if self.lane(Self::GROUP_SHIFT) != 0
-            && (actor.gid() == owner_gid
-                || actor
-                    .supplementary_groups()
-                    .binary_search(&owner_gid)
-                    .is_ok())
+            && owner_gid.is_some_and(|owner_gid| {
+                actor.gid() == owner_gid
+                    || actor
+                        .supplementary_groups()
+                        .binary_search(&owner_gid)
+                        .is_ok()
+            })
         {
             Self::GROUP_SHIFT
         } else {
@@ -291,7 +295,7 @@ mod tests {
     #[test]
     fn user_group_and_other_selection_is_mutually_exclusive() {
         let owner_uid = kuid(1000);
-        let owner_gid = kgid(2000);
+        let owner_gid = Some(kgid(2000));
         let permissions = mask(&[
             (USER, KeyPermission::VIEW),
             (GROUP, KeyPermission::READ),
@@ -332,7 +336,7 @@ mod tests {
     #[test]
     fn supplementary_group_selects_group_lane() {
         let owner_uid = kuid(1000);
-        let owner_gid = kgid(2000);
+        let owner_gid = Some(kgid(2000));
         let permissions = mask(&[(GROUP, KeyPermission::SEARCH), (OTHER, KeyPermission::VIEW)]);
         let supplementary_member = actor(1001, 2001, &[1999, 2000, 2002]);
 
@@ -355,7 +359,7 @@ mod tests {
     #[test]
     fn empty_group_lane_falls_back_to_other_even_for_a_group_member() {
         let owner_uid = kuid(1000);
-        let owner_gid = kgid(2000);
+        let owner_gid = Some(kgid(2000));
         let permissions = mask(&[(OTHER, KeyPermission::VIEW)]);
 
         for group_member in [actor(1001, 2000, &[]), actor(1001, 2001, &[2000])] {
@@ -370,9 +374,36 @@ mod tests {
     }
 
     #[test]
+    fn absent_owner_group_never_selects_group_but_preserves_other_and_possessor() {
+        let owner_uid = kuid(1000);
+        let permissions = mask(&[
+            (USER, KeyPermission::WRITE),
+            (GROUP, KeyPermission::READ),
+            (OTHER, KeyPermission::VIEW),
+            (POSSESSOR, KeyPermission::SEARCH),
+        ]);
+
+        for nonowner in [actor(1001, 2000, &[]), actor(1001, 2001, &[2000])] {
+            assert!(!permissions.allows(owner_uid, None, &nonowner, false, KeyPermission::READ));
+            assert!(permissions.allows(owner_uid, None, &nonowner, false, KeyPermission::VIEW));
+            assert!(permissions.allows(
+                owner_uid,
+                None,
+                &nonowner,
+                true,
+                KeyPermission::VIEW | KeyPermission::SEARCH
+            ));
+        }
+
+        let owner = actor(1000, 2000, &[]);
+        assert!(permissions.allows(owner_uid, None, &owner, false, KeyPermission::WRITE));
+        assert!(!permissions.allows(owner_uid, None, &owner, false, KeyPermission::VIEW));
+    }
+
+    #[test]
     fn possessor_rights_are_cumulative_with_selected_identity_lane() {
         let owner_uid = kuid(1000);
-        let owner_gid = kgid(2000);
+        let owner_gid = Some(kgid(2000));
         let permissions = mask(&[
             (USER, KeyPermission::VIEW),
             (POSSESSOR, KeyPermission::READ),
@@ -405,7 +436,7 @@ mod tests {
             KeyPermission::SETATTR,
             KeyPermission::ALL,
         ] {
-            assert!(!permissions.allows(kuid(1000), kgid(2000), &actor, true, requested));
+            assert!(!permissions.allows(kuid(1000), Some(kgid(2000)), &actor, true, requested));
         }
     }
 }
