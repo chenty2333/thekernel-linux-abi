@@ -301,11 +301,11 @@ fn check_chown_permission<C: DacCredentials>(
     if request.user().is_some_and(|user| user != node.owner_user) {
         return Err(SetattrError::ChownDenied);
     }
-    if let Some(group) = request.group()
-        && group != node.owner_group
-        && group != credentials.fs_group_id()
-        && !credentials.is_in_group(group)
-    {
+    if request.group().is_some_and(|group| {
+        group != node.owner_group
+            && group != credentials.fs_group_id()
+            && !credentials.is_in_group(group)
+    }) {
         return Err(SetattrError::ChownDenied);
     }
     Ok(())
