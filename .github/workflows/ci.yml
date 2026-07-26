@@ -13,12 +13,13 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check out the exact classic-BPF mechanism source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: chenty2333/thekernel-ax
           ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          fetch-depth: 2
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
         run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
@@ -40,12 +41,13 @@ jobs:
   stable:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check out the exact classic-BPF mechanism source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: chenty2333/thekernel-ax
           ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          fetch-depth: 2
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
         run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
@@ -63,12 +65,13 @@ jobs:
   thekernel-nightly:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check out the exact classic-BPF mechanism source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: chenty2333/thekernel-ax
           ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          fetch-depth: 2
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
         run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
