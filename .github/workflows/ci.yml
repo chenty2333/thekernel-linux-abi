@@ -23,7 +23,7 @@ jobs:
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
         run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.85.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -51,7 +51,7 @@ jobs:
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
         run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: stable
           components: clippy,rustfmt
@@ -76,10 +76,10 @@ jobs:
       - name: Link the external path dependency
         run: ln -s "$GITHUB_WORKSPACE/.ci-deps/thekernel-ax" "$GITHUB_WORKSPACE/../thekernel-ax"
       - name: Install the classic-BPF package toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.85.0
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly-2025-05-20
           components: clippy,rustfmt
