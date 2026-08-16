@@ -2,8 +2,9 @@ use core::{mem::MaybeUninit, ops::Range};
 
 use bytemuck::{Pod, Zeroable};
 use thekernel_linux_usercopy::{
-    MAX_NUL_SEARCH_BYTES, UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr, VmResult,
-    vm_load, vm_load_any_until_nul, vm_load_until_nul, vm_read_slice, vm_write_slice,
+    MAX_NUL_SEARCH_BYTES, RawSigevent, UserCopyError, UserMemory, UserMemoryContext, VmMutPtr,
+    VmPtr, VmResult, vm_load, vm_load_any_until_nul, vm_load_any_until_nul_bounded,
+    vm_load_until_nul, vm_load_until_nul_bounded, vm_read_slice, vm_write_slice,
 };
 
 struct TestMemory {
@@ -57,6 +58,33 @@ unsafe impl UserMemory for TestMemory {
 struct Pair {
     first: u64,
     second: u64,
+}
+
+#[test]
+fn raw_sigevent_copyin_preserves_integer_storage_through_context() {
+    let mut provider = TestMemory::new(0x8000);
+    let base = 0x2003;
+    let value_offset = 0;
+    let signo_offset = value_offset + core::mem::size_of::<usize>();
+    let notify_offset = signo_offset + core::mem::size_of::<i32>();
+    let union_offset = notify_offset + core::mem::size_of::<i32>();
+
+    provider.bytes[base + value_offset..base + value_offset + core::mem::size_of::<usize>()]
+        .copy_from_slice(&usize::MAX.to_ne_bytes());
+    provider.bytes[base + signo_offset..base + signo_offset + core::mem::size_of::<i32>()]
+        .copy_from_slice(&64i32.to_ne_bytes());
+    provider.bytes[base + notify_offset..base + notify_offset + core::mem::size_of::<i32>()]
+        .copy_from_slice(&2i32.to_ne_bytes());
+    provider.bytes[base + union_offset..base + union_offset + core::mem::size_of::<i32>()]
+        .copy_from_slice(&123i32.to_ne_bytes());
+
+    let mut memory = UserMemoryContext::new(&mut provider);
+    let event = RawSigevent::read_from_user(&mut memory, base as *const RawSigevent).unwrap();
+
+    assert_eq!(event.value_ptr_address(), usize::MAX);
+    assert_eq!(event.signo(), 64);
+    assert_eq!(event.notify(), 2);
+    assert_eq!(event.thread_id(), 123);
 }
 
 #[test]
@@ -189,6 +217,79 @@ fn nul_load_stops_at_zero_and_enforces_the_byte_bound() {
     let mut memory = UserMemoryContext::new(&mut provider);
     assert_eq!(
         vm_load_until_nul(&mut memory, base as *const u8),
+        Err(UserCopyError::TooLong)
+    );
+}
+
+#[test]
+fn bounded_nul_budget_includes_the_terminator_and_zero_forbids_access() {
+    let base = 0x1800usize;
+    let mut provider = TestMemory::new(0x4000);
+    provider.bytes[base..base + 3].copy_from_slice(b"ab\0");
+
+    let mut memory = UserMemoryContext::new(&mut provider);
+    assert_eq!(
+        memory.load_until_nul_bounded(base as *const u8, 3).unwrap(),
+        b"ab"
+    );
+    assert_eq!(
+        vm_load_until_nul_bounded(&mut memory, base as *const u8, 2),
+        Err(UserCopyError::TooLong)
+    );
+    let reads_before = memory.memory_mut().reads;
+    assert_eq!(
+        vm_load_until_nul_bounded(&mut memory, base as *const u8, 0),
+        Err(UserCopyError::TooLong)
+    );
+    assert_eq!(memory.memory_mut().reads, reads_before);
+}
+
+#[test]
+fn bounded_nul_loader_preserves_raw_pointer_unsafe_boundary() {
+    let base = 0x2001usize;
+    let mut provider = TestMemory::new(0x8000);
+    let raw = [0x4000usize, 0usize];
+    provider.bytes[base..base + core::mem::size_of_val(&raw)]
+        .copy_from_slice(bytemuck::cast_slice(&raw));
+    let mut memory = UserMemoryContext::new(&mut provider);
+
+    // SAFETY: each loaded word is a valid exposed pointer representation and
+    // the null pointer is the all-zero sentinel.
+    let pointers =
+        unsafe { vm_load_any_until_nul_bounded(&mut memory, base as *const *const u8, 2) }.unwrap();
+    assert_eq!(pointers, [0x4000usize as *const u8]);
+    // The budget includes the sentinel, so one slot cannot hold this array.
+    assert_eq!(
+        // SAFETY: the provider still exposes the same valid pointer
+        // representation and the bounded call never dereferences the user
+        // address itself.
+        unsafe { vm_load_any_until_nul_bounded(&mut memory, base as *const *const u8, 1) },
+        Err(UserCopyError::TooLong)
+    );
+}
+
+#[test]
+fn bounded_nul_loader_propagates_provider_faults() {
+    let base = 0x1000usize;
+    let mut provider = TestMemory::new(base + 1);
+    provider.bytes[base] = 1;
+    let mut memory = UserMemoryContext::new(&mut provider);
+
+    assert_eq!(
+        vm_load_until_nul_bounded(&mut memory, base as *const u8, 2),
+        Err(UserCopyError::BadAddress)
+    );
+}
+
+#[test]
+fn bounded_nul_loader_applies_byte_ceiling_without_overflow() {
+    let base = 0x1000usize;
+    let mut provider = TestMemory::new(base + MAX_NUL_SEARCH_BYTES + 32);
+    provider.bytes[base..base + MAX_NUL_SEARCH_BYTES].fill(1);
+    let mut memory = UserMemoryContext::new(&mut provider);
+
+    assert_eq!(
+        vm_load_until_nul_bounded(&mut memory, base as *const Pair, usize::MAX),
         Err(UserCopyError::TooLong)
     );
 }

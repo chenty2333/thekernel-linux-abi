@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+mod buffer;
 mod enter;
 mod error;
 mod registration;
@@ -27,6 +28,11 @@ mod resource;
 mod setup;
 mod sqe;
 
+pub use buffer::{
+    BufferInstallError, BufferLeaseRelease, BufferLeaseReleaseError, BufferSlot, BufferTableId,
+    BufferTableLifecycle, BufferTableProgress, RegisteredBufferLease, RegisteredBufferRange,
+    RegisteredBufferTable, RegisteredBufferToken, RetiredBuffer,
+};
 pub use enter::{EnterFlags, EnterRequest, LegacySignalMask};
 pub use error::IoUringError;
 pub use registration::{

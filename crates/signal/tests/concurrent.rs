@@ -63,7 +63,7 @@ fn concurrent_send_signal() {
     let (proc, thr) = new_test_env();
 
     let signo = Signo::SIGTERM;
-    let sig = SignalInfo::new_user(signo, 9, 9);
+    let sig = SignalInfo::new_user(signo, 9, 9, 0);
 
     thread::spawn({
         let thr = thr.clone();
@@ -83,7 +83,7 @@ fn concurrent_blocked() {
     let (_proc, thr) = new_test_env();
 
     let signo = Signo::SIGTERM;
-    let sig = SignalInfo::new_user(signo, 9, 9);
+    let sig = SignalInfo::new_user(signo, 9, 9, 0);
 
     let mut blocked = SignalSet::default();
     blocked.add(signo);
@@ -119,6 +119,51 @@ fn concurrent_blocked() {
 }
 
 #[test]
+fn concurrent_signalfd_observation_respects_blocked_mask() {
+    let (_proc, thr) = new_test_env();
+    let signo = Signo::SIGTERM;
+    let mut fd_mask = SignalSet::default();
+    fd_mask.add(signo);
+
+    let mut blocked = SignalSet::default();
+    blocked.add(signo);
+    thr.set_blocked(blocked);
+
+    let sender = {
+        let thr = thr.clone();
+        thread::spawn(move || thr.send_unqueued_signal(SignalInfo::new_user(signo, 0, 1, 0)))
+    };
+    let _ = sender.join().unwrap();
+    assert!(wait_until(|| thr.pending().has(signo)));
+    assert!(thr.has_pending_signal_for_signalfd(&fd_mask));
+    assert_eq!(
+        thr.dequeue_signal_for_signalfd(&fd_mask)
+            .expect("blocked signal must remain visible to signalfd")
+            .signo(),
+        signo
+    );
+
+    thr.set_blocked(SignalSet::default());
+    let sender = {
+        let thr = thr.clone();
+        thread::spawn(move || thr.send_unqueued_signal(SignalInfo::new_user(signo, 0, 2, 0)))
+    };
+    assert!(sender.join().unwrap());
+    assert!(wait_until(|| thr.pending().has(signo)));
+    assert!(!thr.has_pending_signal_for_signalfd(&fd_mask));
+    assert!(thr.dequeue_signal_for_signalfd(&fd_mask).is_none());
+
+    thr.set_blocked(blocked);
+    assert!(thr.has_pending_signal_for_signalfd(&fd_mask));
+    assert_eq!(
+        thr.dequeue_signal_for_signalfd(&fd_mask)
+            .expect("mask update must make the pending signal visible")
+            .signo(),
+        signo
+    );
+}
+
+#[test]
 fn concurrent_check_signals() {
     let (proc, thr) = new_test_env();
 
@@ -126,7 +171,7 @@ fn concurrent_check_signals() {
     proc.try_replace_action(
         Signo::SIGTERM,
         SignalAction {
-            disposition: SignalDisposition::Handler(test_handler as usize),
+            disposition: SignalDisposition::Handler(test_handler as *const () as usize),
             ..SignalAction::default()
         },
     )
@@ -136,7 +181,7 @@ fn concurrent_check_signals() {
     let mut provider = memory_provider();
     let mut memory = UserMemoryContext::new(&mut provider);
 
-    let first = SignalInfo::new_user(Signo::SIGTERM, 9, 9);
+    let first = SignalInfo::new_user(Signo::SIGTERM, 9, 9, 0);
     assert!(thr.send_unqueued_signal(first.clone()));
 
     let delivered = thr.check_signals(&mut memory, &mut uctx, None).unwrap();
@@ -147,8 +192,8 @@ fn concurrent_check_signals() {
     thread::spawn({
         let thr = thr.clone();
         move || {
-            let _ = thr.send_unqueued_signal(SignalInfo::new_user(Signo::SIGINT, 2, 2));
-            let _ = thr.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 3, 3));
+            let _ = thr.send_unqueued_signal(SignalInfo::new_user(Signo::SIGINT, 2, 2, 0));
+            let _ = thr.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 3, 3, 0));
         }
     });
 
@@ -188,7 +233,7 @@ fn reset_hand_completion_cannot_overwrite_a_concurrent_replacement() {
         },
     )
     .unwrap();
-    assert!(thr.send_unqueued_signal(SignalInfo::new_user(signo, 1, 1)));
+    assert!(thr.send_unqueued_signal(SignalInfo::new_user(signo, 1, 1, 0)));
 
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -236,7 +281,7 @@ fn cancellation_waits_for_an_already_started_delivery() {
         },
     )
     .unwrap();
-    assert!(thr.send_unqueued_signal(SignalInfo::new_user(signo, 1, 1)));
+    assert!(thr.send_unqueued_signal(SignalInfo::new_user(signo, 1, 1, 0)));
 
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -295,7 +340,7 @@ fn concurrent_account_admission_never_exceeds_limit() {
                 barrier.wait();
                 signal
                     .try_send_signal_with(
-                        SignalInfo::new_user(Signo::SIGRTMIN, sender as i32, sender as u32),
+                        SignalInfo::new_user(Signo::SIGRTMIN, sender as i32, sender as u32, 0),
                         |info| PreparedSignal::try_accounted(info, &user, LIMIT as u64, &global),
                     )
                     .is_ok()
@@ -343,7 +388,7 @@ fn ignore_transition_linearizes_with_prepared_realtime_publication() {
         let publish_barrier = publish.clone();
         thread::spawn(move || {
             signal
-                .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+                .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1, 0), |info| {
                     let signal = PreparedSignal::try_accounted(info, &user, 1, &global)?;
                     prepared_barrier.wait();
                     publish_barrier.wait();
@@ -380,7 +425,7 @@ fn deferred_process_send_linearizes_with_ignored_transition() {
     let user = SignalQueueAccount::try_new(1).unwrap();
     let global = SignalQueueAccount::try_new(1).unwrap();
     let prepared = PreparedSignal::try_accounted(
-        SignalInfo::new_user(Signo::SIGRTMIN, 1, 1),
+        SignalInfo::new_user(Signo::SIGRTMIN, 1, 1, 0),
         &user,
         1,
         &global,
@@ -423,7 +468,7 @@ fn deferred_thread_send_linearizes_with_endpoint_cancellation() {
     let user = SignalQueueAccount::try_new(1).unwrap();
     let global = SignalQueueAccount::try_new(1).unwrap();
     let prepared = PreparedSignal::try_accounted(
-        SignalInfo::new_user(Signo::SIGRTMIN, 1, 1),
+        SignalInfo::new_user(Signo::SIGRTMIN, 1, 1, 0),
         &user,
         1,
         &global,
@@ -505,7 +550,7 @@ fn concurrent_cancellation_linearizes_and_refunds_every_queue_charge() {
                 start.wait();
                 signal
                     .try_send_signal_with(
-                        SignalInfo::new_user(Signo::SIGRTMIN, sender as i32, sender as u32),
+                        SignalInfo::new_user(Signo::SIGRTMIN, sender as i32, sender as u32, 0),
                         |info| PreparedSignal::try_accounted(info, &user, SENDERS as u64, &global),
                     )
                     .unwrap()
@@ -527,7 +572,7 @@ fn concurrent_cancellation_linearizes_and_refunds_every_queue_charge() {
     let prepared_after_cancel = Arc::new(AtomicBool::new(false));
     let called = prepared_after_cancel.clone();
     let outcome = signal
-        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 99, 99), |info| {
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 99, 99, 0), |info| {
             called.store(true, Ordering::Release);
             Ok::<_, core::convert::Infallible>(PreparedSignal::unqueued(info))
         })
@@ -562,7 +607,7 @@ fn registration_commit_cannot_race_teardown_into_resurrection() {
         assert!(cancel.join().unwrap());
         assert!(!signal.is_registered());
         assert_eq!(
-            process.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 1, 1)),
+            process.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 1, 1, 0)),
             None
         );
     }
@@ -604,7 +649,7 @@ fn registration_commit_linearizes_with_ignored_action_flush() {
 
         committed_rx.recv().unwrap();
         signal
-            .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+            .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1, 0), |info| {
                 PreparedSignal::try_accounted(info, &user, 1, &global)
             })
             .unwrap();

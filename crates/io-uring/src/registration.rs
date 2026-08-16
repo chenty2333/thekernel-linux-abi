@@ -17,6 +17,15 @@ pub const PINNED_IORING_REGISTER_LAST: u32 = 31;
 /// Header-level registration operations implemented by the initial profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistrationOperation {
+    /// Copy `count` iovec descriptors and build an unpublished fixed table.
+    RegisterBuffers {
+        /// Userspace address of the iovec array.
+        argument: u64,
+        /// Number of fixed-buffer slots.
+        count: u32,
+    },
+    /// Retire the one published fixed-buffer table.
+    UnregisterBuffers,
     /// Copy `count` signed descriptors and build an unpublished fixed table.
     RegisterFiles {
         /// Userspace address of the signed descriptor array.
@@ -69,11 +78,6 @@ impl RegistrationRequest {
     }
 
     /// Validates the header and classifies supported versus unsupported work.
-    ///
-    /// Classic buffer registration is validated before returning
-    /// `RegisteredBuffersUnsupported`, allowing the adapter to distinguish a
-    /// malformed request (`EINVAL`) from a well-formed unsupported one
-    /// (`EOPNOTSUPP`) without duplicating Linux magic numbers.
     pub const fn decode(self) -> Result<RegistrationOperation, IoUringError> {
         if self.opcode & IORING_REGISTER_USE_REGISTERED_RING != 0 {
             let base = self.opcode & !IORING_REGISTER_USE_REGISTERED_RING;
@@ -87,20 +91,25 @@ impl RegistrationRequest {
         }
         match self.opcode {
             IORING_REGISTER_BUFFERS => {
-                if self.argument == 0
-                    || self.count == 0
-                    || self.count > IORING_MAX_REGISTERED_BUFFERS
+                // A NULL argument is still passed to the syscall adapter so
+                // it can reproduce Linux's EFAULT precedence over the count
+                // cap without allocating or touching an unbounded range.
+                if self.argument != 0
+                    && (self.count == 0 || self.count > IORING_MAX_REGISTERED_BUFFERS)
                 {
                     Err(IoUringError::InvalidRegistration)
                 } else {
-                    Err(IoUringError::RegisteredBuffersUnsupported)
+                    Ok(RegistrationOperation::RegisterBuffers {
+                        argument: self.argument,
+                        count: self.count,
+                    })
                 }
             }
             IORING_UNREGISTER_BUFFERS => {
                 if self.argument != 0 || self.count != 0 {
                     Err(IoUringError::InvalidRegistration)
                 } else {
-                    Err(IoUringError::RegisteredBuffersUnsupported)
+                    Ok(RegistrationOperation::UnregisterBuffers)
                 }
             }
             IORING_REGISTER_FILES => {
@@ -168,10 +177,13 @@ mod tests {
     }
 
     #[test]
-    fn buffer_headers_distinguish_malformed_from_unsupported() {
+    fn buffer_headers_distinguish_malformed_from_supported() {
         assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_BUFFERS, 0, 1).decode(),
-            Err(IoUringError::InvalidRegistration)
+            Ok(RegistrationOperation::RegisterBuffers {
+                argument: 0,
+                count: 1,
+            })
         );
         assert_eq!(
             RegistrationRequest::new(
@@ -183,8 +195,30 @@ mod tests {
             Err(IoUringError::InvalidRegistration)
         );
         assert_eq!(
+            RegistrationRequest::new(IORING_REGISTER_BUFFERS, 0, 0).decode(),
+            Ok(RegistrationOperation::RegisterBuffers {
+                argument: 0,
+                count: 0,
+            })
+        );
+        assert_eq!(
+            RegistrationRequest::new(
+                IORING_REGISTER_BUFFERS,
+                0,
+                IORING_MAX_REGISTERED_BUFFERS + 1
+            )
+            .decode(),
+            Ok(RegistrationOperation::RegisterBuffers {
+                argument: 0,
+                count: IORING_MAX_REGISTERED_BUFFERS + 1,
+            })
+        );
+        assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_BUFFERS, 0x1000, 1).decode(),
-            Err(IoUringError::RegisteredBuffersUnsupported)
+            Ok(RegistrationOperation::RegisterBuffers {
+                argument: 0x1000,
+                count: 1,
+            })
         );
         assert_eq!(
             RegistrationRequest::new(IORING_UNREGISTER_BUFFERS, 1, 0).decode(),
@@ -192,7 +226,7 @@ mod tests {
         );
         assert_eq!(
             RegistrationRequest::new(IORING_UNREGISTER_BUFFERS, 0, 0).decode(),
-            Err(IoUringError::RegisteredBuffersUnsupported)
+            Ok(RegistrationOperation::UnregisterBuffers)
         );
         assert_eq!(
             RegistrationRequest::new(

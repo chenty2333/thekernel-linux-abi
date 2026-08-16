@@ -26,24 +26,40 @@ const REPARENT_BATCH_LIMIT: usize = 64;
 #[cfg(test)]
 static MAX_REPARENT_BATCH_OBSERVED: AtomicUsize = AtomicUsize::new(0);
 
+fn try_atomic_update(
+    counter: &AtomicUsize,
+    set_order: Ordering,
+    load_order: Ordering,
+    mut update: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    let mut current = counter.load(load_order);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match counter.compare_exchange_weak(current, next, set_order, load_order) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn reserve_bounded_counter(counter: &AtomicUsize, limit: usize) -> Result<(), ProcessError> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(1).filter(|next| *next <= limit)
-        })
-        .map(|_| ())
-        .map_err(|_| ProcessError::Capacity)
+    try_atomic_update(counter, Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(1).filter(|next| *next <= limit)
+    })
+    .map(|_| ())
+    .map_err(|_| ProcessError::Capacity)
 }
 
 /// Releases one internal resource charge without ever wrapping through
 /// `usize::MAX`. `None` means the counter was already zero; callers then retain
 /// surrounding registry state instead of turning corruption into new capacity.
 fn release_counter(counter: &AtomicUsize) -> Option<usize> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_sub(1)
-        })
-        .ok()
+    try_atomic_update(counter, Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_sub(1)
+    })
+    .ok()
 }
 
 fn decrement_count(counter: &mut usize) -> bool {

@@ -7,7 +7,7 @@ bump the minor version; compatible fixes bump the patch version.
 
 1. Confirm the release commit is clean and all provenance assets are present.
 2. Run `CARGO_TOOLCHAIN=1.85.0 ./scripts/ci.sh` for stable packages and
-   `CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh` for the complete
+   `CARGO_TOOLCHAIN=nightly ./scripts/ci.sh` for the complete
    workspace. Both gates enforce the lockfile; stable includes MM, io_uring,
    and packet, while nightly also covers process, signal, credentials, and
    seccomp.
@@ -16,10 +16,10 @@ bump the minor version; compatible fixes bump the patch version.
    Cargo-normalized manifest, and test the unpacked source. Cargo-generated
    `[lib]` and `[[test]]` target paths are package-local and intentionally
    allowed.
-4. Require rustdoc with warnings denied, hosted semantic/concurrency tests,
-   no-default-feature builds, and RISC-V 64 plus LoongArch64 builds.
-5. Build registry-only adapters and real TheKernel consumers for both
-   architectures. A workspace-only compile is not a consumer gate.
+4. Require rustdoc with warnings denied, hosted x86_64 semantic/concurrency
+   tests, and no-default-feature builds.
+5. Build registry-only adapters and a real x86_64 TheKernel consumer. A
+   workspace-only compile is not a consumer gate.
 6. Update the workspace and crate `CHANGELOG.md`, README, and patch ledger.
 7. Run `scripts/test-publish-dry-run.sh`. Its default set is the eight
    independently resolvable packages: usercopy, process, VFS, FD, credentials,
@@ -37,10 +37,10 @@ process, VFS, FD, MM, credentials, io_uring, and packet. Signal follows usercopy
 because its registry manifest depends on that published version. Seccomp
 follows the separate `thekernel-axcbpf` 0.1.0 release from the `thekernel-ax`
 repository.
-Credentials and seccomp require the pinned nightly for fallible
+Credentials and seccomp require the rolling nightly for fallible
 `allocator_api`; neither claims a stable `rust-version`. MM, io_uring, packet,
-and seccomp remain unpublished until their semantic, package, real-consumer,
-and dual-architecture gates all pass. No empty `thekernel-linux-abi` facade is
+and seccomp remain unpublished until their semantic, package, and real-consumer
+gates all pass. No empty `thekernel-linux-abi` facade is
 published.
 
 Before the first upload, the nightly package gate builds signal together with
@@ -61,7 +61,7 @@ actually visible to an ordinary registry client. Do not hide this propagation
 delay behind an unbounded retry loop. Then run:
 
 ```bash
-SIGNAL_REGISTRY_READY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
+SIGNAL_REGISTRY_READY=1 CARGO_TOOLCHAIN=nightly \
   ./scripts/test-publish-dry-run.sh thekernel-linux-signal
 ```
 
@@ -73,7 +73,7 @@ After an explicitly authorized `thekernel-axcbpf` upload, wait until 0.1.0 is
 visible to an ordinary registry client, then run:
 
 ```bash
-AXCBPF_REGISTRY_READY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
+AXCBPF_REGISTRY_READY=1 CARGO_TOOLCHAIN=nightly \
   ./scripts/test-publish-dry-run.sh thekernel-linux-seccomp
 ```
 

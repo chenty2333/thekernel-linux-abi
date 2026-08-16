@@ -10,8 +10,7 @@ evaluator behavior, or benchmark-specific policy.
 
 TheKernel maintainers review and release the workspace. A release requires at
 least one maintainer approval, green required CI, a complete provenance
-record, and verification in a real TheKernel consumer on both supported
-architectures.
+record, and verification in a real x86_64 TheKernel consumer.
 
 ## Decision process
 

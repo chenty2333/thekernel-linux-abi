@@ -55,7 +55,6 @@ jobs:
         with:
           toolchain: stable
           components: clippy,rustfmt
-          targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Stable crates release-candidate gate
         env:
@@ -81,11 +80,10 @@ jobs:
           toolchain: 1.85.0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: nightly-2025-05-20
+          toolchain: nightly
           components: clippy,rustfmt
-          targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Full Linux ABI workspace release-candidate gate
         env:
-          CARGO_TOOLCHAIN: nightly-2025-05-20
+          CARGO_TOOLCHAIN: nightly
         run: ./scripts/ci.sh

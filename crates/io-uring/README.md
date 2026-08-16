@@ -69,13 +69,13 @@ under the table lock.
 ## Deliberate 0.1 limits
 
 This first slice does not implement native async workers or io-wq, `SQPOLL` or
-`IOPOLL`, registered buffers or long-term pin ownership, linked or multishot
-requests, personalities, timeouts, buffer selection, or the full Linux opcode
-and registration surface. Well-formed registered-buffer headers are rejected
-explicitly rather than treated as malformed. Positioned reads/writes and poll
-requests still need a real consumer executor and retained readiness adapter.
-Package existence is therefore not a claim of complete Linux `io_uring`
-support.
+`IOPOLL`, linked or multishot requests, personalities, timeouts, buffer
+selection, or the full Linux opcode and registration surface. Registered
+buffers and `READ_FIXED`/`WRITE_FIXED` use generation-safe leases; the adapter
+retains MM pins and uses its existing direct-or-copy I/O fallback when hardware
+DMA is unavailable. Positioned reads/writes and poll requests still need a real
+consumer executor and retained readiness adapter. Package existence is
+therefore not a claim of complete Linux `io_uring` support.
 
 ## Error and stability contract
 

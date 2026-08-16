@@ -263,7 +263,76 @@ fn reservation_fences_mutation_across_bounded_revalidation_windows() {
 }
 
 #[test]
-fn read_pins_may_overlap_but_any_write_overlap_is_rejected() {
+fn active_long_term_pin_transfers_mutation_safety_to_lower_owner() {
+    let quota = PinQuota::new(8, (8 * PAGE) as u64, 4);
+    let mut registry = registry::<1, 4>(quota, 1);
+    let mapping = snapshot(10, 3, 0x1000, 0x4000, access(true, true, false));
+    let reservation = registry
+        .reserve(
+            request(0x1000, 0x2000, PinAccess::Write, PinDuration::LongTerm, 7),
+            mapping.address_space(),
+        )
+        .unwrap();
+    let overlap =
+        InvalidationRange::from_raw(mapping, 0x2000, PAGE, InvalidationReason::Unmap).unwrap();
+
+    assert_eq!(
+        registry.admit_mutation(overlap),
+        Err(MmError::MappingPinned)
+    );
+    validate_single(
+        &mut registry,
+        reservation,
+        mapping,
+        PageRange::new(0x1000, 0x2000, PAGE).unwrap(),
+    );
+    let token = registry.commit(reservation).unwrap();
+
+    assert!(registry.first_mutation_blocker(overlap).is_none());
+    assert!(registry.admit_mutation(overlap).is_ok());
+    assert_eq!(
+        registry.view(token).unwrap().request().duration(),
+        PinDuration::LongTerm
+    );
+    assert_eq!(registry.global_accounting().pages(), 2);
+    registry.release(token).unwrap();
+    assert_eq!(registry.global_accounting(), PinAccounting::default());
+}
+
+#[test]
+fn clone_blocker_tracks_mapping_fences_not_long_term_ownership() {
+    let quota = PinQuota::new(8, (8 * PAGE) as u64, 4);
+    let mapping = snapshot(10, 3, 0x1000, 0x4000, access(true, true, false));
+    let covered = PageRange::new(0x1000, PAGE, PAGE).unwrap();
+
+    let mut long_term = registry::<1, 4>(quota, 1);
+    let reservation = long_term
+        .reserve(
+            request(0x1000, PAGE, PinAccess::Write, PinDuration::LongTerm, 7),
+            mapping.address_space(),
+        )
+        .unwrap();
+    assert!(long_term.has_clone_blocker());
+    validate_single(&mut long_term, reservation, mapping, covered);
+    let token = long_term.commit(reservation).unwrap();
+    assert!(!long_term.has_clone_blocker());
+    long_term.release(token).unwrap();
+
+    let mut async_io = registry::<1, 4>(quota, 1);
+    let reservation = async_io
+        .reserve(
+            request(0x1000, PAGE, PinAccess::Read, PinDuration::AsyncIo, 7),
+            mapping.address_space(),
+        )
+        .unwrap();
+    validate_single(&mut async_io, reservation, mapping, covered);
+    let token = async_io.commit(reservation).unwrap();
+    assert!(async_io.has_clone_blocker());
+    async_io.release(token).unwrap();
+}
+
+#[test]
+fn read_pins_may_overlap_but_short_lived_write_overlap_is_rejected() {
     let quota = PinQuota::new(16, (16 * PAGE) as u64, 8);
     let mut registry = registry::<2, 8>(quota, 1);
     let asid = AddressSpaceId::new(1).unwrap();
@@ -297,6 +366,40 @@ fn read_pins_may_overlap_but_any_write_overlap_is_rejected() {
     );
     registry.release(first).unwrap();
     registry.release(second).unwrap();
+}
+
+#[test]
+fn published_long_term_owner_does_not_block_a_reused_virtual_range() {
+    let quota = PinQuota::new(8, (8 * PAGE) as u64, 4);
+    let mut registry = registry::<1, 4>(quota, 1);
+    let asid = AddressSpaceId::new(1).unwrap();
+    let old_mapping = snapshot(10, 1, 0x1000, PAGE, access(true, true, false));
+    let covered = PageRange::new(0x1000, PAGE, PAGE).unwrap();
+
+    let old = registry
+        .reserve(
+            request(0x1000, PAGE, PinAccess::Write, PinDuration::LongTerm, 7),
+            asid,
+        )
+        .unwrap();
+    validate_single(&mut registry, old, old_mapping, covered);
+    let old = registry.commit(old).unwrap();
+
+    // The old VMA may be unmapped while its published long-term consumer
+    // retains exact lower ownership. Reusing that VA creates a distinct
+    // mapping identity, whose own pin must not alias the old virtual fence.
+    let new_mapping = snapshot(11, 1, 0x1000, PAGE, access(true, true, false));
+    let new = registry
+        .reserve(
+            request(0x1000, PAGE, PinAccess::Write, PinDuration::LongTerm, 7),
+            asid,
+        )
+        .unwrap();
+    validate_single(&mut registry, new, new_mapping, covered);
+    let new = registry.commit(new).unwrap();
+
+    registry.release(old).unwrap();
+    registry.release(new).unwrap();
 }
 
 #[test]

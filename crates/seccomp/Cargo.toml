@@ -21,7 +21,7 @@ default = []
 all-features = true
 
 [package.metadata.thekernel]
-toolchain = "nightly-2025-05-20"
+toolchain = "nightly"
 nightly-features = ["allocator_api"]
 
 [lints]

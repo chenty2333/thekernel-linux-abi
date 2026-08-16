@@ -44,6 +44,24 @@ pub enum PinUse {
     Other,
 }
 
+fn try_atomic_update(
+    counter: &AtomicU64,
+    set_order: Ordering,
+    load_order: Ordering,
+    mut update: impl FnMut(u64) -> Option<u64>,
+) -> Result<u64, u64> {
+    let mut current = counter.load(load_order);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match counter.compare_exchange_weak(current, next, set_order, load_order) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Fully typed pin intent. Fields remain private so intent cannot be partial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PinRequest {
@@ -268,17 +286,17 @@ pub struct PinBudget<const CHARGE_CAPACITY: usize> {
 static NEXT_PIN_BUDGET_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 fn allocate_pin_budget_identity() -> Result<NonZeroU64, MmError> {
-    let identity = NEXT_PIN_BUDGET_IDENTITY
-        .fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| match current {
-                0 => None,
-                u64::MAX => Some(0),
-                _ => Some(current + 1),
-            },
-        )
-        .map_err(|_| MmError::IdExhausted)?;
+    let identity = try_atomic_update(
+        &NEXT_PIN_BUDGET_IDENTITY,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| match current {
+            0 => None,
+            u64::MAX => Some(0),
+            _ => Some(current + 1),
+        },
+    )
+    .map_err(|_| MmError::IdExhausted)?;
     NonZeroU64::new(identity).ok_or(MmError::IdExhausted)
 }
 
@@ -865,20 +883,42 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
         }
     }
 
-    /// Finds the first reservation or active pin overlapping an invalidation.
+    /// Whether cloning the address-space topology would cross an unpublished
+    /// reservation or a short-lived active mapping fence.
+    ///
+    /// Active long-term pins retain exact lower owners independently of the
+    /// source VMA topology and therefore do not block a fork clone.
+    pub fn has_clone_blocker(&self) -> bool {
+        self.records.iter().flatten().any(|record| {
+            record.state == RecordState::Reserved
+                || record.request.duration != PinDuration::LongTerm
+        })
+    }
+
+    /// Finds the first reservation or short-lived active pin overlapping an
+    /// invalidation.
+    ///
+    /// Every reservation remains a mutation fence until publication. An
+    /// active long-term pin has already transferred stability to exact lower
+    /// owners, so mapping topology and permissions may subsequently change
+    /// without invalidating that owner.
     pub fn first_mutation_blocker(
         &self,
         invalidation: InvalidationRange,
     ) -> Option<MutationBlocker> {
         self.records.iter().flatten().find_map(|record| {
             let expected = invalidation.expected();
-            (record.snapshot.address_space == expected.address_space()
+            let fences_mutation = record.state == RecordState::Reserved
+                || record.request.duration != PinDuration::LongTerm;
+            (fences_mutation
+                && record.snapshot.address_space == expected.address_space()
                 && record.range.overlaps(invalidation.range()))
             .then_some(MutationBlocker(PinLeaseView(*record)))
         })
     }
 
-    /// Admits a mapping mutation only when no live pin overlaps it.
+    /// Admits a mapping mutation when no reservation or short-lived active pin
+    /// overlaps it.
     pub fn admit_mutation(&self, invalidation: InvalidationRange) -> Result<(), MmError> {
         if self.first_mutation_blocker(invalidation).is_some() {
             return Err(MmError::MappingPinned);
@@ -1005,6 +1045,8 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
             if record.snapshot.address_space == address_space
                 && record.range.overlaps(range)
                 && (record.request.access == PinAccess::Write || request.access == PinAccess::Write)
+                && (record.state == RecordState::Reserved
+                    || record.request.duration != PinDuration::LongTerm)
             {
                 return Err(MmError::PinOverlap);
             }

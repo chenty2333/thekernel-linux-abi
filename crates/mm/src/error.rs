@@ -34,7 +34,7 @@ pub enum MmError {
     OwnerNotConfigured,
     /// A quota cannot be removed or replaced while it has live charges.
     OwnerBusy,
-    /// A writable pin overlaps another live reservation or pin.
+    /// A writable pin overlaps a live reservation or short-lived pin.
     PinOverlap,
     /// A mapping mutation overlaps a live pin.
     MappingPinned,

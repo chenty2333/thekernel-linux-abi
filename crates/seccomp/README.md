@@ -8,8 +8,8 @@ signal context.
 
 Version 0.1.0 provides:
 
-- the native-endian 64-byte Linux `seccomp_data` view and RISC-V 64 and
-  LoongArch64 audit-architecture values;
+- the native-endian 64-byte Linux `seccomp_data` view and x86_64
+  audit-architecture value;
 - the seccomp-only classic-BPF profile over a fallible, immutable Layer 1
   program, with one-to-4096-instruction validation and allocation-free
   evaluation;
@@ -88,8 +88,8 @@ existing ancestor; a resulting path of exactly 32768 is accepted and a larger
 path is rejected without publishing a leaf.
 
 This is an arithmetic compatibility contract, not an eBPF translator or JIT.
-It deliberately models the Linux v6.12 unblinded migration path used by the
-RISC-V 64 and LoongArch64 eBPF-JIT architecture families. Direct cBPF-JIT
+It deliberately models the Linux v6.12 unblinded migration path for the
+supported x86_64 profile. Direct cBPF-JIT
 architectures, native JIT image bytes, `bpf_jit_limit`, and constant-blinding
 expansion under `bpf_jit_harden` are not claimed exact by version 0.1.
 
@@ -105,10 +105,9 @@ single-task publication, and per-sibling synchronization eligibility. It does
 not freeze a task/thread-group lock, credential slot, signal or ptrace model,
 audit sink, listener protocol, JIT, eBPF subsystem, or packet-filter adapter.
 
-The crate requires TheKernel's pinned nightly because fallible standard `Arc`
+The crate requires TheKernel's rolling nightly because fallible standard `Arc`
 allocation currently uses `allocator_api`. `thekernel-axcbpf` itself supports
-Rust 1.85. Both packages are checked as `no_std` consumers on RISC-V 64 and
-LoongArch64.
+Rust 1.85. Both packages are checked as `no_std` consumers on x86_64.
 
 See `VENDOR.md`, `PATCHES.md`, and `NOTICE` for exact provenance and research
 anchors.

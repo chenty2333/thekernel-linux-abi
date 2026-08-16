@@ -64,11 +64,11 @@ session, group, thread node, or registry owner can report
 type consumed by TheKernel and by `intrusive-collections`.
 
 Rust's fallible `Arc::try_new` still requires the `allocator_api` feature on the
-pinned consumer toolchain. `allocator-api2` supplies stable fallible `Box` and
+rolling nightly consumer toolchain. `allocator-api2` supplies stable fallible `Box` and
 collection allocation, but it does not supply a layout-compatible standard
 `Arc`; converting such a box into `alloc::sync::Arc` performs a new infallible
 allocation. A custom reference-counted pointer would change public ownership
 types and consumer interoperability. Pre-reserving unrelated memory cannot
 guarantee that the later `Arc` allocation succeeds and would only fake the OOM
-contract. Therefore 0.1.0 explicitly requires `nightly-2025-05-20` instead of
-claiming a stable `rust-version`.
+contract. Therefore 0.1.0 explicitly requires the rolling `nightly` toolchain
+instead of claiming a stable `rust-version`.

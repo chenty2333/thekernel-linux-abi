@@ -59,6 +59,10 @@ impl SignalActions {
         signo as usize - 1
     }
 
+    fn is_uncatchable(signo: Signo) -> bool {
+        matches!(signo, Signo::SIGKILL | Signo::SIGSTOP)
+    }
+
     fn reset_claim_is_current(&self, index: usize) -> bool {
         self.reset_claims[index]
             .as_ref()
@@ -66,6 +70,9 @@ impl SignalActions {
     }
 
     fn effective_action(&self, signo: Signo) -> SignalAction {
+        if Self::is_uncatchable(signo) {
+            return SignalAction::default();
+        }
         let index = Self::index(signo);
         if self.reset_claim_is_current(index) {
             SignalAction::default()
@@ -79,6 +86,9 @@ impl SignalActions {
         signo: Signo,
         action: SignalAction,
     ) -> Result<SignalAction, SignalActionUpdateError> {
+        if Self::is_uncatchable(signo) {
+            return Err(SignalActionUpdateError::UncatchableSignal);
+        }
         let index = Self::index(signo);
         let old = self.effective_action(signo);
         let generation = self.generations[index]
@@ -93,6 +103,9 @@ impl SignalActions {
         &mut self,
         signo: Signo,
     ) -> (SignalAction, Option<ResetDeliveryClaim>) {
+        if Self::is_uncatchable(signo) {
+            return (SignalAction::default(), None);
+        }
         let index = Self::index(signo);
         if self.reset_claim_is_current(index) {
             return (SignalAction::default(), None);
@@ -138,6 +151,105 @@ impl SignalActions {
             reset_claims: array::from_fn(|_| None),
         }
     }
+
+    /// Builds the action table which Linux installs after a successful exec.
+    ///
+    /// Caught dispositions do not survive exec, while dispositions explicitly
+    /// set to `SIG_IGN` do.  Claims and generation state belong to the old
+    /// owner and are intentionally not copied into the new owner.
+    fn exec_snapshot(&self) -> Self {
+        Self {
+            actions: array::from_fn(|index| {
+                let action = if self.reset_claim_is_current(index) {
+                    SignalAction::default()
+                } else {
+                    self.actions[index]
+                };
+                match action.disposition {
+                    SignalDisposition::Handler(_) | SignalDisposition::Default => {
+                        SignalAction::default()
+                    }
+                    SignalDisposition::Ignore => SignalAction {
+                        disposition: SignalDisposition::Ignore,
+                        ..SignalAction::default()
+                    },
+                }
+            }),
+            generations: [0; 64],
+            reset_claims: array::from_fn(|_| None),
+        }
+    }
+}
+
+/// The shared process signal-action owner used by Linux `sighand` sharing.
+///
+/// The action table and the update gate intentionally live in one opaque
+/// owner.  A process manager owns only an `Arc` to this value, so managers
+/// which share a sighand observe the same disposition generations and
+/// `SA_RESETHAND` claims while retaining private pending queues and child
+/// registries.
+pub struct SharedSignalActions {
+    update: Mutex<()>,
+    actions: SpinNoIrq<SignalActions>,
+}
+
+impl SharedSignalActions {
+    /// Fallibly allocates a shared action owner from an initial action table.
+    pub fn try_new(actions: SignalActions) -> Result<Arc<Self>, AllocError> {
+        Arc::try_new(Self {
+            update: Mutex::new(()),
+            actions: SpinNoIrq::new(actions),
+        })
+    }
+
+    /// Copies the currently effective actions into an independent owner.
+    ///
+    /// A delivery which has claimed `SA_RESETHAND` is already observed as the
+    /// default disposition by the source table, so the copied owner also
+    /// materializes that in-flight one-shot action as default.  The shared
+    /// update gate is held while the source table is copied, which gives the
+    /// snapshot the same linearization domain as disposition replacement.
+    pub fn try_snapshot(self: &Arc<Self>) -> Result<Arc<Self>, AllocError> {
+        let update = self.update.lock();
+        let actions = {
+            let actions = self.actions.lock();
+            actions.snapshot()
+        };
+        drop(update);
+
+        Self::try_new(actions)
+    }
+
+    /// Returns whether two shared action owners are the same allocation.
+    pub fn ptr_eq(left: impl AsRef<Self>, right: impl AsRef<Self>) -> bool {
+        core::ptr::eq(left.as_ref(), right.as_ref())
+    }
+
+    /// Exposes the action-table lock to the sibling API implementation only.
+    ///
+    /// The owner remains opaque to users of this crate; public action access
+    /// goes through [`ProcessSignalManager`].
+    pub(crate) fn table_lock(&self) -> &SpinNoIrq<SignalActions> {
+        &self.actions
+    }
+
+    /// Exposes the shared update lock to the sibling API implementation only.
+    pub(crate) fn update_lock(&self) -> &Mutex<()> {
+        &self.update
+    }
+
+    pub(crate) fn lock(&self) -> kspin::SpinNoIrqGuard<'_, SignalActions> {
+        self.table_lock().lock()
+    }
+}
+
+/// A delivery claim paired with the exact shared owner from which it was
+/// selected.  Exec may detach that owner before frame publication; finishing
+/// against the current manager owner would otherwise strand a peer's
+/// `SA_RESETHAND` claim.
+pub(crate) struct OwnedResetDeliveryClaim {
+    owner: Arc<SharedSignalActions>,
+    claim: ResetDeliveryClaim,
 }
 
 /// One preallocated entry in the process thread-signal registry.
@@ -154,6 +266,7 @@ pub(crate) struct RegisteredThread {
 const REGISTRATION_PENDING: u8 = 0;
 const REGISTRATION_ACTIVE: u8 = 1;
 const REGISTRATION_CANCELLED: u8 = 2;
+const REGISTRATION_RETAINED: u8 = 3;
 
 impl RegisteredThread {
     pub(crate) fn try_new(
@@ -175,6 +288,14 @@ impl RegisteredThread {
         self.state.store(REGISTRATION_CANCELLED, Ordering::Release);
     }
 
+    pub(crate) fn retain_pending_only(&self) {
+        self.state.store(REGISTRATION_RETAINED, Ordering::Release);
+    }
+
+    pub(crate) fn matches(&self, tid: u32, thread: *const ThreadSignalManager) -> bool {
+        self.tid == tid && self.thread.as_ptr() == thread
+    }
+
     pub(crate) fn is_live(&self) -> bool {
         self.state.load(Ordering::Acquire) != REGISTRATION_CANCELLED
             && self.thread.strong_count() != 0
@@ -193,6 +314,16 @@ impl RegisteredThread {
 
     pub(crate) fn is_active(&self) -> bool {
         self.state.load(Ordering::Acquire) == REGISTRATION_ACTIVE
+    }
+
+    pub(crate) fn upgrade_for_action_update(&self) -> Option<Arc<ThreadSignalManager>> {
+        if !matches!(
+            self.state.load(Ordering::Acquire),
+            REGISTRATION_ACTIVE | REGISTRATION_RETAINED
+        ) {
+            return None;
+        }
+        self.thread.upgrade()
     }
 }
 
@@ -253,22 +384,45 @@ impl PreparedProcessSignalSend {
     pub fn publish(self, prepared: PreparedSignal) -> DeferredProcessSignalSend {
         let process = &self.process;
         let signo = prepared.signo();
-        let blocked_by_any_thread = self.endpoints.iter().any(|endpoint| {
-            endpoint.is_active()
-                && (endpoint.thread.signal_blocked(signo)
-                    || endpoint.thread.signal_real_blocked(signo))
-        });
 
-        let (published, unused, accepted) = {
-            let actions = process.actions.lock();
-            if ProcessSignalManager::action_ignored(&actions, signo) && !blocked_by_any_thread {
-                (false, Some(prepared), false)
-            } else {
-                let outcome = process.pending.lock().publish(prepared);
-                let (published, unused) = outcome.into_parts();
-                (published, unused, true)
+        let mut prepared = Some(prepared);
+        let mut unused = None;
+        let mut published = false;
+        let mut accepted = false;
+        let detached = process.with_action_update(|actions_owner| {
+            let mut generation_detached = DetachedSignal::empty();
+            let lifecycle = process.lifecycle.lock();
+            if *lifecycle == PROCESS_ENDPOINT_ACTIVE {
+                if ProcessSignalManager::has_generation_effect(signo) {
+                    process.apply_generation_effect_locked(signo, &mut generation_detached);
+                }
+                if *lifecycle == PROCESS_ENDPOINT_ACTIVE {
+                    let blocked_by_any_thread = self.endpoints.iter().any(|endpoint| {
+                        endpoint.is_active()
+                            && (endpoint.thread.signal_blocked(signo)
+                                || endpoint.thread.signal_real_blocked(signo))
+                    });
+                    let actions = actions_owner.lock();
+                    if !ProcessSignalManager::action_ignored(&actions, signo)
+                        || blocked_by_any_thread
+                    {
+                        let outcome = process
+                            .pending
+                            .lock()
+                            .publish(prepared.take().expect("prepared signal is retained"));
+                        (published, unused) = outcome.into_parts();
+                        accepted = true;
+                    }
+                    drop(actions);
+                }
             }
-        };
+            drop(lifecycle);
+            generation_detached
+        });
+        // Detached realtime nodes own queue-account charges.  Keep their
+        // destruction outside the shared update, lifecycle, and pending
+        // guards; publication itself only moves those owners.
+        drop(detached);
 
         let wake_tid = if accepted {
             process.possibly_has_signal.store(true, Ordering::Release);
@@ -286,7 +440,7 @@ impl PreparedProcessSignalSend {
                 published,
                 wake_tid,
             },
-            unused,
+            unused: unused.or(prepared),
         }
     }
 }
@@ -328,6 +482,9 @@ pub enum SignalActionUpdateError {
     /// Reusing a generation would let an old `SA_RESETHAND` delivery claim
     /// overwrite a newer disposition, so exhaustion is reported explicitly.
     GenerationExhausted,
+    /// Linux rejects all `rt_sigaction` dispositions for `SIGKILL` and
+    /// `SIGSTOP` with `EINVAL`; these signals remain default and uncatchable.
+    UncatchableSignal,
 }
 
 /// Default finite process-local thread endpoint ceiling.
@@ -352,8 +509,21 @@ pub struct ProcessSignalManager {
     /// The process-level shared pending signals
     pending: SpinNoIrq<PendingSignals>,
 
-    /// The signal actions and one-shot delivery generations.
-    pub(crate) actions: SpinNoIrq<SignalActions>,
+    /// Publication state for the shared pending endpoint. Retention keeps
+    /// already published records alive through the unreaped lifetime while
+    /// cancellation rejects and drains every later publication.
+    lifecycle: SpinNoIrq<u8>,
+
+    /// Shared Linux sighand identity, action table, and update domain.
+    ///
+    /// The indirection is manager-local: an exec swaps this pointer while
+    /// peers which still share the old sighand retain their original owner.
+    pub(crate) actions: SpinNoIrq<Arc<SharedSignalActions>>,
+
+    /// Serializes owner lookup/update with an exec owner swap.  The shared
+    /// owner update lock is acquired after this gate, so a manager never uses
+    /// an owner which an exec has already detached.
+    action_update: Mutex<()>,
 
     /// The default restorer function.
     pub(crate) default_restorer: usize,
@@ -362,16 +532,71 @@ pub struct ProcessSignalManager {
     /// snapshot `Arc` acquisition never runs with interrupts disabled.
     pub(crate) children: Mutex<Option<Arc<ThreadRegistry>>>,
 
-    /// Serializes registry publication with action transitions. On kernel
-    /// targets this is a sleepable mutex when the crate's `multitask` feature
-    /// is enabled, so immutable snapshots are allocated without holding a
-    /// SpinNoIrq guard. Hosted tests retain the spin fallback.
-    pub(crate) action_update: Mutex<()>,
-
     thread_limit: usize,
 
     pub(crate) possibly_has_signal: AtomicBool,
 }
+
+/// Fallibly prepared private sighand replacement for a successful exec.
+///
+/// The token borrows its manager so it cannot be committed to a different
+/// process signal endpoint.  Its replacement owner is allocated while exec is
+/// still recoverable; [`Self::commit`] only copies the fixed-size action table
+/// and swaps the manager's owner pointer, so it cannot report an allocation
+/// failure after the caller has started tearing down the old image.
+#[must_use = "commit or drop the prepared exec sighand token"]
+pub struct PreparedExecUnshare<'a> {
+    manager: &'a ProcessSignalManager,
+    replacement: Arc<SharedSignalActions>,
+}
+
+impl PreparedExecUnshare<'_> {
+    /// Commits the prepared sighand replacement without allocation.
+    ///
+    /// The manager gate excludes another owner swap, while the source-owner
+    /// update gate linearizes this exec against every peer disposition update.
+    /// The source is copied again at this point rather than reusing the
+    /// prepare-time snapshot, so an update which won the race during sibling
+    /// teardown is visible in the execing manager's private owner.
+    pub fn commit(self) {
+        let Self {
+            manager,
+            replacement,
+        } = self;
+        let manager_update = manager.action_update.lock();
+        let source = manager.action_owner();
+        let source_update = source.update_lock().lock();
+        let replacement_update = replacement.update_lock().lock();
+        let actions = {
+            let actions = source.lock();
+            actions.exec_snapshot()
+        };
+        {
+            let mut replacement_actions = replacement.lock();
+            *replacement_actions = actions;
+        }
+        let replacement_for_owner = replacement.clone();
+        let old = {
+            let mut owner = manager.actions.lock();
+            core::mem::replace(&mut *owner, replacement_for_owner)
+        };
+        drop(replacement_update);
+        drop(source_update);
+        drop(manager_update);
+        drop(old);
+    }
+}
+
+const PROCESS_ENDPOINT_ACTIVE: u8 = 1;
+const PROCESS_ENDPOINT_RETAINED: u8 = 2;
+const PROCESS_ENDPOINT_CANCELLED: u8 = 3;
+
+const JOB_CONTROL_STOP_SIGNALS: [Signo; 4] = [
+    Signo::SIGSTOP,
+    Signo::SIGTSTP,
+    Signo::SIGTTIN,
+    Signo::SIGTTOU,
+];
 
 impl ProcessSignalManager {
     pub(crate) fn action_ignored(actions: &SignalActions, signo: Signo) -> bool {
@@ -384,15 +609,53 @@ impl ProcessSignalManager {
         }
     }
 
+    pub(crate) fn has_generation_effect(signo: Signo) -> bool {
+        signo == Signo::SIGCONT || JOB_CONTROL_STOP_SIGNALS.contains(&signo)
+    }
+
+    /// Applies Linux's generation-time job-control cancellation while the
+    /// caller owns the shared action-update gate. Both active and retained
+    /// private endpoint queues are included; cancelled endpoints no longer
+    /// retain meaningful pending state.
+    pub(crate) fn apply_generation_effect_locked(
+        &self,
+        signo: Signo,
+        detached: &mut DetachedSignal,
+    ) {
+        let flush: &[Signo] = if signo == Signo::SIGCONT {
+            &JOB_CONTROL_STOP_SIGNALS
+        } else if JOB_CONTROL_STOP_SIGNALS.contains(&signo) {
+            core::slice::from_ref(&Signo::SIGCONT)
+        } else {
+            return;
+        };
+
+        for &pending_signo in flush {
+            self.detach_signal_into(pending_signo, detached);
+        }
+
+        let registry = self.children_registry_snapshot();
+        if let Some(registry) = registry.as_deref() {
+            for entry in registry {
+                if let Some(thread) = entry.upgrade_for_action_update() {
+                    for &pending_signo in flush {
+                        thread.detach_signal_into(pending_signo, detached);
+                    }
+                }
+            }
+        }
+        drop(registry);
+    }
+
     /// Creates a process signal manager with the default finite thread limit.
-    pub fn new(actions: SignalActions, default_restorer: usize) -> Self {
+    pub fn new(actions: Arc<SharedSignalActions>, default_restorer: usize) -> Self {
         Self::with_validated_thread_limit(actions, default_restorer, SIGNAL_THREAD_REGISTRY_LIMIT)
     }
 
     /// Creates a process signal manager with a caller-selected finite thread
     /// endpoint limit.
     pub fn try_with_thread_limit(
-        actions: SignalActions,
+        actions: Arc<SharedSignalActions>,
         default_restorer: usize,
         thread_limit: usize,
     ) -> Result<Self, SignalManagerConfigError> {
@@ -407,16 +670,17 @@ impl ProcessSignalManager {
     }
 
     fn with_validated_thread_limit(
-        actions: SignalActions,
+        actions: Arc<SharedSignalActions>,
         default_restorer: usize,
         thread_limit: usize,
     ) -> Self {
         Self {
             pending: SpinNoIrq::new(PendingSignals::default()),
+            lifecycle: SpinNoIrq::new(PROCESS_ENDPOINT_ACTIVE),
             actions: SpinNoIrq::new(actions),
+            action_update: Mutex::new(()),
             default_restorer,
             children: Mutex::new(None),
-            action_update: Mutex::new(()),
             thread_limit,
             possibly_has_signal: AtomicBool::new(false),
         }
@@ -427,19 +691,144 @@ impl ProcessSignalManager {
         self.thread_limit
     }
 
+    fn action_owner(&self) -> Arc<SharedSignalActions> {
+        self.actions.lock().clone()
+    }
+
+    /// Runs a bounded action operation while the manager's owner pointer and
+    /// the shared owner update domain are both stable.  The manager gate is
+    /// intentionally acquired before the shared gate; every owner mutation,
+    /// endpoint transition, and exec swap follows this order.
+    pub(crate) fn with_action_update<R>(
+        &self,
+        operation: impl FnOnce(&SharedSignalActions) -> R,
+    ) -> R {
+        let _manager_update = self.action_update.lock();
+        let owner = self.action_owner();
+        let _owner_update = owner.update_lock().lock();
+        operation(&owner)
+    }
+
+    /// Runs an action-table operation against the manager's current owner.
+    pub(crate) fn with_action_table<R>(
+        &self,
+        operation: impl FnOnce(&mut SignalActions) -> R,
+    ) -> R {
+        self.with_action_update(|owner| {
+            let mut actions = owner.lock();
+            operation(&mut actions)
+        })
+    }
+
+    /// Prepares a private sighand owner for a successful exec.
+    ///
+    /// The source action table is snapshotted and the replacement owner is
+    /// allocated while the manager and source-owner update gates are held.
+    /// The gates are released before the caller interrupts or waits for
+    /// sibling threads, so peer action updates are not blocked by teardown.
+    /// [`PreparedExecUnshare::commit`] takes a fresh fixed-size snapshot under
+    /// the source-owner gate; updates linearized before that commit therefore
+    /// cannot be overwritten by this prepare-time snapshot.
+    pub fn try_prepare_exec_unshare(&self) -> Result<PreparedExecUnshare<'_>, AllocError> {
+        let manager_update = self.action_update.lock();
+        let source = self.action_owner();
+        let source_update = source.update_lock().lock();
+        let actions = {
+            let actions = source.lock();
+            actions.exec_snapshot()
+        };
+        let replacement = SharedSignalActions::try_new(actions)?;
+        drop(source_update);
+        drop(manager_update);
+        Ok(PreparedExecUnshare {
+            manager: self,
+            replacement,
+        })
+    }
+
+    /// Claims one `SA_RESETHAND` action while retaining the exact owner to
+    /// which the delivery must later be finished.  This matters if exec swaps
+    /// the manager to a private owner between selection and frame handling.
+    pub(crate) fn claim_delivery(
+        &self,
+        signo: Signo,
+    ) -> (SignalAction, Option<OwnedResetDeliveryClaim>) {
+        let manager_update = self.action_update.lock();
+        let owner = self.action_owner();
+        let owner_update = owner.update_lock().lock();
+        let result = {
+            let mut actions = owner.lock();
+            actions.claim_delivery(signo)
+        };
+        drop(owner_update);
+        drop(manager_update);
+        let (action, claim) = result;
+        (
+            action,
+            claim.map(|claim| OwnedResetDeliveryClaim { owner, claim }),
+        )
+    }
+
+    pub(crate) fn finish_delivery(&self, reservation: OwnedResetDeliveryClaim, commit: bool) {
+        let _owner_update = reservation.owner.update_lock().lock();
+        let mut actions = reservation.owner.lock();
+        actions.finish_delivery(reservation.claim, commit);
+    }
+
+    /// Freezes the process-directed queue while retaining already published
+    /// records for the unreaped lifetime. Prepared and direct sends recheck
+    /// this state while committing, so a sender which loses the race returns
+    /// its prepared queue owner to the caller's deferred cleanup path.
+    pub fn retain_pending_only(&self) {
+        self.with_action_update(|_| {
+            let mut lifecycle = self.lifecycle.lock();
+            if *lifecycle == PROCESS_ENDPOINT_ACTIVE {
+                *lifecycle = PROCESS_ENDPOINT_RETAINED;
+            }
+        });
+    }
+
+    /// Cancels the process-directed endpoint and drains every retained record.
+    /// Queue nodes and their accounting are released only after all signal
+    /// state guards have been dropped.
+    pub fn retire_pending(&self) {
+        let detached = self.with_action_update(|_| {
+            let mut lifecycle = self.lifecycle.lock();
+            if *lifecycle == PROCESS_ENDPOINT_CANCELLED {
+                drop(lifecycle);
+                return None;
+            }
+            *lifecycle = PROCESS_ENDPOINT_CANCELLED;
+            let detached = {
+                let mut pending = self.pending.lock();
+                let detached = pending.take_all();
+                self.possibly_has_signal.store(false, Ordering::Release);
+                detached
+            };
+            drop(lifecycle);
+            Some(detached)
+        });
+        drop(detached);
+    }
+
     pub(crate) fn children_registry_snapshot(&self) -> Option<Arc<ThreadRegistry>> {
         self.children.lock().clone()
     }
 
+    /// Returns the opaque shared sighand identity owned by this manager.
+    pub fn shared_actions(&self) -> Arc<SharedSignalActions> {
+        self.action_owner()
+    }
+
     /// Returns the currently effective action for one signal.
     pub fn action(&self, signo: Signo) -> SignalAction {
-        self.actions.lock().effective_action(signo)
+        self.with_action_table(|actions| actions.effective_action(signo))
     }
 
     /// Copies the effective action table for a new, independent process.
     /// In-flight `SA_RESETHAND` claims are materialized as default actions.
     pub fn actions_snapshot(&self) -> SignalActions {
-        self.actions.lock().snapshot()
+        self.with_action_table(|actions| actions.snapshot())
     }
 
     fn try_children_snapshot(&self) -> Result<Vec<Arc<ThreadSignalManager>>, AllocError> {
@@ -450,7 +839,7 @@ impl ProcessSignalManager {
 
         if let Some(registry) = registry.as_deref() {
             for entry in registry {
-                if let Some((_, child)) = entry.upgrade() {
+                if let Some(child) = entry.upgrade_for_action_update() {
                     snapshot.push(child);
                 }
             }
@@ -501,34 +890,70 @@ impl ProcessSignalManager {
         signo: Signo,
         action: SignalAction,
     ) -> Result<SignalAction, SignalActionUpdateError> {
-        let update = self.action_update.lock();
-        let children = self.try_children_snapshot()?;
-        let mut detached = DetachedSignal::empty();
-        let old_action = {
-            let mut actions = self.actions.lock();
-            let old_action = actions.replace(signo, action)?;
-            if Self::action_ignored(&actions, signo) {
-                let empty = {
-                    let mut pending = self.pending.lock();
-                    pending.detach_signal_into(signo, &mut detached);
-                    pending.set.is_empty()
+        // Linux rejects SIGKILL and SIGSTOP before any action-table or
+        // endpoint work.  Keep this check at the public entry point as well
+        // as in SignalActions::replace so the errno contract wins over a
+        // possible allocation failure while preparing the child snapshot.
+        if SignalActions::is_uncatchable(signo) {
+            return Err(SignalActionUpdateError::UncatchableSignal);
+        }
+        // Keep any retained endpoint snapshot in the result on an action
+        // replacement failure.  In particular, generation exhaustion is
+        // reported after the snapshot has been prepared; letting the closure
+        // unwind normally would drop those endpoint Arcs while the shared
+        // action/update guards are still held.
+        let result = self.with_action_update(|owner| {
+            let children = match self.try_children_snapshot() {
+                Ok(children) => children,
+                Err(_) => {
+                    return Err((SignalActionUpdateError::NoMemory, Vec::new()));
+                }
+            };
+            let mut detached = DetachedSignal::empty();
+            let old_action = {
+                let mut actions = owner.lock();
+                let old_action = match actions.replace(signo, action) {
+                    Ok(old_action) => old_action,
+                    Err(error) => return Err((error, children)),
                 };
-                if empty {
-                    self.possibly_has_signal.store(false, Ordering::Release);
+                if Self::action_ignored(&actions, signo) {
+                    let empty = {
+                        let mut pending = self.pending.lock();
+                        pending.detach_signal_into(signo, &mut detached);
+                        pending.set.is_empty()
+                    };
+                    if empty {
+                        self.possibly_has_signal.store(false, Ordering::Release);
+                    }
+                    for child in &children {
+                        child.detach_signal_into(signo, &mut detached);
+                    }
                 }
-                for child in &children {
-                    child.detach_signal_into(signo, &mut detached);
-                }
-            }
-            old_action
-        };
+                old_action
+            };
+            Ok::<_, (SignalActionUpdateError, Vec<Arc<ThreadSignalManager>>)>((
+                old_action, detached, children,
+            ))
+        });
 
-        // Neither queue nodes nor strong endpoint snapshots are destroyed
-        // while an actions, registry, or pending SpinNoIrq guard is held.
-        drop(update);
-        drop(detached);
-        drop(children);
-        Ok(old_action)
+        match result {
+            Ok((old_action, detached, children)) => {
+                // Neither queue nodes nor strong endpoint snapshots are
+                // destroyed while an actions, registry, or pending
+                // SpinNoIrq guard is held.
+                drop(detached);
+                drop(children);
+                Ok(old_action)
+            }
+            Err((error, children)) => {
+                // The closure has already released every short signal-state
+                // guard.  This is the generation-exhaustion and allocation
+                // failure path, so release the retained endpoint snapshot
+                // only now as well.
+                drop(children);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn dequeue_signal_owned(&self, mask: &SignalSet) -> Option<DequeuedSignal> {
@@ -542,23 +967,43 @@ impl ProcessSignalManager {
         }
     }
 
-    pub(crate) fn dequeue_signal(&self, mask: &SignalSet) -> Option<SignalInfo> {
-        self.dequeue_signal_owned(mask)
-            .map(DequeuedSignal::into_info)
+    /// Returns one exact dequeued record to the front of the process queue.
+    /// Delivery Retry/Fault uses this rather than reconstructing siginfo so
+    /// RT FIFO order and queue accounting remain unchanged.
+    pub(crate) fn requeue_signal(&self, signal: DequeuedSignal) {
+        let detached = self.with_action_update(|_| {
+            let lifecycle = self.lifecycle.lock();
+            if *lifecycle == PROCESS_ENDPOINT_CANCELLED {
+                drop(lifecycle);
+                return Some(signal);
+            }
+            let mut pending = self.pending.lock();
+            signal.requeue_front(&mut pending);
+            self.possibly_has_signal.store(true, Ordering::Release);
+            drop(pending);
+            drop(lifecycle);
+            None
+        });
+        // A process retirement can win after a thread selected a process
+        // record but before Retry/Fault returns it.  Do not republish into a
+        // cancelled endpoint; release that exact record only after all
+        // lifecycle, pending, and shared-update guards have left scope.
+        drop(detached);
     }
 
     /// Checks if a signal is ignored by the process.
     pub fn signal_ignored(&self, signo: Signo) -> bool {
-        Self::action_ignored(&self.actions.lock(), signo)
+        self.with_action_table(|actions| Self::action_ignored(actions, signo))
     }
 
     /// Checks if syscalls interrupted by the given signal can be restarted.
     pub fn can_restart(&self, signo: Signo) -> bool {
-        self.actions
-            .lock()
-            .effective_action(signo)
-            .flags
-            .contains(SignalActionFlags::RESTART)
+        self.with_action_table(|actions| {
+            actions
+                .effective_action(signo)
+                .flags
+                .contains(SignalActionFlags::RESTART)
+        })
     }
 
     fn blocked_by_any_thread(&self, signo: Signo) -> bool {
@@ -602,47 +1047,100 @@ impl ProcessSignalManager {
         prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
     ) -> Result<ProcessSignalSendOutcome, E> {
         let signo = sig.signo();
-        if self.signal_ignored(signo) && !self.blocked_by_any_thread(signo) {
-            return Ok(ProcessSignalSendOutcome {
-                published: false,
-                wake_tid: None,
-            });
+        let inactive = || ProcessSignalSendOutcome {
+            published: false,
+            wake_tid: None,
+        };
+
+        // Generation-time job-control cancellation is deliberately part of
+        // the same preflight and commit protocol as direct and prepared
+        // publication. It runs before ignored/coalesced decisions and before
+        // any queue record is prepared.
+        let (preflight, detached) = self.with_action_update(|owner| {
+            let mut generation_detached = DetachedSignal::empty();
+            let lifecycle = self.lifecycle.lock();
+            if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+                drop(lifecycle);
+                return (Some(inactive()), generation_detached);
+            }
+            if Self::has_generation_effect(signo) {
+                self.apply_generation_effect_locked(signo, &mut generation_detached);
+            }
+            if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+                drop(lifecycle);
+                return (Some(inactive()), generation_detached);
+            }
+            let blocked_by_any_thread = self.blocked_by_any_thread(signo);
+            let actions = owner.lock();
+            if Self::action_ignored(&actions, signo) && !blocked_by_any_thread {
+                drop(actions);
+                drop(lifecycle);
+                return (Some(inactive()), generation_detached);
+            }
+            let coalesced = !signo.is_realtime() && self.pending.lock().set.has(signo);
+            drop(actions);
+            drop(lifecycle);
+            (
+                coalesced.then(|| ProcessSignalSendOutcome {
+                    published: false,
+                    wake_tid: self.wake_thread_for(signo),
+                }),
+                generation_detached,
+            )
+        });
+        drop(detached);
+        if let Some(outcome) = preflight {
+            if outcome.published || outcome.wake_tid.is_some() {
+                self.possibly_has_signal.store(true, Ordering::Release);
+            }
+            return Ok(outcome);
         }
 
-        let already_pending = !signo.is_realtime() && self.pending.lock().set.has(signo);
-        let mut published = false;
-        if !already_pending {
-            let prepared = prepare(sig)?;
+        // Preparation is outside every signal-state guard. A concurrent
+        // retain/cancel or action transition may win before commit; the
+        // commit-side state and action checks below then reject the prepared
+        // owner and release it only after all guards have left scope.
+        let mut prepared = Some(prepare(sig)?);
+        let ((outcome, unused, ignored), detached) = self.with_action_update(|owner| {
+            let mut generation_detached = DetachedSignal::empty();
+            let lifecycle = self.lifecycle.lock();
+            if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+                drop(lifecycle);
+                return ((None, prepared.take(), true), generation_detached);
+            }
+            if Self::has_generation_effect(signo) {
+                self.apply_generation_effect_locked(signo, &mut generation_detached);
+            }
+            if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+                drop(lifecycle);
+                return ((None, prepared.take(), true), generation_detached);
+            }
             let blocked_by_any_thread = self.blocked_by_any_thread(signo);
-            let outcome = {
-                let actions = self.actions.lock();
-                if Self::action_ignored(&actions, signo) && !blocked_by_any_thread {
-                    Err(prepared)
-                } else {
-                    let mut pending = self.pending.lock();
-                    Ok(pending.publish(prepared))
+            let actions = owner.lock();
+            let ignored = Self::action_ignored(&actions, signo) && !blocked_by_any_thread;
+            let mut outcome = None;
+            if !ignored {
+                let mut pending = self.pending.lock();
+                if signo.is_realtime() || !pending.set.has(signo) {
+                    outcome = Some(
+                        pending.publish(prepared.take().expect("prepared signal is retained")),
+                    );
                 }
-            };
-            // A disposition transition can make a prepared node unnecessary.
-            // Release it only after the action and pending guards are gone.
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(prepared) => {
-                    drop(prepared);
-                    return Ok(ProcessSignalSendOutcome {
-                        published: false,
-                        wake_tid: None,
-                    });
-                }
-            };
-            // A racing standard sender may have filled the fixed slot after
-            // preflight. Release its unused charge outside the pending lock.
-            published = outcome.finish();
+            }
+            drop(actions);
+            drop(lifecycle);
+            ((outcome, prepared.take(), ignored), generation_detached)
+        });
+        drop(detached);
+        drop(unused);
+
+        let published = outcome.is_some_and(|outcome| outcome.finish());
+        if !ignored {
+            self.possibly_has_signal.store(true, Ordering::Release);
         }
-        self.possibly_has_signal.store(true, Ordering::Release);
         Ok(ProcessSignalSendOutcome {
             published,
-            wake_tid: self.wake_thread_for(signo),
+            wake_tid: (!ignored).then(|| self.wake_thread_for(signo)).flatten(),
         })
     }
 
@@ -687,11 +1185,24 @@ impl ProcessSignalManager {
         };
         drop(detached);
     }
+
+    fn detach_signal_into(&self, signo: Signo, detached: &mut DetachedSignal) {
+        let empty = {
+            let mut pending = self.pending.lock();
+            pending.detach_signal_into(signo, detached);
+            pending.set.is_empty()
+        };
+        if empty {
+            self.possibly_has_signal.store(false, Ordering::Release);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SignalActionUpdateError, SignalActions};
+    use super::{
+        ProcessSignalManager, SharedSignalActions, SignalActionUpdateError, SignalActions,
+    };
     use crate::{SignalAction, SignalActionFlags, SignalDisposition, Signo};
 
     fn reset_action(handler: usize) -> SignalAction {
@@ -743,6 +1254,99 @@ mod tests {
         assert!(matches!(
             actions.effective_action(signo).disposition,
             SignalDisposition::Handler(1)
+        ));
+    }
+
+    #[test]
+    fn uncatchable_signal_replacement_is_rejected_without_mutation() {
+        for signo in [Signo::SIGKILL, Signo::SIGSTOP] {
+            let mut actions = SignalActions::default();
+            assert!(matches!(
+                actions.replace(signo, reset_action(1)),
+                Err(SignalActionUpdateError::UncatchableSignal)
+            ));
+            assert!(matches!(
+                actions.effective_action(signo).disposition,
+                SignalDisposition::Default
+            ));
+        }
+    }
+
+    #[test]
+    fn snapshot_materializes_an_inflight_reset_claim_as_default() {
+        let signo = Signo::SIGTERM;
+        let shared = SharedSignalActions::try_new(SignalActions::default()).unwrap();
+        let claim = {
+            let mut actions = shared.lock();
+            actions.replace(signo, reset_action(1)).unwrap();
+            let (_, claim) = actions.claim_delivery(signo);
+            claim.unwrap()
+        };
+
+        let snapshot = shared.try_snapshot().unwrap();
+        assert!(matches!(
+            snapshot.lock().effective_action(signo).disposition,
+            SignalDisposition::Default
+        ));
+
+        shared.lock().finish_delivery(claim, false);
+        assert!(matches!(
+            shared.lock().effective_action(signo).disposition,
+            SignalDisposition::Handler(1)
+        ));
+        assert!(matches!(
+            snapshot.lock().effective_action(signo).disposition,
+            SignalDisposition::Default
+        ));
+    }
+
+    #[test]
+    fn manager_generation_failure_does_not_mutate_shared_owner() {
+        let signo = Signo::SIGTERM;
+        let shared = SharedSignalActions::try_new(SignalActions::default()).unwrap();
+        let manager = ProcessSignalManager::new(shared.clone(), 0);
+        let index = SignalActions::index(signo);
+        {
+            let mut actions = shared.lock();
+            actions.actions[index] = reset_action(1);
+            actions.generations[index] = u64::MAX;
+        }
+
+        assert!(matches!(
+            manager.try_replace_action(signo, reset_action(2)),
+            Err(SignalActionUpdateError::GenerationExhausted)
+        ));
+        assert!(SharedSignalActions::ptr_eq(
+            manager.shared_actions(),
+            &shared
+        ));
+        assert!(matches!(
+            manager.action(signo).disposition,
+            SignalDisposition::Handler(1)
+        ));
+    }
+
+    #[test]
+    fn exec_unshare_resets_caught_actions_without_reusing_generation_space() {
+        let signo = Signo::SIGTERM;
+        let shared = SharedSignalActions::try_new(SignalActions::default()).unwrap();
+        let manager = ProcessSignalManager::new(shared.clone(), 0);
+        let index = SignalActions::index(signo);
+        {
+            let mut actions = shared.lock();
+            actions.actions[index] = reset_action(1);
+            actions.generations[index] = u64::MAX;
+        }
+
+        manager.try_prepare_exec_unshare().unwrap().commit();
+
+        assert!(!SharedSignalActions::ptr_eq(
+            manager.shared_actions(),
+            &shared
+        ));
+        assert!(matches!(
+            manager.action(signo).disposition,
+            SignalDisposition::Default
         ));
     }
 }

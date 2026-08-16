@@ -69,8 +69,7 @@ pub struct RawSignalAction {
     pub handler: usize,
     /// Linux `SA_*` flags.
     pub flags: c_ulong,
-    /// Userspace restorer address on architectures that expose `sa_restorer`.
-    #[cfg(sa_restorer)]
+    /// Userspace restorer address in the x86_64 Linux `kernel_sigaction` ABI.
     pub restorer: usize,
     /// Signals blocked while the handler runs.
     pub mask: SignalSet,
@@ -82,7 +81,6 @@ const _: [(); mem::offset_of!(kernel_sigaction, sa_handler_kernel)] =
     [(); mem::offset_of!(RawSignalAction, handler)];
 const _: [(); mem::offset_of!(kernel_sigaction, sa_flags)] =
     [(); mem::offset_of!(RawSignalAction, flags)];
-#[cfg(sa_restorer)]
 const _: [(); mem::offset_of!(kernel_sigaction, sa_restorer)] =
     [(); mem::offset_of!(RawSignalAction, restorer)];
 const _: [(); mem::offset_of!(kernel_sigaction, sa_mask)] =
@@ -146,13 +144,11 @@ impl From<SignalAction> for RawSignalAction {
             SignalDisposition::Ignore => 1,
             SignalDisposition::Handler(handler) => handler,
         };
-        #[cfg(sa_restorer)]
         let restorer = value.restorer.unwrap_or(0);
 
         Self {
             handler,
             flags: value.flags.bits(),
-            #[cfg(sa_restorer)]
             restorer,
             mask: value.mask,
         }
@@ -168,14 +164,11 @@ impl From<RawSignalAction> for SignalAction {
             handler => SignalDisposition::Handler(handler),
         };
 
-        #[cfg(sa_restorer)]
         let restorer = if flags.contains(SignalActionFlags::RESTORER) {
             Some(value.restorer)
         } else {
             None
         };
-        #[cfg(not(sa_restorer))]
-        let restorer = None;
 
         SignalAction {
             flags,

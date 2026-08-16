@@ -101,6 +101,6 @@ drop cmsgs. Every known option outside ignore-outgoing and statistics is
 rejected explicitly rather than silently accepted. Package existence is not a
 claim that a consumer exposes `AF_PACKET` yet.
 
-The package supports stable Rust 1.85, RISC-V 64, and LoongArch64 consumers.
+The package supports stable Rust 1.85 and x86_64 consumers.
 See `VENDOR.md`, `PATCHES.md`, and `NOTICE` for provenance and research
 boundaries.

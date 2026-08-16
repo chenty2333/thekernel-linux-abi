@@ -19,28 +19,24 @@ multitask = ["dep:axsync", "axsync/multitask"]
 [dependencies]
 axcpu.workspace = true
 bitflags.workspace = true
-cfg-if.workspace = true
 derive_more.workspace = true
 kspin.workspace = true
 linux-raw-sys.workspace = true
 log.workspace = true
 strum.workspace = true
 thekernel-linux-usercopy.workspace = true
+x86_64.workspace = true
 
 [target.'cfg(target_os = "none")'.dependencies]
 axsync = { workspace = true, optional = true }
-
-# axcpu accepts any x86_64 0.15 release, but 0.15.5 requires a newer Step
-# contract than this package's pinned nightly. A direct target constraint keeps
-# standalone and unpacked package builds reproducible.
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
 
 [package.metadata.thekernel]
-toolchain = "nightly-2025-05-20"
+# The workspace selects the rolling nightly toolchain; this crate only needs
+# the allocator_api nightly feature and intentionally does not pin a date.
+toolchain = "nightly"
 nightly-features = ["allocator_api"]
 
 [lints]

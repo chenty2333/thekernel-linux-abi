@@ -351,7 +351,7 @@ mod tests {
     use core::mem::{align_of, offset_of, size_of};
 
     use super::*;
-    use crate::{AUDIT_ARCH_LOONGARCH64, AUDIT_ARCH_RISCV64, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO};
+    use crate::{AUDIT_ARCH_X86_64, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO};
 
     const fn stmt(code: u16, value: u32) -> ClassicBpfInstruction {
         ClassicBpfInstruction::statement(code, value)
@@ -364,22 +364,21 @@ mod tests {
     fn data() -> SeccompData {
         SeccompData {
             number: 63,
-            architecture: AUDIT_ARCH_RISCV64,
+            architecture: AUDIT_ARCH_X86_64,
             instruction_pointer: 0x1122_3344_5566_7788,
             arguments: [0x0102_0304_0506_0708, 2, 3, 4, 5, 0xa1a2_a3a4_a5a6_a7a8],
         }
     }
 
     #[test]
-    fn seccomp_data_and_audit_arches_match_linux_64_bit_abi() {
+    fn seccomp_data_and_audit_arch_matches_linux_x86_64_abi() {
         assert_eq!(size_of::<SeccompData>(), 64);
         assert_eq!(align_of::<SeccompData>(), 8);
         assert_eq!(offset_of!(SeccompData, number), 0);
         assert_eq!(offset_of!(SeccompData, architecture), 4);
         assert_eq!(offset_of!(SeccompData, instruction_pointer), 8);
         assert_eq!(offset_of!(SeccompData, arguments), 16);
-        assert_eq!(AUDIT_ARCH_RISCV64, 0xc000_00f3);
-        assert_eq!(AUDIT_ARCH_LOONGARCH64, 0xc000_0102);
+        assert_eq!(AUDIT_ARCH_X86_64, 0xc000_003e);
     }
 
     #[test]
@@ -535,7 +534,7 @@ mod tests {
     fn evaluates_syscall_arch_ip_and_argument_words() {
         let cases = [
             (0, 63),
-            (4, AUDIT_ARCH_RISCV64),
+            (4, AUDIT_ARCH_X86_64),
             (8, 0x5566_7788),
             (12, 0x1122_3344),
             (16, 0x0506_0708),

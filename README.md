@@ -49,12 +49,13 @@ the caller rather than becoming hidden workspace-global state.
 The workspace name is not a facade package. The MM package exposes policy and
 lifecycle contracts, including reusable userfaultfd negotiation/registration
 rules; it is not a page-table, fault-broker, FD/readiness implementation, or a
-claim that a consumer already exposes the complete syscall. Real-consumer and
-dual-architecture gates remain required before a release tag.
+claim that a consumer already exposes the complete syscall. A real-consumer
+x86_64 gate remains required before a release tag.
 
 ## Development
 
-The repository pins the same nightly used by its initial TheKernel consumer.
+The repository uses the rolling `nightly` toolchain used by its initial
+TheKernel consumer.
 The usercopy, VFS, FD, MM, io_uring, and packet crates are additionally checked
 against stable Rust 1.85 or newer. The process, signal, credential, and seccomp
 crates are explicitly nightly-only because preserving fallible standard `Arc`
@@ -81,8 +82,8 @@ cargo check -p thekernel-linux-mm --no-default-features --locked
 cargo check -p thekernel-linux-io-uring --no-default-features --locked
 cargo check -p thekernel-linux-packet --no-default-features --locked
 cargo check -p thekernel-linux-seccomp --no-default-features --locked
-CARGO_TOOLCHAIN=nightly-2025-05-20 ./scripts/ci.sh
-PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly-2025-05-20 \
+CARGO_TOOLCHAIN=nightly ./scripts/ci.sh
+PACKAGE_ALLOW_DIRTY=1 CARGO_TOOLCHAIN=nightly \
   ./scripts/test-package.sh
 ```
 

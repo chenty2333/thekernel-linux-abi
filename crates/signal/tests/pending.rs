@@ -3,11 +3,12 @@ use std::sync::Arc;
 use thekernel_linux_signal::{
     PreparedSignal, SignalAction, SignalDisposition, SignalInfo, SignalQueueAccount, SignalSet,
     Signo,
-    api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
+    api::{ProcessSignalManager, SharedSignalActions, SignalActions, ThreadSignalManager},
 };
 
 fn new_test_env() -> (Arc<ProcessSignalManager>, Arc<ThreadSignalManager>) {
-    let process = Arc::new(ProcessSignalManager::new(SignalActions::default(), 0));
+    let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
+    let process = Arc::new(ProcessSignalManager::new(actions, 0));
     let thread = ThreadSignalManager::try_new(process.clone()).unwrap();
     thread.try_register(7).unwrap().commit().unwrap();
     (process, thread)
@@ -45,14 +46,14 @@ fn send_outcome_distinguishes_owned_publication_from_coalescing() {
 
     let (_proc, thread) = new_test_env();
     let first = thread
-        .try_send_signal_with(SignalInfo::new_user(Signo::SIGINT, 1, 1), |info| {
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGINT, 1, 1, 0), |info| {
             Ok::<_, core::convert::Infallible>(PreparedSignal::unqueued(info))
         })
         .unwrap();
     assert!(first.published);
 
     let coalesced = thread
-        .try_send_signal_with(SignalInfo::new_user(Signo::SIGINT, 2, 2), |info| {
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGINT, 2, 2, 0), |info| {
             Ok::<_, core::convert::Infallible>(PreparedSignal::unqueued(info))
         })
         .unwrap();
@@ -62,13 +63,13 @@ fn send_outcome_distinguishes_owned_publication_from_coalescing() {
 
 #[test]
 fn prepared_signal_replaces_siginfo_without_changing_signo() {
-    let mut prepared = PreparedSignal::unqueued(SignalInfo::new_user(Signo::SIGRTMIN, 1, 10));
-    let replacement = SignalInfo::new_user(Signo::SIGRTMIN, 2, 20);
+    let mut prepared = PreparedSignal::unqueued(SignalInfo::new_user(Signo::SIGRTMIN, 1, 10, 0));
+    let replacement = SignalInfo::new_user(Signo::SIGRTMIN, 2, 20, 0);
     let old = prepared.replace_info(replacement).unwrap();
     assert_eq!(old.code(), 1);
     assert_eq!(prepared.info().code(), 2);
 
-    let wrong_signo = SignalInfo::new_user(Signo::SIGRT1, 3, 30);
+    let wrong_signo = SignalInfo::new_user(Signo::SIGRT1, 3, 30, 0);
     assert!(prepared.replace_info(wrong_signo).is_none());
     assert_eq!(prepared.signo(), Signo::SIGRTMIN);
 }
@@ -79,14 +80,14 @@ fn standard_signal_uses_fixed_slots_and_coalesces() {
     let (user, global) = accounts(1);
     send_accounted(
         &thread,
-        SignalInfo::new_user(Signo::SIGINT, 9, 9),
+        SignalInfo::new_user(Signo::SIGINT, 9, 9, 0),
         &user,
         &global,
         0,
     );
     send_accounted(
         &thread,
-        SignalInfo::new_user(Signo::SIGINT, 10, 10),
+        SignalInfo::new_user(Signo::SIGINT, 10, 10, 0),
         &user,
         &global,
         0,
@@ -110,7 +111,7 @@ fn realtime_signal_is_fifo_with_lowest_signo_priority() {
     ] {
         send_accounted(
             &thread,
-            SignalInfo::new_user(signo, code, 9),
+            SignalInfo::new_user(signo, code, 9, 0),
             &user,
             &global,
             8,
@@ -140,22 +141,23 @@ fn process_and_thread_pending_share_one_account() {
     let (process, thread) = new_test_env();
     let (user, global) = accounts(2);
     process
-        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1, 0), |info| {
             PreparedSignal::try_accounted(info, &user, 2, &global)
         })
         .unwrap();
     send_accounted(
         &thread,
-        SignalInfo::new_user(Signo::SIGRT1, 2, 2),
+        SignalInfo::new_user(Signo::SIGRT1, 2, 2, 0),
         &user,
         &global,
         2,
     );
     assert_eq!(user.queued(), 2);
 
-    let rejected = thread.try_send_signal_with(SignalInfo::new_user(Signo::SIGRT2, 3, 3), |info| {
-        PreparedSignal::try_accounted(info, &user, 2, &global)
-    });
+    let rejected = thread
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRT2, 3, 3, 0), |info| {
+            PreparedSignal::try_accounted(info, &user, 2, &global)
+        });
     assert!(rejected.is_err());
     assert_eq!(user.queued(), 2);
 
@@ -170,13 +172,13 @@ fn flush_one_signal_refunds_process_and_thread_queues_precisely() {
     let (user, global) = accounts(8);
     for (signo, code) in [(Signo::SIGRTMIN, 1), (Signo::SIGRT1, 2)] {
         process
-            .try_send_signal_with(SignalInfo::new_user(signo, code, 1), |info| {
+            .try_send_signal_with(SignalInfo::new_user(signo, code, 1, 0), |info| {
                 PreparedSignal::try_accounted(info, &user, 8, &global)
             })
             .unwrap();
         send_accounted(
             &thread,
-            SignalInfo::new_user(signo, code + 10, 1),
+            SignalInfo::new_user(signo, code + 10, 1, 0),
             &user,
             &global,
             8,
@@ -205,13 +207,13 @@ fn dropping_signal_managers_refunds_all_queue_charges() {
     {
         let (process, thread) = new_test_env();
         process
-            .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+            .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1, 0), |info| {
                 PreparedSignal::try_accounted(info, &user, 4, &global)
             })
             .unwrap();
         send_accounted(
             &thread,
-            SignalInfo::new_user(Signo::SIGRT1, 2, 2),
+            SignalInfo::new_user(Signo::SIGRT1, 2, 2, 0),
             &user,
             &global,
             4,
@@ -227,13 +229,13 @@ fn ignored_action_transition_flushes_process_and_thread_instances() {
     let (process, thread) = new_test_env();
     let (user, global) = accounts(4);
     process
-        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1, 0), |info| {
             PreparedSignal::try_accounted(info, &user, 4, &global)
         })
         .unwrap();
     send_accounted(
         &thread,
-        SignalInfo::new_user(Signo::SIGRTMIN, 2, 2),
+        SignalInfo::new_user(Signo::SIGRTMIN, 2, 2, 0),
         &user,
         &global,
         4,

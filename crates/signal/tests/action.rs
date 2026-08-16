@@ -35,7 +35,7 @@ fn convert() {
         ),
         (
             SignalActionFlags::SIGINFO | SignalActionFlags::NODEFER,
-            SignalDisposition::Handler(test_handler as usize),
+            SignalDisposition::Handler(test_handler as *const () as usize),
         ),
     ];
 
@@ -83,7 +83,6 @@ fn raw_action_classifies_arbitrary_handler_bits_without_function_pointer_validit
     let raw = RawSignalAction {
         handler: usize::MAX,
         flags: SignalActionFlags::SIGINFO.bits(),
-        #[cfg(sa_restorer)]
         restorer: 0,
         mask: SignalSet::default(),
     };
@@ -95,7 +94,6 @@ fn raw_action_classifies_arbitrary_handler_bits_without_function_pointer_validit
     ));
 }
 
-#[cfg(sa_restorer)]
 #[test]
 fn explicit_null_restorer_is_not_replaced_by_the_default() {
     let raw = RawSignalAction {
@@ -118,7 +116,6 @@ fn raw_action_round_trip_uses_one_explicit_memory_context() {
     let raw = RawSignalAction {
         handler: 0x1234_5678,
         flags: SignalActionFlags::RESTART.bits(),
-        #[cfg(sa_restorer)]
         restorer: 0x8765_4321,
         mask: {
             let mut mask = SignalSet::default();

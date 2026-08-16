@@ -1,0 +1,22 @@
+[package]
+name = "thekernel-linux-rseq"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Pure Linux restartable-sequence ABI and lifecycle policy for no_std kernels"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "rseq"]
+categories = ["no-std", "os"]
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

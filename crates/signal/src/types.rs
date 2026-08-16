@@ -1,7 +1,13 @@
 use core::{fmt, mem};
 
 use derive_more::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
-use linux_raw_sys::general::{SI_KERNEL, SS_DISABLE, SS_ONSTACK, kernel_sigset_t, siginfo_t};
+use linux_raw_sys::{
+    ctypes::c_void,
+    general::{
+        SI_KERNEL, SI_SIGIO, SI_TIMER, SS_DISABLE, SS_ONSTACK, SYS_SECCOMP, kernel_sigset_t,
+        siginfo_t, sigval_t,
+    },
+};
 use strum::{EnumIter, FromRepr, IntoEnumIterator};
 
 use crate::DefaultSignalAction;
@@ -126,6 +132,16 @@ impl Signo {
 pub struct SignalSet(u64);
 
 impl SignalSet {
+    /// Returns the native x86_64 bit representation of this signal set.
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// Builds a signal set from its native x86_64 bit representation.
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
     fn signo_bit(signo: Signo) -> u64 {
         1 << (signo as u8 - 1)
     }
@@ -199,12 +215,81 @@ impl fmt::Debug for SignalSet {
     }
 }
 
+/// The payload carried by an `SI_TIMER` signal.
+///
+/// `value` is the bit-preserving representation of Linux's `sigval_t`.  It
+/// can be interpreted as either the low 32-bit `sival_int` value or the full
+/// x86_64 `sival_ptr` value by the eventual ABI consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalTimerPayload {
+    pub tid: i32,
+    pub overrun: i32,
+    pub value: usize,
+    pub sys_private: i32,
+}
+
+impl SignalTimerPayload {
+    pub const fn new(tid: i32, overrun: i32, value: usize, sys_private: i32) -> Self {
+        Self {
+            tid,
+            overrun,
+            value,
+            sys_private,
+        }
+    }
+}
+
+/// The payload carried by an `SI_QUEUE` or `SI_MESGQ` signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalRtPayload {
+    pub pid: i32,
+    pub uid: u32,
+    pub value: usize,
+}
+
+impl SignalRtPayload {
+    pub const fn new(pid: i32, uid: u32, value: usize) -> Self {
+        Self { pid, uid, value }
+    }
+}
+
+/// The payload carried by an `SI_SIGIO` signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalPollPayload {
+    pub band: i64,
+    pub fd: i32,
+}
+
+impl SignalPollPayload {
+    pub const fn new(band: i64, fd: i32) -> Self {
+        Self { band, fd }
+    }
+}
+
 /// Signal information. Compatible with `struct siginfo` in libc.
 #[derive(Clone)]
 #[repr(C, align(8))]
 pub struct SignalInfo([u8; 128]);
 
 impl SignalInfo {
+    /// Copies a fully initialized Linux `siginfo_t` record into the canonical
+    /// signal-information storage without relying on nominal type layout
+    /// compatibility at a consumer boundary.
+    pub fn from_raw(raw: siginfo_t) -> Self {
+        let mut bytes = [0u8; mem::size_of::<siginfo_t>()];
+        // SAFETY: `raw` is an owned, fully initialized `siginfo_t`; copying its
+        // exact object representation into the equally-sized byte storage does
+        // not create a reference or interpret any union arm.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&raw as *const siginfo_t).cast::<u8>(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            );
+        }
+        Self(bytes)
+    }
+
     pub fn new_kernel(signo: Signo) -> Self {
         let mut result = Self([0; 128]);
         result.set_signo(signo);
@@ -212,11 +297,77 @@ impl SignalInfo {
         result
     }
 
-    pub fn new_user(signo: Signo, code: i32, pid: u32) -> Self {
+    pub fn new_user(signo: Signo, code: i32, pid: u32, uid: u32) -> Self {
         let mut result = Self([0; 128]);
         result.set_signo(signo);
         result.set_code(code);
         result.set_pid(pid);
+        result.set_uid(uid);
+        result
+    }
+
+    /// Builds a synchronous hardware-fault record with its exact user
+    /// address.
+    pub fn new_fault(signo: Signo, code: i32, address: usize) -> Self {
+        let mut result = Self([0; 128]);
+        result.set_signo(signo);
+        result.set_code(code);
+        result
+            .raw_mut()
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._sigfault
+            ._addr = address as *mut c_void;
+        result
+    }
+
+    /// Builds the `SIGSYS` record Linux exposes for a seccomp trap.
+    pub fn new_sigsys(errno: i32, call_address: usize, syscall: i32, arch: u32) -> Self {
+        let mut result = Self([0; 128]);
+        result.set_signo(Signo::SIGSYS);
+        result.raw_mut().__bindgen_anon_1.__bindgen_anon_1.si_errno = errno;
+        result.set_code(SYS_SECCOMP as _);
+        // SAFETY: `_sigsys` is the initialized payload selected by the
+        // constructor's `SYS_SECCOMP` code. The writes stay behind the private
+        // raw view and cannot expose mutable ABI storage to callers.
+        unsafe {
+            let sigsys = &mut result
+                .raw_mut()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigsys;
+            sigsys._call_addr = call_address as *mut c_void;
+            sigsys._syscall = syscall;
+            sigsys._arch = arch;
+        }
+        result
+    }
+
+    /// Builds an `SI_TIMER` signal with its complete timer payload.
+    pub fn new_timer(signo: Signo, payload: SignalTimerPayload) -> Self {
+        let mut result = Self::new_kernel(signo);
+        result.set_code(SI_TIMER);
+        result.set_timer_payload(payload);
+        result
+    }
+
+    /// Builds an `SI_QUEUE` or `SI_MESGQ` signal with its complete realtime
+    /// payload. The caller selects the Linux code because both variants share
+    /// this ABI payload.
+    pub fn new_rt(signo: Signo, code: i32, payload: SignalRtPayload) -> Self {
+        let mut result = Self::new_kernel(signo);
+        result.set_code(code);
+        result.set_rt_payload(payload);
+        result
+    }
+
+    /// Builds an `SI_SIGIO` signal with its complete poll payload.
+    pub fn new_poll(signo: Signo, payload: SignalPollPayload) -> Self {
+        let mut result = Self::new_kernel(signo);
+        result.set_code(SI_SIGIO);
+        result.set_poll_payload(payload);
         result
     }
 
@@ -268,11 +419,189 @@ impl SignalInfo {
             ._pid = pid as _;
     }
 
+    pub fn uid(&self) -> u32 {
+        // SAFETY: callers use this accessor for SI_USER/SI_TKILL-style records
+        // whose initialized _kill payload contains the sender UID.
+        unsafe {
+            self.as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._kill
+                ._uid
+        }
+    }
+
+    pub fn set_uid(&mut self, uid: u32) {
+        self.raw_mut()
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._kill
+            ._uid = uid as _;
+    }
+
     pub fn errno(&self) -> i32 {
         // SAFETY: The union layout matches Linux's siginfo_t definition. bindgen keeps
         // this layout, so it is safe to read the errno field through the
         // anonymous union.
         unsafe { self.as_raw().__bindgen_anon_1.__bindgen_anon_1.si_errno }
+    }
+
+    /// Returns the user address carried by a synchronous fault record.
+    pub fn fault_address(&self) -> usize {
+        // SAFETY: the fixed 128-byte storage is fully initialized and the
+        // payload is read as the Linux x86_64 `_sigfault` arm.
+        unsafe {
+            self.as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigfault
+                ._addr as usize
+        }
+    }
+
+    /// Returns the userspace instruction address carried by a `SIGSYS`
+    /// record.
+    pub fn sigsys_call_address(&self) -> usize {
+        // SAFETY: see [`Self::fault_address`].
+        unsafe {
+            self.as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigsys
+                ._call_addr as usize
+        }
+    }
+
+    /// Returns the raw syscall number carried by a `SIGSYS` record.
+    pub fn sigsys_syscall(&self) -> i32 {
+        // SAFETY: see [`Self::sigsys_call_address`].
+        unsafe {
+            self.as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigsys
+                ._syscall
+        }
+    }
+
+    /// Returns the Linux audit architecture carried by a `SIGSYS` record.
+    pub fn sigsys_arch(&self) -> u32 {
+        // SAFETY: see [`Self::sigsys_call_address`].
+        unsafe {
+            self.as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigsys
+                ._arch
+        }
+    }
+
+    /// Reads the complete timer payload without exposing the raw union.
+    pub fn timer_payload(&self) -> SignalTimerPayload {
+        // SAFETY: all bytes in SignalInfo are initialized; reading the
+        // sigval pointer arm preserves all 64 payload bits, including values
+        // that a consumer later interprets as `sival_int`.
+        unsafe {
+            let timer = self
+                .as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._timer;
+            SignalTimerPayload::new(
+                timer._tid,
+                timer._overrun,
+                timer._sigval.sival_ptr as usize,
+                timer._sys_private,
+            )
+        }
+    }
+
+    /// Replaces the complete timer payload while retaining the common header.
+    pub fn set_timer_payload(&mut self, payload: SignalTimerPayload) {
+        // SAFETY: writing a union arm is valid for the fully initialized
+        // private ABI record and does not expose a mutable raw view.
+        unsafe {
+            let timer = &mut self
+                .raw_mut()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._timer;
+            timer._tid = payload.tid;
+            timer._overrun = payload.overrun;
+            timer._sigval = sigval_from_bits(payload.value);
+            timer._sys_private = payload.sys_private;
+        }
+    }
+
+    /// Reads the complete `SI_QUEUE`/`SI_MESGQ` payload without exposing the
+    /// raw union.
+    pub fn rt_payload(&self) -> SignalRtPayload {
+        // SAFETY: see [`Self::timer_payload`].
+        unsafe {
+            let rt = self
+                .as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._rt;
+            SignalRtPayload::new(rt._pid, rt._uid, rt._sigval.sival_ptr as usize)
+        }
+    }
+
+    /// Replaces the complete `SI_QUEUE`/`SI_MESGQ` payload while retaining
+    /// the common header and selected code.
+    pub fn set_rt_payload(&mut self, payload: SignalRtPayload) {
+        // SAFETY: see [`Self::set_timer_payload`].
+        unsafe {
+            let rt = &mut self
+                .raw_mut()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._rt;
+            rt._pid = payload.pid;
+            rt._uid = payload.uid;
+            rt._sigval = sigval_from_bits(payload.value);
+        }
+    }
+
+    /// Reads the complete `SI_SIGIO` payload without exposing the raw union.
+    pub fn poll_payload(&self) -> SignalPollPayload {
+        // SAFETY: the fixed storage is initialized and `_sigpoll` consists
+        // only of scalar fields on the x86_64 Linux ABI.
+        unsafe {
+            let poll = self
+                .as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigpoll;
+            SignalPollPayload::new(poll._band, poll._fd)
+        }
+    }
+
+    /// Replaces the complete `SI_SIGIO` payload while retaining the common
+    /// header.
+    pub fn set_poll_payload(&mut self, payload: SignalPollPayload) {
+        // SAFETY: see [`Self::set_timer_payload`].
+        unsafe {
+            let poll = &mut self
+                .raw_mut()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigpoll;
+            poll._band = payload.band;
+            poll._fd = payload.fd;
+        }
     }
 
     /// Returns the raw Linux ABI record.
@@ -287,6 +616,14 @@ impl SignalInfo {
     fn raw_mut(&mut self) -> &mut siginfo_t {
         // SAFETY: as_raw's layout argument also applies to this exclusive view.
         unsafe { &mut *self.0.as_mut_ptr().cast::<siginfo_t>() }
+    }
+}
+
+fn sigval_from_bits(value: usize) -> sigval_t {
+    // Storing the bits through the pointer arm is valid for the C union and
+    // preserves both the integer and pointer interpretations of sigval_t.
+    sigval_t {
+        sival_ptr: value as *mut c_void,
     }
 }
 

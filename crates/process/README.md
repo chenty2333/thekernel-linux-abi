@@ -14,8 +14,8 @@ permission paths require.
 
 ## Toolchain
 
-Version 0.1.0 is intentionally **nightly-only** and is tested with
-`nightly-2025-05-20`. It uses `Arc::try_new` through Rust's `allocator_api`
+Version 0.1.0 is intentionally **nightly-only** and is tested with the rolling
+`nightly` toolchain. It uses `Arc::try_new` through Rust's `allocator_api`
 feature so process-object allocation can return `ProcessError::NoMemory`.
 There is no `rust-version` claim for this package. See `PATCHES.md` for the
 stable-allocation alternatives considered and rejected.

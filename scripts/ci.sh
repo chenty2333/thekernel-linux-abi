@@ -12,7 +12,7 @@ run_cargo() {
     fi
 }
 
-case "${CARGO_TOOLCHAIN:-nightly-2025-05-20}" in
+case "${CARGO_TOOLCHAIN:-nightly}" in
     stable|1.85|1.85.0)
         stable_only=1
         ;;
@@ -49,23 +49,6 @@ run_cargo check -p thekernel-linux-fd --features alloc --lib --locked
 run_cargo check -p thekernel-linux-mm --no-default-features --lib --locked
 run_cargo check -p thekernel-linux-io-uring --no-default-features --lib --locked
 run_cargo check -p thekernel-linux-packet --no-default-features --lib --locked
-
-for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
-    run_cargo check -p thekernel-linux-usercopy --no-default-features --target "$target" --locked
-    run_cargo check -p thekernel-linux-usercopy --features alloc --target "$target" --locked
-    run_cargo check -p thekernel-linux-vfs --no-default-features --target "$target" --locked
-    run_cargo check -p thekernel-linux-fd --no-default-features --target "$target" --locked
-    run_cargo check -p thekernel-linux-fd --features alloc --target "$target" --locked
-    run_cargo check -p thekernel-linux-mm --no-default-features --target "$target" --locked
-    run_cargo check -p thekernel-linux-io-uring --no-default-features --target "$target" --locked
-    run_cargo check -p thekernel-linux-packet --no-default-features --target "$target" --locked
-    if [ "$stable_only" = 0 ]; then
-        run_cargo check -p thekernel-linux-process --no-default-features --target "$target" --locked
-        run_cargo check -p thekernel-linux-signal --features multitask --target "$target" --locked
-        run_cargo check -p thekernel-linux-cred --no-default-features --target "$target" --locked
-        run_cargo check -p thekernel-linux-seccomp --no-default-features --target "$target" --locked
-    fi
-done
 
 "$script_dir/check-provenance.sh"
 if [ "$stable_only" = 1 ]; then

@@ -7,6 +7,7 @@ members = [
     "crates/mm",
     "crates/packet",
     "crates/process",
+    "crates/rseq",
     "crates/seccomp",
     "crates/signal",
     "crates/usercopy",
@@ -42,7 +43,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = [
 log = "0.4"
 strum = { version = "0.27", default-features = false, features = ["derive"] }
 thekernel-linux-usercopy = { path = "crates/usercopy", version = "0.1" }
-x86_64 = { version = "=0.15.4", default-features = false }
+x86_64 = { version = "=0.15.5", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

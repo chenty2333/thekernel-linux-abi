@@ -256,7 +256,7 @@ mod tests {
             prepared
                 .evaluate(&SeccompData {
                     number: 0,
-                    architecture: crate::AUDIT_ARCH_RISCV64,
+                    architecture: crate::AUDIT_ARCH_X86_64,
                     instruction_pointer: 0,
                     arguments: [0; 6],
                 })

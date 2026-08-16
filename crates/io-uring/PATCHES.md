@@ -53,8 +53,8 @@
   UAPI structs, raw pointers, usercopy, and architecture address types;
 - FD lookup, VFS I/O, retained readiness registration, task waiting, signals,
   workers, execution scheduling, MM pins, and errno/result conversion;
-- native async/io-wq workers, `SQPOLL`, `IOPOLL`, registered buffers and their
-  long-term pin lifetime, linked/multishot requests, personalities, timeouts,
+- native async/io-wq workers, `SQPOLL`, `IOPOLL`, linked/multishot requests,
+  personalities, timeouts,
   buffer selection, and the remaining Linux operations/registration commands;
   and
 - concrete lock, queue, map, allocator, RCU/epoch, or reclamation choices.

@@ -313,8 +313,8 @@ duplicate entry points.
 
 ## Toolchain
 
-Version 0.1.0 is intentionally nightly-only and is tested with
-`nightly-2025-05-20`. Fallible `Arc` allocation uses Rust's `allocator_api` so
+Version 0.1.0 is intentionally nightly-only and is tested with the rolling
+`nightly` toolchain. Fallible `Arc` allocation uses Rust's `allocator_api` so
 allocation failure remains `CredError::NoMemory` rather than a panic or abort.
 There is no stable `rust-version` claim for this package. The nightly
 requirement is not a synchronization dependency; consumers select and own

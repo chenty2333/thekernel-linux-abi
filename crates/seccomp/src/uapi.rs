@@ -62,10 +62,8 @@ pub const MAX_INSNS_PER_PATH: usize = 32_768;
 /// Per-ancestor path penalty used by Linux when stacking filters.
 pub const FILTER_PATH_PENALTY: usize = 4;
 
-/// Linux audit architecture value for little-endian RV64.
-pub const AUDIT_ARCH_RISCV64: u32 = 0xc000_00f3;
-/// Linux audit architecture value for little-endian LoongArch64.
-pub const AUDIT_ARCH_LOONGARCH64: u32 = 0xc000_0102;
+/// Linux audit architecture value for little-endian x86_64.
+pub const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
 /// Size of Linux `struct seccomp_data` on supported 64-bit ABIs.
 pub const SECCOMP_DATA_SIZE: usize = 64;

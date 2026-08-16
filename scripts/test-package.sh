@@ -356,7 +356,7 @@ for package in "${packages[@]}"; do
                 printf '%s must not claim a stable rust-version\n' "$package" >&2
                 exit 1
             }
-            grep -Fq 'toolchain = "nightly-2025-05-20"' "$package_dir/Cargo.toml"
+            grep -Fq 'toolchain = "nightly"' "$package_dir/Cargo.toml"
             grep -Fq 'nightly-features = ["allocator_api"]' "$package_dir/Cargo.toml"
             ;;
     esac

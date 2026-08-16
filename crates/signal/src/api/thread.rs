@@ -1,25 +1,24 @@
 use alloc::{alloc::AllocError, sync::Arc, vec::Vec};
-use core::{
-    alloc::Layout,
-    mem::offset_of,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use axcpu::uspace::UserContext;
 use kspin::SpinNoIrq;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, VmResult};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
 
 #[cfg(all(feature = "multitask", target_os = "none"))]
 use axsync::Mutex as DeliveryMutex;
 #[cfg(not(all(feature = "multitask", target_os = "none")))]
 use kspin::SpinNoIrq as DeliveryMutex;
 
+use super::frame::{
+    FpRestore, PreparedSignalRestore, SignalFrame, SignalFrameStack, prepare_signal_restore,
+};
 use super::{ProcessSignalManager, RegisteredThread};
 use crate::{
-    DefaultSignalAction, DequeuedSignal, DetachedSignal, PendingSignals, PreparedSignal,
-    SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction, SignalSet,
-    SignalStack, SignalStackRestoreError, Signo,
-    arch::{SignalContextError, UContext},
+    DefaultSignalAction, DequeuedSignal as PendingDequeuedSignal, DetachedSignal, PendingSignals,
+    PreparedSignal, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction,
+    SignalRecordGeneration, SignalSet, SignalStack, SignalStackRestoreError, Signo,
+    arch::{LegacyFpState64, SignalContextError},
 };
 
 /// Result of publishing one thread-directed signal.
@@ -29,6 +28,10 @@ pub struct ThreadSignalSendOutcome {
     pub published: bool,
     /// Whether the target endpoint should be interrupted for delivery.
     pub wake: bool,
+    /// Generation of the exact queue record when this call published one.
+    /// Ignored, coalesced, inactive, fallback, and exhausted sends return
+    /// `None`.
+    pub generation: Option<SignalRecordGeneration>,
 }
 
 /// Prepared exact thread endpoint for a non-blocking signal commit.
@@ -43,6 +46,26 @@ pub struct PreparedThreadSignalSend {
     registration: Arc<RegisteredThread>,
 }
 
+const ENDPOINT_PENDING: u8 = 0;
+const ENDPOINT_ACTIVE: u8 = 1;
+const ENDPOINT_RETAINED: u8 = 2;
+const ENDPOINT_CANCELLED: u8 = 3;
+
+#[derive(Clone, Copy)]
+enum EndpointSendMode {
+    Active,
+    Retained,
+}
+
+impl EndpointSendMode {
+    const fn accepts(self, state: u8) -> bool {
+        matches!(
+            (self, state),
+            (Self::Active, ENDPOINT_ACTIVE) | (Self::Retained, ENDPOINT_RETAINED)
+        )
+    }
+}
+
 impl PreparedThreadSignalSend {
     /// Publishes one already allocated and accounted signal record.
     ///
@@ -51,42 +74,110 @@ impl PreparedThreadSignalSend {
     /// IRQ-disabled outer critical section before it is finished or dropped.
     pub fn publish(self, prepared: PreparedSignal) -> DeferredThreadSignalSend {
         let thread = &self.thread;
-        let lifecycle = thread.lifecycle.lock();
-        if !self.registration.is_active() || !thread.accepting_signals.load(Ordering::Acquire) {
+        let signo = prepared.signo();
+        let inactive = ThreadSignalSendOutcome {
+            published: false,
+            wake: false,
+            generation: None,
+        };
+        let mut prepared = Some(prepared);
+        let mut unused = None;
+        let mut published = false;
+        let mut accepted = false;
+        let mut wake = false;
+        let mut generation = None;
+        let mut inactive_commit = false;
+        let detached = thread.proc.with_action_update(|owner| {
+            let mut generation_detached = DetachedSignal::empty();
+            let lifecycle = thread.lifecycle.lock();
+            let exact_active = *lifecycle == ENDPOINT_ACTIVE
+                && self.registration.is_active()
+                && thread
+                    .registration
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &self.registration));
+            if !exact_active {
+                inactive_commit = true;
+                drop(lifecycle);
+                return generation_detached;
+            }
+            if ProcessSignalManager::has_generation_effect(signo) {
+                thread
+                    .proc
+                    .apply_generation_effect_locked(signo, &mut generation_detached);
+                let still_active = *lifecycle == ENDPOINT_ACTIVE
+                    && self.registration.is_active()
+                    && thread
+                        .registration
+                        .lock()
+                        .as_ref()
+                        .is_some_and(|entry| Arc::ptr_eq(entry, &self.registration));
+                if !still_active {
+                    inactive_commit = true;
+                    drop(lifecycle);
+                    return generation_detached;
+                }
+            }
+
+            let blocked = thread.signal_blocked(signo);
+            let actions = owner.lock();
+            let ignored = ProcessSignalManager::action_ignored(&actions, signo)
+                && !blocked
+                && !thread.signal_real_blocked(signo);
+            if !ignored {
+                let mut pending = thread.pending.lock();
+                let coalesced = !signo.is_realtime() && pending.set.has(signo);
+                if !coalesced {
+                    match thread.assign_generation(
+                        prepared
+                            .as_mut()
+                            .expect("prepared signal is retained until publication"),
+                    ) {
+                        Ok(next) => generation = next,
+                        Err(()) => {
+                            drop(pending);
+                            drop(actions);
+                            drop(lifecycle);
+                            inactive_commit = true;
+                            return generation_detached;
+                        }
+                    }
+                }
+                let outcome = pending.publish(
+                    prepared
+                        .take()
+                        .expect("prepared signal is retained until publication"),
+                );
+                (published, unused) = outcome.into_parts();
+                accepted = true;
+                wake = !blocked;
+            }
+            drop(actions);
             drop(lifecycle);
+            generation_detached
+        });
+        // Job-control cancellation detaches owned realtime nodes.  Release
+        // those nodes and their queue-account charges only after every
+        // shared-update and endpoint signal-state guard has left scope.
+        drop(detached);
+        if inactive_commit {
             return DeferredThreadSignalSend {
                 _prepared: self,
-                outcome: ThreadSignalSendOutcome {
-                    published: false,
-                    wake: false,
-                },
-                unused: Some(prepared),
+                outcome: inactive,
+                unused: prepared,
             };
         }
-
-        let signo = prepared.signo();
-        let blocked = thread.signal_blocked(signo);
-        let (published, unused, accepted) = {
-            let actions = thread.proc.actions.lock();
-            let ignored = ProcessSignalManager::action_ignored(&actions, signo);
-            if ignored && !blocked && !thread.signal_real_blocked(signo) {
-                (false, Some(prepared), false)
-            } else {
-                let outcome = thread.pending.lock().publish(prepared);
-                let (published, unused) = outcome.into_parts();
-                (published, unused, true)
-            }
-        };
+        unused = unused.or(prepared);
         if accepted {
             thread.possibly_has_signal.store(true, Ordering::Release);
         }
-        drop(lifecycle);
-
         DeferredThreadSignalSend {
             _prepared: self,
             outcome: ThreadSignalSendOutcome {
                 published,
-                wake: accepted && !blocked,
+                wake,
+                generation: published.then_some(generation).flatten(),
             },
             unused,
         }
@@ -142,91 +233,56 @@ pub enum ThreadSignalPrepareError {
     NotRegistered,
 }
 
+/// Failure returned by a fallible signal pre-handler hook.
+///
+/// The hook runs after the effective userspace handler disposition has been
+/// selected and before the signal frame is snapshotted or copied to userspace.
+/// Keeping the hook error behind a signal-owned type lets callers distinguish a
+/// rejected pre-handler from the existing signal actions, which continue to
+/// report copyout and invalid-layout failures as `SignalOSAction::CoreDump`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SignalPreHandlerError<E> {
+    /// The pre-handler rejected delivery.
+    Hook(E),
+}
+
+/// Result of the kernel's pre-delivery rseq gate.
+///
+/// The callback runs after a signal has been selected and its effective
+/// disposition has been resolved, but before a frame is prepared or copied
+/// to userspace. Retry and Fault return the selected record to its source
+/// queue so the caller can make progress without losing signal ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalDeliveryPreflight {
+    /// Proceed with default-action handling or userspace frame publication.
+    Proceed,
+    /// Retry delivery at a later user-return point.
+    Retry,
+    /// Enter the user-return fault path before retrying delivery.
+    Fault,
+    /// Consume the selected record because the caller published an
+    /// origin-bound replacement signal. The caller should retry delivery so
+    /// the replacement can be selected.
+    Replaced,
+    /// Consume the selected record because the caller must fail closed with a
+    /// fatal signal action.
+    Fatal,
+}
+
+/// Result of one asynchronous signal-delivery scan.
+#[must_use = "the caller must handle the selected signal or retry/fault result"]
+pub enum SignalDeliveryResult {
+    Delivered(DeliveredSignal),
+    None,
+    Retry,
+    Fault,
+    Replaced,
+    Fatal,
+}
+
 impl From<AllocError> for ThreadRegistrationError {
     fn from(_: AllocError) -> Self {
         Self::NoMemory
-    }
-}
-
-/// The userspace ABI frame created for a signal handler.
-///
-/// This contains only Linux-visible signal state. Kernel trap metadata is not
-/// serialized into userspace and therefore cannot be forged by `sigreturn`.
-#[repr(C)]
-#[derive(Clone)]
-pub struct SignalFrame {
-    ucontext: UContext,
-    siginfo: SignalInfo,
-}
-
-impl SignalFrame {
-    fn new(
-        uctx: &UserContext,
-        sigmask: SignalSet,
-        stack: SignalStack,
-        siginfo: SignalInfo,
-    ) -> Self {
-        Self {
-            ucontext: UContext::new(uctx, sigmask, stack),
-            siginfo,
-        }
-    }
-
-    /// Returns the Linux-visible user context stored in this frame.
-    pub fn ucontext(&self) -> &UContext {
-        &self.ucontext
-    }
-
-    /// Returns a mutable Linux-visible user context, as a signal handler sees it.
-    pub fn ucontext_mut(&mut self) -> &mut UContext {
-        &mut self.ucontext
-    }
-
-    /// Copies a complete signal frame from userspace into an owned value.
-    pub fn read_from_user<M: UserMemory + ?Sized>(
-        memory: &mut UserMemoryContext<'_, M>,
-        ptr: *const Self,
-    ) -> VmResult<Self> {
-        let frame = ptr.vm_read_uninit(memory)?;
-        // SAFETY: VmPtr returns `Ok` only after UserMemory initialized every byte of
-        // the destination. SignalFrame and every architecture's UContext and
-        // MContext are repr(C) records made solely from integer scalars and
-        // integer/byte arrays. SignalStack explicitly stores its ABI alignment
-        // bytes, SignalSet is a transparent u64, and SignalInfo is fully
-        // initialized byte storage; none contains bool, a Rust enum, a
-        // reference, or NonZero state. Restoration never interprets
-        // frame.siginfo (in particular, it never calls SignalInfo::signo), and
-        // prepare_restore validates every machine field that has architectural
-        // constraints before publication.
-        Ok(unsafe { frame.assume_init() })
-    }
-}
-
-const _: [(); core::mem::size_of::<SignalFrame>()] =
-    [(); core::mem::offset_of!(SignalFrame, siginfo) + core::mem::size_of::<SignalInfo>()];
-
-/// A fully validated signal return that can be committed without failure.
-pub struct PreparedSignalRestore {
-    context: UserContext,
-    blocked: SignalSet,
-    stack: Option<SignalStack>,
-    stack_error: Option<SignalStackRestoreError>,
-}
-
-impl PreparedSignalRestore {
-    /// Returns the validated candidate user context.
-    pub fn context(&self) -> &UserContext {
-        &self.context
-    }
-
-    /// Returns the validated alternate-stack update, if one will be applied.
-    pub fn stack(&self) -> Option<&SignalStack> {
-        self.stack.as_ref()
-    }
-
-    /// Returns a Linux-compatible, squashed `restore_altstack()` error.
-    pub fn stack_error(&self) -> Option<SignalStackRestoreError> {
-        self.stack_error
     }
 }
 
@@ -236,17 +292,73 @@ pub struct DeliveredSignal {
     pub restartable_handler: bool,
 }
 
+fn no_signal_pre_handler<M: UserMemory + ?Sized>(
+    _memory: &mut UserMemoryContext<'_, M>,
+    _uctx: &mut UserContext,
+) -> Result<(), core::convert::Infallible> {
+    Ok(())
+}
+
 /// One linearized observation made by a synchronous signal wait.
 ///
 /// `Accepted` owns a signal selected by the wait set. `Delivered` owns a
 /// different, asynchronously deliverable signal whose disposition has already
 /// been resolved and whose handler frame, if any, has already been published.
-/// `None` means neither class was present at this observation.
+/// `Retry`/`Fault` retain the selected asynchronous record. `Replaced` means
+/// the selected record was consumed because the caller published an
+/// origin-bound replacement. `Fatal` means it was consumed before a caller's
+/// fatal action. `None` means neither class was present at this observation.
 #[must_use = "the caller must complete accepted or delivered signal ownership"]
 pub enum SignalWaitObservation {
     Accepted(SignalInfo),
     Delivered(DeliveredSignal),
+    Retry,
+    Fault,
+    Replaced,
+    Fatal,
     None,
+}
+
+/// Keeps ownership provenance for one selected record. Retry/Fault must put
+/// the exact record back at the front of the queue which supplied it; a
+/// signal number alone is insufficient because process and thread queues have
+/// independent RT FIFO/accounting state.
+enum DequeuedSignal {
+    Thread(PendingDequeuedSignal),
+    Process(PendingDequeuedSignal),
+}
+
+impl DequeuedSignal {
+    fn signo(&self) -> Signo {
+        match self {
+            Self::Thread(signal) | Self::Process(signal) => signal.signo(),
+        }
+    }
+
+    fn generation(&self) -> Option<SignalRecordGeneration> {
+        match self {
+            Self::Thread(signal) | Self::Process(signal) => signal.generation(),
+        }
+    }
+
+    fn info(&self) -> Option<&SignalInfo> {
+        match self {
+            Self::Thread(signal) | Self::Process(signal) => signal.info(),
+        }
+    }
+
+    fn into_info(self) -> SignalInfo {
+        match self {
+            Self::Thread(signal) | Self::Process(signal) => signal.into_info(),
+        }
+    }
+
+    fn requeue(self, manager: &ThreadSignalManager) {
+        match self {
+            Self::Thread(signal) => manager.requeue_thread_signal(signal),
+            Self::Process(signal) => manager.proc.requeue_signal(signal),
+        }
+    }
 }
 
 /// Thread-level signal manager.
@@ -268,10 +380,21 @@ pub struct ThreadSignalManager {
     /// must never run with interrupts disabled.
     delivery: DeliveryMutex<()>,
 
-    /// Serializes publication against explicit endpoint cancellation.
-    lifecycle: SpinNoIrq<()>,
+    /// Serializes publication against explicit endpoint cancellation and
+    /// stores the sole endpoint lifecycle state.
+    lifecycle: SpinNoIrq<u8>,
     registration: SpinNoIrq<Option<Arc<RegisteredThread>>>,
-    accepting_signals: AtomicBool,
+
+    /// One-shot exact bypass for a signal forced by the user-return rseq
+    /// fault path. Zero means no bypass is armed.
+    delivery_bypass: AtomicU64,
+    delivery_bypass_signo: AtomicU8,
+    /// The exact record currently selected by the single delivery consumer.
+    /// These values are visible to the pre-delivery callback only.
+    selected_generation: AtomicU64,
+    selected_signo: AtomicU8,
+    /// Next nonzero record generation. Zero is a sticky exhausted state.
+    next_generation: AtomicU64,
 
     possibly_has_signal: AtomicBool,
 }
@@ -292,24 +415,25 @@ pub struct ThreadSignalRegistration {
 impl ThreadSignalRegistration {
     /// Activates the admitted endpoint unless teardown cancelled it first.
     pub fn commit(mut self) -> Result<(), ThreadRegistrationError> {
-        let update = self.thread.proc.action_update.lock();
-        let lifecycle = self.thread.lifecycle.lock();
-        let still_admitted = self
-            .thread
-            .registration
-            .lock()
-            .as_ref()
-            .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry));
-        if !still_admitted {
-            drop(lifecycle);
-            drop(update);
+        let committed = self.thread.proc.with_action_update(|_| {
+            let mut lifecycle = self.thread.lifecycle.lock();
+            let still_admitted = self
+                .thread
+                .registration
+                .lock()
+                .as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry));
+            if !still_admitted || *lifecycle != ENDPOINT_PENDING {
+                return false;
+            }
+            *lifecycle = ENDPOINT_ACTIVE;
+            self.entry.activate();
+            true
+        });
+        if !committed {
             return Err(ThreadRegistrationError::Cancelled);
         }
-        self.thread.accepting_signals.store(true, Ordering::Release);
-        self.entry.activate();
         self.rollback = false;
-        drop(lifecycle);
-        drop(update);
         Ok(())
     }
 }
@@ -317,21 +441,42 @@ impl ThreadSignalRegistration {
 impl Drop for ThreadSignalRegistration {
     fn drop(&mut self) {
         if self.rollback {
-            self.entry.deactivate();
-            let removed = {
-                let mut registration = self.thread.registration.lock();
-                if registration
-                    .as_ref()
-                    .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
-                {
-                    registration.take()
+            let (removed, detached) = self.thread.proc.with_action_update(|_| {
+                let mut lifecycle = self.thread.lifecycle.lock();
+                self.entry.deactivate();
+                let removed = {
+                    let mut registration = self.thread.registration.lock();
+                    if registration
+                        .as_ref()
+                        .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+                    {
+                        *lifecycle = ENDPOINT_CANCELLED;
+                        registration.take()
+                    } else {
+                        None
+                    }
+                };
+                let detached = if removed.is_some() {
+                    let mut pending = self.thread.pending.lock();
+                    let detached = pending.take_all();
+                    self.thread
+                        .possibly_has_signal
+                        .store(false, Ordering::Release);
+                    Some(detached)
                 } else {
                     None
-                }
-            };
+                };
+                drop(lifecycle);
+                (removed, detached)
+            });
             // The final strong reference may deallocate the registry entry.
             // Never release it while the IRQ-off registration guard is held.
             drop(removed);
+            // A pending admission can be explicitly retained before its
+            // token commits.  If that token is then dropped (or commit loses
+            // the lifecycle race), reclaim any exact private records outside
+            // all endpoint and action-update guards.
+            drop(detached);
         }
     }
 }
@@ -351,9 +496,14 @@ impl ThreadSignalManager {
 
             delivery: DeliveryMutex::new(()),
 
-            lifecycle: SpinNoIrq::new(()),
+            lifecycle: SpinNoIrq::new(ENDPOINT_PENDING),
             registration: SpinNoIrq::new(None),
-            accepting_signals: AtomicBool::new(false),
+
+            delivery_bypass: AtomicU64::new(0),
+            delivery_bypass_signo: AtomicU8::new(0),
+            selected_generation: AtomicU64::new(0),
+            selected_signo: AtomicU8::new(0),
+            next_generation: AtomicU64::new(1),
 
             possibly_has_signal: AtomicBool::new(false),
         })
@@ -364,62 +514,65 @@ impl ThreadSignalManager {
         self: &Arc<Self>,
         tid: u32,
     ) -> Result<ThreadSignalRegistration, ThreadRegistrationError> {
-        let update = self.proc.action_update.lock();
-        if self.registration.lock().is_some() {
-            return Err(ThreadRegistrationError::AlreadyRegistered);
-        }
-        let registry = self.proc.children_registry_snapshot();
-        let mut live = 0usize;
-        if let Some(registry) = registry.as_deref() {
-            for registered in registry {
-                if registered.is_live() {
-                    if registered.claims_tid(tid) {
-                        return Err(ThreadRegistrationError::TidInUse);
-                    }
-                    live += 1;
-                }
-            }
-        }
-        if live >= self.proc.thread_limit() {
-            return Err(ThreadRegistrationError::Capacity);
-        }
-        let capacity = live
-            .checked_add(1)
-            .ok_or(ThreadRegistrationError::NoMemory)?;
-        let mut replacement = Vec::new();
-        replacement
-            .try_reserve_exact(capacity)
-            .map_err(|_| ThreadRegistrationError::NoMemory)?;
-        if let Some(registry) = registry.as_deref() {
-            for registered in registry {
-                if registered.is_live() {
-                    replacement.push(registered.clone());
-                }
-            }
-        }
-        let entry = RegisteredThread::try_new(tid, self)?;
-        replacement.push(entry.clone());
-        let replacement =
-            Arc::try_new(replacement).map_err(|_| ThreadRegistrationError::NoMemory)?;
-
-        let manager_entry = entry.clone();
-        {
-            let mut registration = self.registration.lock();
-            if registration.is_some() {
+        let (entry, previous, registry) = self.proc.with_action_update(|_| {
+            if self.registration.lock().is_some() {
                 return Err(ThreadRegistrationError::AlreadyRegistered);
             }
-            *registration = Some(manager_entry);
-        }
+            let registry = self.proc.children_registry_snapshot();
+            let mut live = 0usize;
+            if let Some(registry) = registry.as_deref() {
+                for registered in registry {
+                    if registered.is_live() {
+                        if registered.claims_tid(tid) {
+                            return Err(ThreadRegistrationError::TidInUse);
+                        }
+                        live += 1;
+                    }
+                }
+            }
+            if live >= self.proc.thread_limit() {
+                return Err(ThreadRegistrationError::Capacity);
+            }
+            let capacity = live
+                .checked_add(1)
+                .ok_or(ThreadRegistrationError::NoMemory)?;
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(capacity)
+                .map_err(|_| ThreadRegistrationError::NoMemory)?;
+            if let Some(registry) = registry.as_deref() {
+                for registered in registry {
+                    if registered.is_live() {
+                        replacement.push(registered.clone());
+                    }
+                }
+            }
+            let entry = RegisteredThread::try_new(tid, self)?;
+            replacement.push(entry.clone());
+            let replacement =
+                Arc::try_new(replacement).map_err(|_| ThreadRegistrationError::NoMemory)?;
 
-        let previous = {
-            let mut children = self.proc.children.lock();
-            children.replace(replacement)
-        };
+            let manager_entry = entry.clone();
+            {
+                let mut lifecycle = self.lifecycle.lock();
+                let mut registration = self.registration.lock();
+                if registration.is_some() {
+                    return Err(ThreadRegistrationError::AlreadyRegistered);
+                }
+                *lifecycle = ENDPOINT_PENDING;
+                *registration = Some(manager_entry);
+            }
+
+            let previous = {
+                let mut children = self.proc.children.lock();
+                children.replace(replacement)
+            };
+            Ok((entry, previous, registry))
+        })?;
 
         // The immutable registry and all of its owned Arcs are allocated and
-        // destroyed outside the publication spin lock. The shared update
-        // mutex serializes this pointer swap with disposition transitions.
-        drop(update);
+        // destroyed outside the publication spin lock. The manager/shared
+        // action gates are no longer held here.
         drop(previous);
         drop(registry);
         Ok(ThreadSignalRegistration {
@@ -438,27 +591,79 @@ impl ThreadSignalManager {
     /// A later `try_register` may publish the endpoint again.
     pub fn cancel_registration(&self) -> bool {
         let delivery = self.delivery.lock();
-        let update = self.proc.action_update.lock();
-        let lifecycle = self.lifecycle.lock();
-        self.accepting_signals.store(false, Ordering::Release);
-        let registration = self.registration.lock().take();
-        let cancelled = registration.is_some();
-        if let Some(entry) = registration.as_ref() {
-            entry.deactivate();
-        }
-        let detached = self.pending.lock().take_all();
-        self.possibly_has_signal.store(false, Ordering::Release);
-        drop(lifecycle);
-        drop(update);
+        let (cancelled, registration, detached) = self.proc.with_action_update(|_| {
+            let mut lifecycle = self.lifecycle.lock();
+            let registration = self.registration.lock().take();
+            let cancelled = registration.is_some();
+            *lifecycle = ENDPOINT_CANCELLED;
+            if let Some(entry) = registration.as_ref() {
+                entry.deactivate();
+            }
+            let detached = self.pending.lock().take_all();
+            self.possibly_has_signal.store(false, Ordering::Release);
+            drop(lifecycle);
+            (cancelled, registration, detached)
+        });
         drop(delivery);
         drop(registration);
         drop(detached);
         cancelled
     }
 
+    /// Retires this exact registry identity. Retained group-leader endpoints
+    /// remain available only to [`Self::try_send_retained_signal_with`] and
+    /// remain visible to action/job-control flushes; ordinary routing and
+    /// wakeup scans see only active entries. A non-retained retirement is a
+    /// full cancellation and permits a later registration with a new entry.
+    pub fn retire_registration(&self, tid: u32, retain_private_pending: bool) {
+        // A delivery may already have selected a private record. Holding the
+        // delivery mutex through the lifecycle transition guarantees that no
+        // frame or mask update completes after retirement returns.
+        let delivery = self.delivery.lock();
+        let (_registry, removed, detached) = self.proc.with_action_update(|_| {
+            let registry = self.proc.children_registry_snapshot();
+            let entry = registry.as_deref().and_then(|registry| {
+                registry
+                    .iter()
+                    .find(|entry| entry.matches(tid, self as *const Self))
+            });
+            let mut detached = None;
+            let mut removed = None;
+            if let Some(entry) = entry {
+                let mut lifecycle = self.lifecycle.lock();
+                let exact_registration = self
+                    .registration
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, entry));
+                if exact_registration {
+                    if retain_private_pending {
+                        if matches!(*lifecycle, ENDPOINT_PENDING | ENDPOINT_ACTIVE) {
+                            entry.retain_pending_only();
+                            *lifecycle = ENDPOINT_RETAINED;
+                        }
+                    } else {
+                        entry.deactivate();
+                        *lifecycle = ENDPOINT_CANCELLED;
+                        removed = self.registration.lock().take();
+                        detached = Some(self.pending.lock().take_all());
+                        self.possibly_has_signal.store(false, Ordering::Release);
+                    }
+                }
+                drop(lifecycle);
+            }
+            (registry, removed, detached)
+        });
+        drop(delivery);
+        // Registry-entry and queue ownership are released only outside every
+        // lifecycle, action-update, registry, and pending guard.
+        drop(removed);
+        drop(detached);
+    }
+
     /// Returns whether this endpoint currently accepts directed signals.
     pub fn is_registered(&self) -> bool {
-        self.accepting_signals.load(Ordering::Acquire)
+        *self.lifecycle.lock() == ENDPOINT_ACTIVE
     }
 
     /// Retains this exact endpoint and registration identity before a
@@ -488,12 +693,57 @@ impl ThreadSignalManager {
     /// Dequeues a signal from the thread's pending signals.
     #[must_use]
     pub fn dequeue_signal(&self, mask: &SignalSet) -> Option<SignalInfo> {
-        self.dequeue_thread_signal_owned(mask)
+        self.dequeue_signal_with_source(mask)
             .map(DequeuedSignal::into_info)
-            .or_else(|| self.proc.dequeue_signal(mask))
     }
 
-    fn dequeue_thread_signal_owned(&self, mask: &SignalSet) -> Option<DequeuedSignal> {
+    /// Returns whether a pending signal matches both `mask` and the current
+    /// blocked mask of this thread.
+    ///
+    /// The blocked-mask lock is held while both pending queues are observed.
+    /// This gives readiness users the same blocked-mask linearization domain
+    /// as [`Self::dequeue_signal_for_signalfd`]; the result is still only a
+    /// readiness hint and may change before a later operation.
+    pub fn has_pending_signal_for_signalfd(&self, mask: &SignalSet) -> bool {
+        self.with_signalfd_mask(mask, |effective| {
+            let thread_pending = self.pending.lock().set;
+            !(thread_pending & *effective).is_empty()
+                || !(self.proc.pending() & *effective).is_empty()
+        })
+    }
+
+    /// Dequeues one pending signal selected by `mask` and the thread's
+    /// currently blocked mask.
+    ///
+    /// The blocked-mask lock remains held until selection and dequeue have
+    /// both completed. A concurrent mask update therefore cannot make an
+    /// unblocked signal eligible after this operation has selected it.
+    #[must_use]
+    pub fn dequeue_signal_for_signalfd(&self, mask: &SignalSet) -> Option<SignalInfo> {
+        // Keep queue-owned destruction outside the blocked spin lock. The
+        // selection and removal are still linearized while that lock is held.
+        let selected =
+            self.with_signalfd_mask(mask, |effective| self.dequeue_signal_with_source(effective));
+        selected.map(DequeuedSignal::into_info)
+    }
+
+    fn with_signalfd_mask<R>(&self, mask: &SignalSet, f: impl FnOnce(&SignalSet) -> R) -> R {
+        let blocked = self.blocked.lock();
+        let effective = *mask & *blocked;
+        f(&effective)
+    }
+
+    fn dequeue_signal_with_source(&self, mask: &SignalSet) -> Option<DequeuedSignal> {
+        self.dequeue_thread_signal_owned(mask)
+            .map(DequeuedSignal::Thread)
+            .or_else(|| {
+                self.proc
+                    .dequeue_signal_owned(mask)
+                    .map(DequeuedSignal::Process)
+            })
+    }
+
+    fn dequeue_thread_signal_owned(&self, mask: &SignalSet) -> Option<PendingDequeuedSignal> {
         {
             let mut pending = self.pending.lock();
             let signal = pending.dequeue_signal(mask);
@@ -504,10 +754,204 @@ impl ThreadSignalManager {
         }
     }
 
+    fn requeue_thread_signal(&self, signal: PendingDequeuedSignal) {
+        let mut pending = self.pending.lock();
+        signal.requeue_front(&mut pending);
+        self.possibly_has_signal.store(true, Ordering::Release);
+    }
+
+    /// Selects an armed exact record before ordinary signal-number ordering.
+    /// This lets a forced SIGSEGV bypass a lower-numbered rejected signal,
+    /// while stale or same-number records remain ordinary candidates.
+    fn dequeue_signal_for_delivery(&self, mask: &SignalSet) -> Option<DequeuedSignal> {
+        let generation = self.delivery_bypass.load(Ordering::Acquire);
+        let priority = self.delivery_bypass_signo.load(Ordering::Acquire);
+        if generation != 0
+            && let Some(signo) = Signo::from_repr(priority)
+        {
+            let mut priority_mask = SignalSet::default();
+            priority_mask.add(signo);
+            if let Some(signal) = self.dequeue_signal_with_source(&(priority_mask & *mask)) {
+                if signal
+                    .generation()
+                    .is_some_and(|selected| selected.get() == generation)
+                {
+                    return Some(signal);
+                }
+                // A stale token or a same-number coalesced/fallback record
+                // cannot satisfy the bypass. Restore this exact record and
+                // retire the stale arm before ordinary selection.
+                signal.requeue(self);
+                if self
+                    .delivery_bypass
+                    .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.delivery_bypass_signo.store(0, Ordering::Release);
+                }
+            }
+        }
+        self.dequeue_signal_with_source(mask)
+    }
+
     pub fn process(&self) -> &Arc<ProcessSignalManager> {
         &self.proc
     }
 
+    /// Handles a signal with a fallible pre-handler hook.
+    ///
+    /// The hook is called exactly once only for an effective userspace
+    /// [`SignalDisposition::Handler`] action. It receives the same explicit
+    /// userspace memory context and mutable machine context used for frame
+    /// publication. Its changes to the machine context become the snapshot
+    /// stored in the signal frame when it succeeds.
+    ///
+    /// A hook error leaves the machine context unchanged, writes no signal
+    /// frame or restorer, and is returned as [`SignalPreHandlerError::Hook`].
+    pub fn handle_signal_with_pre_handler<M, E>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: SignalSet,
+        sig: &SignalInfo,
+        action: &SignalAction,
+        pre_handler: impl FnMut(&mut UserMemoryContext<'_, M>, &mut UserContext) -> Result<(), E>,
+    ) -> Result<Option<SignalOSAction>, SignalPreHandlerError<E>>
+    where
+        M: UserMemory + ?Sized,
+    {
+        self.handle_signal_with_pre_handler_and_fp_snapshot(
+            memory,
+            uctx,
+            restore_blocked,
+            sig,
+            action,
+            pre_handler,
+            LegacyFpState64::default,
+        )
+    }
+
+    /// Handles a signal with a caller-provided legacy FXSAVE snapshot.
+    ///
+    /// The callback is called only after the selected action is a userspace
+    /// handler and the checked frame layout succeeds. It returns owned bytes;
+    /// CPU save instructions and any architecture validation stay in the
+    /// embedding root.
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_signal_with_fp_snapshot<M, E>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: SignalSet,
+        sig: &SignalInfo,
+        action: &SignalAction,
+        pre_handler: impl FnMut(&mut UserMemoryContext<'_, M>, &mut UserContext) -> Result<(), E>,
+        snapshot: impl FnOnce() -> LegacyFpState64,
+    ) -> Result<Option<SignalOSAction>, SignalPreHandlerError<E>>
+    where
+        M: UserMemory + ?Sized,
+    {
+        self.handle_signal_with_pre_handler_and_fp_snapshot(
+            memory,
+            uctx,
+            restore_blocked,
+            sig,
+            action,
+            pre_handler,
+            snapshot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_signal_with_pre_handler_and_fp_snapshot<M, E>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: SignalSet,
+        sig: &SignalInfo,
+        action: &SignalAction,
+        mut pre_handler: impl FnMut(&mut UserMemoryContext<'_, M>, &mut UserContext) -> Result<(), E>,
+        snapshot: impl FnOnce() -> LegacyFpState64,
+    ) -> Result<Option<SignalOSAction>, SignalPreHandlerError<E>>
+    where
+        M: UserMemory + ?Sized,
+    {
+        let signo = sig.signo();
+        debug!("Handle signal: {signo:?}");
+        match action.disposition {
+            SignalDisposition::Default => match signo.default_action() {
+                DefaultSignalAction::Terminate => Ok(Some(SignalOSAction::Terminate)),
+                DefaultSignalAction::CoreDump => Ok(Some(SignalOSAction::CoreDump)),
+                DefaultSignalAction::Stop => Ok(Some(SignalOSAction::Stop)),
+                DefaultSignalAction::Ignore => Ok(None),
+                DefaultSignalAction::Continue => Ok(Some(SignalOSAction::Continue)),
+            },
+            SignalDisposition::Ignore => Ok(None),
+            SignalDisposition::Handler(handler) => {
+                let pre_handler_context = *uctx;
+                if let Err(error) = pre_handler(memory, uctx) {
+                    *uctx = pre_handler_context;
+                    return Err(SignalPreHandlerError::Hook(error));
+                }
+
+                let interrupted_sp = uctx.sp();
+                let stack = *self.stack.lock();
+                let already_on_altstack = stack.contains_sp(interrupted_sp);
+                let use_altstack = action.flags.contains(SignalActionFlags::ONSTACK)
+                    && !stack.disabled()
+                    && !already_on_altstack;
+                let frame_stack = if already_on_altstack {
+                    SignalFrameStack::NestedAltStack
+                } else if use_altstack {
+                    SignalFrameStack::FreshAltStack
+                } else {
+                    SignalFrameStack::Normal
+                };
+                let restorer = action.restorer.unwrap_or(self.proc.default_restorer);
+                let prepared = match super::frame::prepare_signal_frame_with_fp_snapshot(
+                    uctx,
+                    restore_blocked,
+                    stack,
+                    frame_stack,
+                    sig.clone(),
+                    handler,
+                    restorer,
+                    snapshot,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        *uctx = pre_handler_context;
+                        return Ok(Some(SignalOSAction::CoreDump));
+                    }
+                };
+                // The data-plane token consumes itself on publication.  A
+                // failed frame/restorer copy therefore cannot install the
+                // handler context or update the manager mask.
+                let published = match prepared.publish(memory) {
+                    Ok(published) => published,
+                    Err(_) => {
+                        *uctx = pre_handler_context;
+                        return Ok(Some(SignalOSAction::CoreDump));
+                    }
+                };
+                published.install(uctx);
+
+                let mut add_blocked = action.mask;
+                if !action.flags.contains(SignalActionFlags::NODEFER) {
+                    add_blocked.add(signo);
+                }
+
+                *self.blocked.lock() |= add_blocked;
+                Ok(Some(SignalOSAction::Handler))
+            }
+        }
+    }
+
+    /// Handles a signal without a pre-handler.
+    ///
+    /// This is the infallible compatibility wrapper for consumers that do not
+    /// need a delivery seam. The wrapper supplies a no-op hook, so its
+    /// behavior and signature remain unchanged.
     pub fn handle_signal<M: UserMemory + ?Sized>(
         &self,
         memory: &mut UserMemoryContext<'_, M>,
@@ -516,119 +960,107 @@ impl ThreadSignalManager {
         sig: &SignalInfo,
         action: &SignalAction,
     ) -> Option<SignalOSAction> {
-        let signo = sig.signo();
-        debug!("Handle signal: {signo:?}");
-        match action.disposition {
-            SignalDisposition::Default => match signo.default_action() {
-                DefaultSignalAction::Terminate => Some(SignalOSAction::Terminate),
-                DefaultSignalAction::CoreDump => Some(SignalOSAction::CoreDump),
-                DefaultSignalAction::Stop => Some(SignalOSAction::Stop),
-                DefaultSignalAction::Ignore => None,
-                DefaultSignalAction::Continue => Some(SignalOSAction::Continue),
-            },
-            SignalDisposition::Ignore => None,
-            SignalDisposition::Handler(handler) => {
-                let layout = Layout::new::<SignalFrame>();
-                let interrupted_sp = uctx.sp();
-                let stack = *self.stack.lock();
-                let mut visible_stack = stack;
-                visible_stack.flags = stack.flags_at(interrupted_sp);
-                let already_on_altstack = stack.contains_sp(interrupted_sp);
-                let use_altstack = action.flags.contains(SignalActionFlags::ONSTACK)
-                    && !stack.disabled()
-                    && !already_on_altstack;
-                let sp = if use_altstack {
-                    let Some(top) = stack.checked_top() else {
-                        return Some(SignalOSAction::CoreDump);
-                    };
-                    top
-                } else {
-                    interrupted_sp
-                };
+        match self.handle_signal_with_pre_handler(
+            memory,
+            uctx,
+            restore_blocked,
+            sig,
+            action,
+            no_signal_pre_handler::<M>,
+        ) {
+            Ok(action) => action,
+            Err(error) => match error {},
+        }
+    }
 
-                let Some(frame_start) = sp.checked_sub(layout.size()) else {
-                    return Some(SignalOSAction::CoreDump);
-                };
-                let aligned_sp = frame_start & !(layout.align() - 1);
-                let Some(siginfo_ptr) = aligned_sp.checked_add(offset_of!(SignalFrame, siginfo))
-                else {
-                    return Some(SignalOSAction::CoreDump);
-                };
-                let Some(ucontext_ptr) = aligned_sp.checked_add(offset_of!(SignalFrame, ucontext))
-                else {
-                    return Some(SignalOSAction::CoreDump);
-                };
-
-                #[cfg(target_arch = "x86_64")]
-                let Some(published_sp) = aligned_sp.checked_sub(core::mem::size_of::<usize>())
-                else {
-                    return Some(SignalOSAction::CoreDump);
-                };
-                #[cfg(not(target_arch = "x86_64"))]
-                let published_sp = aligned_sp;
-
-                if use_altstack || already_on_altstack {
-                    let Some(frame_span) = sp.checked_sub(published_sp) else {
-                        return Some(SignalOSAction::CoreDump);
-                    };
-                    if !stack.contains_range(published_sp, frame_span) {
-                        return Some(SignalOSAction::CoreDump);
-                    }
+    #[allow(clippy::too_many_arguments)]
+    fn handle_signal_with_pre_delivery_and_fp_snapshot<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: SignalSet,
+        sig: &SignalInfo,
+        action: &SignalAction,
+        pre_delivery: &mut impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+        snapshot: &mut impl FnMut() -> LegacyFpState64,
+    ) -> Result<Option<SignalOSAction>, SignalDeliveryPreflight> {
+        let saved_uctx = *uctx;
+        if matches!(action.disposition, SignalDisposition::Handler(_)) {
+            match pre_delivery(uctx, sig, action) {
+                SignalDeliveryPreflight::Proceed => {}
+                SignalDeliveryPreflight::Retry => {
+                    *uctx = saved_uctx;
+                    return Err(SignalDeliveryPreflight::Retry);
                 }
-
-                let frame_ptr = aligned_sp as *mut SignalFrame;
-                let frame = SignalFrame::new(uctx, restore_blocked, visible_stack, sig.clone());
-                // SAFETY: SignalFrame has no implicit outer padding (asserted
-                // above). Every architecture record makes each ABI alignment
-                // hole an explicit zeroed field, SignalStack does the same,
-                // and SignalInfo represents every ABI byte as initialized
-                // storage. Therefore every source byte is
-                // initialized before it crosses into userspace.
-                if unsafe { frame_ptr.vm_write_unchecked(memory, frame) }.is_err() {
-                    return Some(SignalOSAction::CoreDump);
+                SignalDeliveryPreflight::Fault => {
+                    *uctx = saved_uctx;
+                    return Err(SignalDeliveryPreflight::Fault);
                 }
-
-                let restorer = action.restorer.unwrap_or(self.proc.default_restorer);
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if (published_sp as *mut usize)
-                        .vm_write(memory, restorer)
-                        .is_err()
-                    {
-                        return Some(SignalOSAction::CoreDump);
-                    }
+                SignalDeliveryPreflight::Replaced => {
+                    *uctx = saved_uctx;
+                    return Err(SignalDeliveryPreflight::Replaced);
                 }
-
-                // Publish the new execution context only after every user
-                // write has succeeded. A failed frame/restorer copy therefore
-                // cannot leave a partially installed handler context.
-                uctx.set_ip(handler);
-                uctx.set_sp(published_sp);
-                uctx.set_arg0(signo as _);
-                uctx.set_arg1(siginfo_ptr);
-                uctx.set_arg2(ucontext_ptr);
-                #[cfg(not(target_arch = "x86_64"))]
-                uctx.set_ra(restorer);
-
-                let mut add_blocked = action.mask;
-                if !action.flags.contains(SignalActionFlags::NODEFER) {
-                    add_blocked.add(signo);
+                SignalDeliveryPreflight::Fatal => {
+                    *uctx = saved_uctx;
+                    return Err(SignalDeliveryPreflight::Fatal);
                 }
-
-                *self.blocked.lock() |= add_blocked;
-                Some(SignalOSAction::Handler)
             }
+        }
+
+        match self.handle_signal_with_pre_handler_and_fp_snapshot(
+            memory,
+            uctx,
+            restore_blocked,
+            sig,
+            action,
+            no_signal_pre_handler::<M>,
+            &mut *snapshot,
+        ) {
+            Ok(result) => Ok(result),
+            Err(error) => match error {},
         }
     }
 
     #[cold]
-    fn check_signals_slow<M: UserMemory + ?Sized>(
+    fn check_signals_slow<M, E>(
         &self,
         memory: &mut UserMemoryContext<'_, M>,
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
         excluded: SignalSet,
-    ) -> Option<DeliveredSignal> {
+        pre_handler: &mut impl FnMut(&mut UserMemoryContext<'_, M>, &mut UserContext) -> Result<(), E>,
+    ) -> Result<Option<DeliveredSignal>, SignalPreHandlerError<E>>
+    where
+        M: UserMemory + ?Sized,
+    {
+        let mut snapshot = || LegacyFpState64::default();
+        self.check_signals_slow_with_fp_snapshot(
+            memory,
+            uctx,
+            restore_blocked,
+            excluded,
+            pre_handler,
+            &mut snapshot,
+        )
+    }
+
+    #[cold]
+    fn check_signals_slow_with_fp_snapshot<M, E>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+        excluded: SignalSet,
+        pre_handler: &mut impl FnMut(&mut UserMemoryContext<'_, M>, &mut UserContext) -> Result<(), E>,
+        snapshot: &mut impl FnMut() -> LegacyFpState64,
+    ) -> Result<Option<DeliveredSignal>, SignalPreHandlerError<E>>
+    where
+        M: UserMemory + ?Sized,
+    {
         let blocked = self.blocked.lock();
         let mask = !*blocked & !excluded;
         let restore_blocked = restore_blocked.unwrap_or_else(|| *blocked);
@@ -636,31 +1068,177 @@ impl ThreadSignalManager {
 
         loop {
             let (queued, action, reset_claim) = {
-                let mut actions = self.proc.actions.lock();
-                let queued = self
+                let Some(queued) = self
                     .dequeue_thread_signal_owned(&mask)
-                    .or_else(|| self.proc.dequeue_signal_owned(&mask))?;
-                let (action, reset_claim) = actions.claim_delivery(queued.signo());
+                    .or_else(|| self.proc.dequeue_signal_owned(&mask))
+                else {
+                    return Ok(None);
+                };
+                let (action, reset_claim) = self.proc.claim_delivery(queued.signo());
                 (queued, action, reset_claim)
             };
             let sig = queued.into_info();
             let restartable = matches!(action.disposition, SignalDisposition::Handler(_))
                 && action.flags.contains(SignalActionFlags::RESTART);
 
-            let os_action = self.handle_signal(memory, uctx, restore_blocked, &sig, &action);
+            let os_action = match self.handle_signal_with_pre_handler_and_fp_snapshot(
+                memory,
+                uctx,
+                restore_blocked,
+                &sig,
+                &action,
+                &mut *pre_handler,
+                &mut *snapshot,
+            ) {
+                Ok(os_action) => os_action,
+                Err(error) => {
+                    if let Some(reset_claim) = reset_claim {
+                        self.proc.finish_delivery(reset_claim, false);
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(reset_claim) = reset_claim {
-                self.proc.actions.lock().finish_delivery(
+                self.proc.finish_delivery(
                     reset_claim,
                     matches!(os_action, Some(SignalOSAction::Handler)),
                 );
             }
 
             if let Some(os_action) = os_action {
-                break Some(DeliveredSignal {
+                break Ok(Some(DeliveredSignal {
                     info: sig,
                     os_action,
                     restartable_handler: restartable && os_action == SignalOSAction::Handler,
-                });
+                }));
+            }
+        }
+    }
+
+    #[cold]
+    fn check_signals_slow_with_pre_delivery<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+        excluded: SignalSet,
+        pre_delivery: &mut impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+    ) -> SignalDeliveryResult {
+        let mut snapshot = LegacyFpState64::default;
+        self.check_signals_slow_with_pre_delivery_and_fp_snapshot(
+            memory,
+            uctx,
+            restore_blocked,
+            excluded,
+            pre_delivery,
+            &mut snapshot,
+        )
+    }
+
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    fn check_signals_slow_with_pre_delivery_and_fp_snapshot<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+        excluded: SignalSet,
+        pre_delivery: &mut impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+        snapshot: &mut impl FnMut() -> LegacyFpState64,
+    ) -> SignalDeliveryResult {
+        let blocked = self.blocked.lock();
+        let mask = !*blocked & !excluded;
+        let restore_blocked = restore_blocked.unwrap_or_else(|| *blocked);
+        drop(blocked);
+
+        loop {
+            let Some(selected) = self.dequeue_signal_for_delivery(&mask) else {
+                return SignalDeliveryResult::None;
+            };
+            let sig = selected
+                .info()
+                .cloned()
+                .unwrap_or_else(|| SignalInfo::new_user(selected.signo(), 0, 0, 0));
+
+            // Claim one-shot actions while the action table is locked, then
+            // release it before any frame preparation/copyout.
+            let (action, reset_claim) = self.proc.claim_delivery(sig.signo());
+            self.selected_signo
+                .store(sig.signo() as u8, Ordering::Release);
+            self.selected_generation.store(
+                selected.generation().map_or(0, SignalRecordGeneration::get),
+                Ordering::Release,
+            );
+
+            // A default/ignored transition cannot run the pre-delivery
+            // callback. Retire any stale arm which happened to select this
+            // exact record rather than leaving it for a later signal.
+            if !matches!(action.disposition, SignalDisposition::Handler(_)) {
+                self.take_signal_delivery_bypass(sig.signo());
+            }
+
+            let restartable = matches!(action.disposition, SignalDisposition::Handler(_))
+                && action.flags.contains(SignalActionFlags::RESTART);
+            let saved_uctx = *uctx;
+            let result = self.handle_signal_with_pre_delivery_and_fp_snapshot(
+                memory,
+                uctx,
+                restore_blocked,
+                &sig,
+                &action,
+                pre_delivery,
+                &mut *snapshot,
+            );
+
+            self.selected_generation.store(0, Ordering::Release);
+            self.selected_signo.store(0, Ordering::Release);
+
+            let reset_committed = matches!(&result, Ok(Some(SignalOSAction::Handler)));
+            if let Some(reset_claim) = reset_claim {
+                self.proc.finish_delivery(reset_claim, reset_committed);
+            }
+
+            match result {
+                Ok(Some(os_action)) => {
+                    return SignalDeliveryResult::Delivered(DeliveredSignal {
+                        info: selected.into_info(),
+                        os_action,
+                        restartable_handler: restartable && os_action == SignalOSAction::Handler,
+                    });
+                }
+                Ok(None) => {
+                    // Ignored signals are consumed and the scan continues.
+                }
+                Err(preflight) => {
+                    // The callback may have changed the machine context
+                    // before rejecting the operation. Restore it, roll back
+                    // SA_RESETHAND. Retry/Fault retain the exact record in its
+                    // original queue. Replaced/Fatal deliberately consume it:
+                    // the caller has either published an origin-bound
+                    // replacement or is about to fail closed.
+                    *uctx = saved_uctx;
+                    return match preflight {
+                        SignalDeliveryPreflight::Retry => {
+                            selected.requeue(self);
+                            SignalDeliveryResult::Retry
+                        }
+                        SignalDeliveryPreflight::Fault => {
+                            selected.requeue(self);
+                            SignalDeliveryResult::Fault
+                        }
+                        SignalDeliveryPreflight::Replaced => SignalDeliveryResult::Replaced,
+                        SignalDeliveryPreflight::Fatal => SignalDeliveryResult::Fatal,
+                        SignalDeliveryPreflight::Proceed => unreachable!(),
+                    };
+                }
             }
         }
     }
@@ -674,22 +1252,177 @@ impl ThreadSignalManager {
         uctx: &mut UserContext,
         restore_blocked: Option<SignalSet>,
     ) -> Option<DeliveredSignal> {
+        let mut pre_delivery = |_: &mut UserContext, _: &SignalInfo, _: &SignalAction| {
+            SignalDeliveryPreflight::Proceed
+        };
+        match self.check_signals_with_pre_delivery(memory, uctx, restore_blocked, &mut pre_delivery)
+        {
+            SignalDeliveryResult::Delivered(delivered) => Some(delivered),
+            SignalDeliveryResult::None
+            | SignalDeliveryResult::Retry
+            | SignalDeliveryResult::Fault
+            | SignalDeliveryResult::Replaced
+            | SignalDeliveryResult::Fatal => None,
+        }
+    }
+
+    /// Checks pending signals while obtaining each delivered handler's
+    /// legacy FXSAVE snapshot from the caller.
+    ///
+    /// This is the data-plane seam for an embedding root that owns CPU save
+    /// instructions. The returned [`DeliveredSignal`] is otherwise identical
+    /// to [`Self::check_signals`].
+    pub fn check_signals_with_fp_snapshot<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+        snapshot: impl FnMut() -> LegacyFpState64,
+    ) -> Option<DeliveredSignal> {
+        let mut pre_delivery = |_: &mut UserContext, _: &SignalInfo, _: &SignalAction| {
+            SignalDeliveryPreflight::Proceed
+        };
+        match self.check_signals_with_pre_delivery_and_fp_snapshot(
+            memory,
+            uctx,
+            restore_blocked,
+            &mut pre_delivery,
+            snapshot,
+        ) {
+            SignalDeliveryResult::Delivered(delivered) => Some(delivered),
+            SignalDeliveryResult::None
+            | SignalDeliveryResult::Retry
+            | SignalDeliveryResult::Fault
+            | SignalDeliveryResult::Replaced
+            | SignalDeliveryResult::Fatal => None,
+        }
+    }
+
+    /// Checks pending signals with a fallible pre-handler hook.
+    ///
+    /// The hook is called once at most, only after a deliverable signal's
+    /// effective disposition has been resolved to a userspace handler and
+    /// before [`prepare_signal_frame`] snapshots the interrupted context. Signals
+    /// that are blocked, ignored, or handled by a default action never invoke
+    /// it.
+    ///
+    /// If the hook fails, no frame or restorer is written, the in-flight
+    /// `SA_RESETHAND` claim is aborted, and the hook error is returned in a
+    /// typed [`SignalPreHandlerError`].
+    pub fn check_signals_with_pre_handler<M, E>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+        mut pre_handler: impl FnMut(&mut UserMemoryContext<'_, M>, &mut UserContext) -> Result<(), E>,
+    ) -> Result<Option<DeliveredSignal>, SignalPreHandlerError<E>>
+    where
+        M: UserMemory + ?Sized,
+    {
         let delivery = self.delivery.lock();
-        if !self.accepting_signals.load(Ordering::Acquire) {
-            return None;
+        if !self.is_registered() {
+            return Ok(None);
         }
         // Fast path
         if !self.possibly_has_signal.load(Ordering::Acquire)
             && !self.proc.possibly_has_signal.load(Ordering::Acquire)
         {
-            return None;
+            return Ok(None);
         }
-        let delivered =
-            self.check_signals_slow(memory, uctx, restore_blocked, SignalSet::default());
+        let delivered = self.check_signals_slow(
+            memory,
+            uctx,
+            restore_blocked,
+            SignalSet::default(),
+            &mut pre_handler,
+        );
         drop(delivery);
         delivered
     }
 
+    /// Checks pending signals through the kernel's pre-delivery rseq gate.
+    /// Retry/Fault retain the selected record in its original queue and roll
+    /// back any in-flight `SA_RESETHAND` claim. Replaced/Fatal consume the
+    /// selected record, allowing the embedding kernel to deliver an exact
+    /// replacement or fail closed.
+    pub fn check_signals_with_pre_delivery<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+        mut pre_delivery: impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+    ) -> SignalDeliveryResult {
+        let delivery = self.delivery.lock();
+        if !self.is_registered() {
+            drop(delivery);
+            return SignalDeliveryResult::None;
+        }
+        if !self.possibly_has_signal.load(Ordering::Acquire)
+            && !self.proc.possibly_has_signal.load(Ordering::Acquire)
+        {
+            drop(delivery);
+            return SignalDeliveryResult::None;
+        }
+        let result = self.check_signals_slow_with_pre_delivery(
+            memory,
+            uctx,
+            restore_blocked,
+            SignalSet::default(),
+            &mut pre_delivery,
+        );
+        drop(delivery);
+        result
+    }
+
+    /// Checks pending signals through the pre-delivery gate and supplies a
+    /// caller-owned legacy FXSAVE snapshot for a signal that reaches the
+    /// handler publication path.
+    ///
+    /// The snapshot callback is called only for a userspace handler after the
+    /// pre-delivery callback returns [`SignalDeliveryPreflight::Proceed`] and
+    /// checked frame layout succeeds. Default/ignored signals, rejected
+    /// preflight outcomes, and copy/layout failures never invoke it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_signals_with_pre_delivery_and_fp_snapshot<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        restore_blocked: Option<SignalSet>,
+        mut pre_delivery: impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+        mut snapshot: impl FnMut() -> LegacyFpState64,
+    ) -> SignalDeliveryResult {
+        let delivery = self.delivery.lock();
+        if !self.is_registered() {
+            drop(delivery);
+            return SignalDeliveryResult::None;
+        }
+        if !self.possibly_has_signal.load(Ordering::Acquire)
+            && !self.proc.possibly_has_signal.load(Ordering::Acquire)
+        {
+            drop(delivery);
+            return SignalDeliveryResult::None;
+        }
+        let result = self.check_signals_slow_with_pre_delivery_and_fp_snapshot(
+            memory,
+            uctx,
+            restore_blocked,
+            SignalSet::default(),
+            &mut pre_delivery,
+            &mut snapshot,
+        );
+        drop(delivery);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn observe_signal_wait_inner<M: UserMemory + ?Sized>(
         &self,
         memory: &mut UserMemoryContext<'_, M>,
@@ -697,12 +1430,18 @@ impl ThreadSignalManager {
         waited: &SignalSet,
         restore_blocked: SignalSet,
         after_waited_scan: impl FnOnce(),
+        pre_delivery: &mut impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+        snapshot: &mut impl FnMut() -> LegacyFpState64,
     ) -> SignalWaitObservation {
         // This is the same sole delivery owner used by `check_signals`. Signal
         // producers remain non-blocking: publication is serialized by the
         // pending/action locks and never acquires this mutex.
         let delivery = self.delivery.lock();
-        if !self.accepting_signals.load(Ordering::Acquire) {
+        if !self.is_registered() {
             drop(delivery);
             return SignalWaitObservation::None;
         }
@@ -730,12 +1469,25 @@ impl ThreadSignalManager {
         // excluded from asynchronous delivery. Publication requests an
         // embedding wake, so the caller observes it as `Accepted` on the next
         // pass; it can never be consumed into a handler frame in this gap.
-        let delivered = self.check_signals_slow(memory, uctx, Some(restore_blocked), *waited);
+        let delivered = self.check_signals_slow_with_pre_delivery_and_fp_snapshot(
+            memory,
+            uctx,
+            Some(restore_blocked),
+            *waited,
+            pre_delivery,
+            snapshot,
+        );
         drop(delivery);
-        delivered.map_or(
-            SignalWaitObservation::None,
-            SignalWaitObservation::Delivered,
-        )
+        match delivered {
+            SignalDeliveryResult::Delivered(delivered) => {
+                SignalWaitObservation::Delivered(delivered)
+            }
+            SignalDeliveryResult::None => SignalWaitObservation::None,
+            SignalDeliveryResult::Retry => SignalWaitObservation::Retry,
+            SignalDeliveryResult::Fault => SignalWaitObservation::Fault,
+            SignalDeliveryResult::Replaced => SignalWaitObservation::Replaced,
+            SignalDeliveryResult::Fatal => SignalWaitObservation::Fatal,
+        }
     }
 
     /// Atomically observes the two classes relevant to a synchronous signal
@@ -753,7 +1505,73 @@ impl ThreadSignalManager {
         waited: &SignalSet,
         restore_blocked: SignalSet,
     ) -> SignalWaitObservation {
-        self.observe_signal_wait_inner(memory, uctx, waited, restore_blocked, || {})
+        let mut pre_delivery = |_: &mut UserContext, _: &SignalInfo, _: &SignalAction| {
+            SignalDeliveryPreflight::Proceed
+        };
+        let mut snapshot = LegacyFpState64::default;
+        self.observe_signal_wait_inner(
+            memory,
+            uctx,
+            waited,
+            restore_blocked,
+            || {},
+            &mut pre_delivery,
+            &mut snapshot,
+        )
+    }
+
+    /// Observes a synchronous wait while routing asynchronous signals through
+    /// the kernel's pre-delivery callback. Signals in `waited` remain
+    /// synchronous and are returned as `Accepted` without a frame or callback.
+    pub fn observe_signal_wait_with_pre_delivery<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+        pre_delivery: impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+    ) -> SignalWaitObservation {
+        let mut snapshot = LegacyFpState64::default;
+        self.observe_signal_wait_with_pre_delivery_and_fp_snapshot(
+            memory,
+            uctx,
+            waited,
+            restore_blocked,
+            pre_delivery,
+            &mut snapshot,
+        )
+    }
+
+    /// Observes a synchronous wait while routing asynchronous delivery
+    /// through both the pre-delivery gate and the caller's FP snapshot seam.
+    /// Waited signals remain synchronous and never invoke `snapshot`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_signal_wait_with_pre_delivery_and_fp_snapshot<M: UserMemory + ?Sized>(
+        &self,
+        memory: &mut UserMemoryContext<'_, M>,
+        uctx: &mut UserContext,
+        waited: &SignalSet,
+        restore_blocked: SignalSet,
+        mut pre_delivery: impl FnMut(
+            &mut UserContext,
+            &SignalInfo,
+            &SignalAction,
+        ) -> SignalDeliveryPreflight,
+        mut snapshot: impl FnMut() -> LegacyFpState64,
+    ) -> SignalWaitObservation {
+        self.observe_signal_wait_inner(
+            memory,
+            uctx,
+            waited,
+            restore_blocked,
+            || {},
+            &mut pre_delivery,
+            &mut snapshot,
+        )
     }
 
     #[cfg(test)]
@@ -765,7 +1583,19 @@ impl ThreadSignalManager {
         restore_blocked: SignalSet,
         after_waited_scan: impl FnOnce(),
     ) -> SignalWaitObservation {
-        self.observe_signal_wait_inner(memory, uctx, waited, restore_blocked, after_waited_scan)
+        let mut pre_delivery = |_: &mut UserContext, _: &SignalInfo, _: &SignalAction| {
+            SignalDeliveryPreflight::Proceed
+        };
+        let mut snapshot = LegacyFpState64::default;
+        self.observe_signal_wait_inner(
+            memory,
+            uctx,
+            waited,
+            restore_blocked,
+            after_waited_scan,
+            &mut pre_delivery,
+            &mut snapshot,
+        )
     }
 
     /// Validates an owned signal frame without publishing any state.
@@ -785,45 +1615,33 @@ impl ThreadSignalManager {
             &SignalStack,
         ) -> Result<(), SignalStackRestoreError>,
     ) -> Result<PreparedSignalRestore, SignalContextError> {
-        let context = frame.ucontext.mcontext.prepare_restore(current)?;
-        if !valid_program_counter(context.ip()) {
-            return Err(SignalContextError::InvalidProgramCounter);
-        }
-        if !valid_stack_pointer(context.sp()) {
-            return Err(SignalContextError::InvalidStackPointer);
-        }
-
-        let mut blocked = frame.ucontext.sigmask;
-        blocked.remove(Signo::SIGKILL);
-        blocked.remove(Signo::SIGSTOP);
-
         let current_stack = *self.stack.lock();
-        let candidate = frame.ucontext.stack.prepare_restore();
-        let (stack, stack_error) = match candidate {
-            Ok(candidate) => match validate_stack(&current_stack, current.sp(), &candidate) {
-                Ok(()) => (Some(candidate), None),
-                Err(error) => (None, Some(error)),
-            },
-            Err(error) => (None, Some(error)),
-        };
-        Ok(PreparedSignalRestore {
-            context,
-            blocked,
-            stack,
-            stack_error,
-        })
+        prepare_signal_restore(
+            current,
+            frame,
+            valid_program_counter,
+            valid_stack_pointer,
+            current_stack,
+            validate_stack,
+        )
     }
 
     /// Commits a previously validated signal restore without failure.
-    pub fn commit_restore(&self, uctx: &mut UserContext, prepared: PreparedSignalRestore) {
+    pub fn commit_restore(
+        &self,
+        uctx: &mut UserContext,
+        prepared: PreparedSignalRestore,
+    ) -> FpRestore {
+        let (context, blocked_value, stack_value, fp_restore) = prepared.into_parts_with_fp();
         let mut blocked = self.blocked.lock();
         let mut stack = self.stack.lock();
-        *uctx = prepared.context;
-        *blocked = prepared.blocked;
-        if let Some(restored) = prepared.stack {
+        *uctx = context;
+        *blocked = blocked_value;
+        if let Some(restored) = stack_value {
             *stack = restored;
         }
         self.possibly_has_signal.store(true, Ordering::Release);
+        fp_restore
     }
 
     /// Sends a signal, preparing any queue record outside spin locks.
@@ -838,81 +1656,235 @@ impl ThreadSignalManager {
         sig: SignalInfo,
         prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
     ) -> Result<ThreadSignalSendOutcome, E> {
+        self.try_send_signal_for_endpoint(EndpointSendMode::Active, sig, prepare)
+    }
+
+    /// Sends directly to an exited endpoint whose private queue is retained
+    /// for its unreaped identity. The exact manager identity is required;
+    /// ordinary active routing never considers this endpoint.
+    #[must_use = "the caller must handle queue-admission failure"]
+    pub fn try_send_retained_signal_with<E>(
+        &self,
+        sig: SignalInfo,
+        prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
+    ) -> Result<ThreadSignalSendOutcome, E> {
+        self.try_send_signal_for_endpoint(EndpointSendMode::Retained, sig, prepare)
+    }
+
+    fn try_send_signal_for_endpoint<E>(
+        &self,
+        mode: EndpointSendMode,
+        sig: SignalInfo,
+        prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
+    ) -> Result<ThreadSignalSendOutcome, E> {
         let signo = sig.signo();
-        if !self.accepting_signals.load(Ordering::Acquire) {
-            return Ok(ThreadSignalSendOutcome {
-                published: false,
-                wake: false,
-            });
-        }
-        let blocked = self.signal_blocked(signo);
-        if self.proc.signal_ignored(signo) && !blocked && !self.signal_real_blocked(signo) {
-            return Ok(ThreadSignalSendOutcome {
-                published: false,
-                wake: false,
-            });
-        }
+        let inactive = || ThreadSignalSendOutcome {
+            published: false,
+            wake: false,
+            generation: None,
+        };
 
-        if !signo.is_realtime() {
+        // The first pass avoids queue preparation for an inactive, ignored,
+        // or already-coalesced signal. Job-control cancellation happens first
+        // and is shared with the commit pass below.
+        let (preflight, detached) = self.proc.with_action_update(|owner| {
+            let mut generation_detached = DetachedSignal::empty();
             let lifecycle = self.lifecycle.lock();
-            if !self.accepting_signals.load(Ordering::Acquire) {
+            if !mode.accepts(*lifecycle) {
                 drop(lifecycle);
-                return Ok(ThreadSignalSendOutcome {
-                    published: false,
-                    wake: false,
-                });
+                return (Some(inactive()), generation_detached);
             }
-            if self.pending.lock().set.has(signo) {
-                let wake = !self.signal_blocked(signo);
+            if ProcessSignalManager::has_generation_effect(signo) {
+                self.proc
+                    .apply_generation_effect_locked(signo, &mut generation_detached);
+                if !mode.accepts(*lifecycle) {
+                    drop(lifecycle);
+                    return (Some(inactive()), generation_detached);
+                }
+            }
+            let blocked = self.signal_blocked(signo);
+            let actions = owner.lock();
+            let ignored = ProcessSignalManager::action_ignored(&actions, signo)
+                && !blocked
+                && !self.signal_real_blocked(signo);
+            if ignored {
+                drop(actions);
+                drop(lifecycle);
+                return (Some(inactive()), generation_detached);
+            }
+            if !signo.is_realtime() && self.pending.lock().set.has(signo) {
                 self.possibly_has_signal.store(true, Ordering::Release);
-                drop(lifecycle);
-                return Ok(ThreadSignalSendOutcome {
+                let outcome = ThreadSignalSendOutcome {
                     published: false,
-                    wake,
-                });
+                    wake: mode.accepts(ENDPOINT_ACTIVE) && !blocked,
+                    generation: None,
+                };
+                drop(actions);
+                drop(lifecycle);
+                return (Some(outcome), generation_detached);
             }
+            drop(actions);
+            drop(lifecycle);
+            (None, generation_detached)
+        });
+        drop(detached);
+        if let Some(outcome) = preflight {
+            return Ok(outcome);
         }
 
-        let prepared = prepare(sig)?;
-        let lifecycle = self.lifecycle.lock();
-        if !self.accepting_signals.load(Ordering::Acquire) {
-            drop(lifecycle);
-            drop(prepared);
-            return Ok(ThreadSignalSendOutcome {
-                published: false,
-                wake: false,
-            });
-        }
-        let outcome = {
-            let actions = self.proc.actions.lock();
-            let blocked = self.signal_blocked(signo);
-            let ignored = ProcessSignalManager::action_ignored(&actions, signo);
-            if ignored && !blocked && !self.signal_real_blocked(signo) {
-                Err(prepared)
-            } else {
-                let mut pending = self.pending.lock();
-                Ok((pending.publish(prepared), !blocked))
-            }
-        };
-        let (outcome, wake) = match outcome {
-            Ok(outcome) => outcome,
-            Err(prepared) => {
+        // Preparation is outside signal-state locks. The commit pass
+        // rechecks endpoint identity/state after this potentially blocking
+        // operation and safely returns the unused owner on rejection.
+        let mut prepared = Some(prepare(sig)?);
+        let ((outcome, unused, ignored, blocked, exhausted, generation), detached) =
+            self.proc.with_action_update(|owner| {
+                let mut generation_detached = DetachedSignal::empty();
+                let lifecycle = self.lifecycle.lock();
+                if !mode.accepts(*lifecycle) {
+                    drop(lifecycle);
+                    return (
+                        (None, prepared.take(), true, false, true, None),
+                        generation_detached,
+                    );
+                }
+                if ProcessSignalManager::has_generation_effect(signo) {
+                    self.proc
+                        .apply_generation_effect_locked(signo, &mut generation_detached);
+                    if !mode.accepts(*lifecycle) {
+                        drop(lifecycle);
+                        return (
+                            (None, prepared.take(), true, false, true, None),
+                            generation_detached,
+                        );
+                    }
+                }
+
+                let blocked = self.signal_blocked(signo);
+                let actions = owner.lock();
+                let ignored = ProcessSignalManager::action_ignored(&actions, signo)
+                    && !blocked
+                    && !self.signal_real_blocked(signo);
+                let mut outcome = None;
+                let mut exhausted = false;
+                let mut generation = None;
+                if !ignored {
+                    let mut pending = self.pending.lock();
+                    let coalesced = !signo.is_realtime() && pending.set.has(signo);
+                    if !coalesced {
+                        match self.assign_generation(
+                            prepared
+                                .as_mut()
+                                .expect("prepared signal is retained until publication"),
+                        ) {
+                            Ok(next) => generation = next,
+                            Err(()) => exhausted = true,
+                        }
+                    }
+                    if !exhausted && !coalesced {
+                        outcome = Some(
+                            pending.publish(
+                                prepared
+                                    .take()
+                                    .expect("prepared signal is retained until publication"),
+                            ),
+                        );
+                    }
+                }
+                drop(actions);
                 drop(lifecycle);
-                // Drop a node made obsolete by a disposition transition only
-                // after releasing every signal-state spin guard.
-                drop(prepared);
-                return Ok(ThreadSignalSendOutcome {
-                    published: false,
-                    wake: false,
-                });
+                (
+                    (
+                        outcome,
+                        prepared.take(),
+                        ignored,
+                        blocked,
+                        exhausted,
+                        generation,
+                    ),
+                    generation_detached,
+                )
+            });
+        drop(detached);
+        drop(unused);
+        if exhausted {
+            return Ok(inactive());
+        }
+        let published = outcome.is_some_and(|outcome| outcome.finish());
+        if !ignored {
+            self.possibly_has_signal.store(true, Ordering::Release);
+        }
+        Ok(ThreadSignalSendOutcome {
+            published,
+            wake: !ignored && mode.accepts(ENDPOINT_ACTIVE) && !blocked,
+            generation: published.then_some(generation).flatten(),
+        })
+    }
+
+    fn allocate_generation(&self) -> Option<SignalRecordGeneration> {
+        let mut current = self.next_generation.load(Ordering::Acquire);
+        loop {
+            // Zero is a sticky exhaustion marker. It is never reused as a
+            // valid token and is never mapped back to an earlier generation.
+            if current == 0 {
+                return None;
             }
-        };
-        self.possibly_has_signal.store(true, Ordering::Release);
-        let added = outcome.added;
-        drop(lifecycle);
-        let published = outcome.finish();
-        debug_assert_eq!(published, added);
-        Ok(ThreadSignalSendOutcome { published, wake })
+            let next = current.checked_add(1).unwrap_or(0);
+            match self.next_generation.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(SignalRecordGeneration::new(current)),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Assigns one exact generation to an actually publishable prepared
+    /// record. Allocation-free RT fallback deliberately returns `Ok(None)`;
+    /// exhaustion returns `Err(())` so every publication entrance fails
+    /// closed without creating an untagged record.
+    fn assign_generation(
+        &self,
+        prepared: &mut PreparedSignal,
+    ) -> Result<Option<SignalRecordGeneration>, ()> {
+        if !prepared.supports_generation() {
+            return Ok(None);
+        }
+        let generation = self.allocate_generation().ok_or(())?;
+        prepared.set_generation(generation);
+        Ok(Some(generation))
+    }
+
+    /// Arms a one-shot bypass for one exact forced signal record. The
+    /// generation must come from an actual publication outcome; coalesced,
+    /// ignored, fallback, and inactive sends cannot arm a meaningful bypass.
+    pub fn arm_signal_delivery_bypass(&self, signo: Signo, generation: SignalRecordGeneration) {
+        self.delivery_bypass_signo
+            .store(signo as u8, Ordering::Release);
+        self.delivery_bypass
+            .store(generation.get(), Ordering::Release);
+    }
+
+    /// Consumes the one-shot bypass only when the currently selected record
+    /// matches both the armed signal number and exact record generation.
+    pub fn take_signal_delivery_bypass(&self, signo: Signo) -> bool {
+        let selected_generation = self.selected_generation.load(Ordering::Acquire);
+        if selected_generation == 0
+            || self.selected_signo.load(Ordering::Acquire) != signo as u8
+            || self.delivery_bypass_signo.load(Ordering::Acquire) != signo as u8
+        {
+            return false;
+        }
+        let consumed = self
+            .delivery_bypass
+            .compare_exchange(selected_generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if consumed {
+            self.delivery_bypass_signo.store(0, Ordering::Release);
+        }
+        consumed
     }
 
     /// Sends a signal through the allocation-free fallback path.
@@ -1007,7 +1979,7 @@ impl ThreadSignalManager {
 
 impl Drop for ThreadSignalManager {
     fn drop(&mut self) {
-        self.accepting_signals.store(false, Ordering::Release);
+        *self.lifecycle.lock() = ENDPOINT_CANCELLED;
         let registration = { self.registration.lock().take() };
         if let Some(entry) = registration {
             entry.deactivate();
@@ -1026,7 +1998,7 @@ mod signal_wait_tests {
     use super::{SignalWaitObservation, ThreadSignalManager};
     use crate::{
         SignalInfo, SignalSet, Signo,
-        api::{ProcessSignalManager, SignalActions},
+        api::{ProcessSignalManager, SharedSignalActions, SignalActions},
     };
 
     struct NoUserAccess;
@@ -1044,7 +2016,8 @@ mod signal_wait_tests {
     }
 
     fn registered_thread() -> Arc<ThreadSignalManager> {
-        let process = Arc::new(ProcessSignalManager::new(SignalActions::default(), 0));
+        let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
+        let process = Arc::new(ProcessSignalManager::new(actions, 0));
         let thread = ThreadSignalManager::try_new(process).unwrap();
         thread.try_register(1).unwrap().commit().unwrap();
         thread
@@ -1066,7 +2039,9 @@ mod signal_wait_tests {
             &waited,
             SignalSet::default(),
             move || {
-                assert!(sender.send_unqueued_signal(SignalInfo::new_user(Signo::SIGUSR1, 1, 1,)));
+                assert!(
+                    sender.send_unqueued_signal(SignalInfo::new_user(Signo::SIGUSR1, 1, 1, 0,))
+                );
             },
         );
         assert!(matches!(first, SignalWaitObservation::None));
@@ -1084,8 +2059,8 @@ mod signal_wait_tests {
     #[test]
     fn selected_signal_precedes_an_existing_async_delivery() {
         let thread = registered_thread();
-        assert!(thread.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 1, 1,)));
-        assert!(thread.send_unqueued_signal(SignalInfo::new_user(Signo::SIGUSR1, 1, 1,)));
+        assert!(thread.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 1, 1, 0,)));
+        assert!(thread.send_unqueued_signal(SignalInfo::new_user(Signo::SIGUSR1, 1, 1, 0,)));
 
         let mut waited = SignalSet::default();
         waited.add(Signo::SIGUSR1);
@@ -1107,5 +2082,22 @@ mod signal_wait_tests {
             SignalWaitObservation::Delivered(signal)
                 if signal.info.signo() == Signo::SIGTERM
         ));
+    }
+
+    #[test]
+    fn generation_exhaustion_is_sticky_and_fails_closed() {
+        let thread = registered_thread();
+        thread
+            .next_generation
+            .store(u64::MAX - 1, core::sync::atomic::Ordering::Release);
+
+        assert_eq!(thread.allocate_generation().unwrap().get(), u64::MAX - 1);
+        assert_eq!(thread.allocate_generation().unwrap().get(), u64::MAX);
+        assert!(thread.allocate_generation().is_none());
+        assert!(thread.allocate_generation().is_none());
+
+        let outcome = thread.send_unqueued_signal(SignalInfo::new_kernel(Signo::SIGTERM));
+        assert!(!outcome);
+        assert!(!thread.pending().has(Signo::SIGTERM));
     }
 }

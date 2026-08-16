@@ -9,7 +9,8 @@ use std::{
 };
 
 use thekernel_linux_signal::api::{
-    ProcessSignalManager, SignalActions, ThreadSignalManager, ThreadSignalRegistration,
+    ProcessSignalManager, SharedSignalActions, SignalActions, ThreadSignalManager,
+    ThreadSignalRegistration,
 };
 use thekernel_linux_usercopy::{UserCopyError, UserMemory, VmResult};
 
@@ -83,7 +84,8 @@ pub fn new_unregistered_test_env() -> (
     Arc<ThreadSignalManager>,
     ThreadSignalRegistration,
 ) {
-    let proc = Arc::new(ProcessSignalManager::new(SignalActions::default(), 0));
+    let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
+    let proc = Arc::new(ProcessSignalManager::new(actions, 0));
     let thr = ThreadSignalManager::try_new(proc.clone()).unwrap();
     let registration = thr.try_register(TID).unwrap();
     (proc, thr, registration)

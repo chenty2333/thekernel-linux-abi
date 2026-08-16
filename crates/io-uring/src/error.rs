@@ -98,8 +98,24 @@ pub enum IoUringError {
     FileTableNotPublished,
     /// No cancellable request matches the supported selector.
     CancellationTargetNotFound,
-    /// A well-formed registered-buffer operation is deliberately unsupported.
-    RegisteredBuffersUnsupported,
+    /// A registered-buffer table capacity was zero or exceeded the Linux limit.
+    InvalidBufferTableCapacity,
+    /// A registered-buffer lease budget was zero or exceeded the ring limit.
+    InvalidBufferLeaseCapacity,
+    /// Every configured registered-buffer execution lease is already charged.
+    BufferLeaseCapacityExceeded,
+    /// A registered-buffer slot index is outside the table.
+    InvalidBufferSlot,
+    /// A registered-buffer slot is not empty.
+    BufferSlotOccupied,
+    /// A registered-buffer slot does not contain a lookup-visible owner.
+    BufferSlotEmpty,
+    /// A buffer lease token does not name its exact active or retired generation.
+    UnknownBufferLease,
+    /// Registered buffers are not yet lookup-visible.
+    BufferTableNotPublished,
+    /// A fixed-buffer request range is outside its registered iovec.
+    InvalidBufferRange,
     /// A copied io_uring registration header or argument is malformed.
     InvalidRegistration,
     /// A registration opcode is known but not implemented by this profile.

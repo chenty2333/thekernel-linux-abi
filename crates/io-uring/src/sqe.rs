@@ -1,10 +1,12 @@
-use crate::{FileSlot, IoUringError, RequestDescriptor, RequestOperation, SQE_BYTES};
+use crate::{BufferSlot, FileSlot, IoUringError, RequestDescriptor, RequestOperation, SQE_BYTES};
 
 const IOSQE_FIXED_FILE: u8 = 1 << 0;
 
 const IORING_OP_NOP: u8 = 0;
 const IORING_OP_POLL_ADD: u8 = 6;
 const IORING_OP_ASYNC_CANCEL: u8 = 14;
+const IORING_OP_READ_FIXED: u8 = 4;
+const IORING_OP_WRITE_FIXED: u8 = 5;
 const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
 /// First opcode outside the Linux v6.12.35 UAPI enum.
@@ -27,6 +29,8 @@ pub const fn classify_submission_opcode(opcode: u8) -> SubmissionOpcodeSupport {
         IORING_OP_NOP => SubmissionOpcodeSupport::Supported(RequestOperation::Nop),
         IORING_OP_POLL_ADD => SubmissionOpcodeSupport::Supported(RequestOperation::PollAdd),
         IORING_OP_ASYNC_CANCEL => SubmissionOpcodeSupport::Supported(RequestOperation::AsyncCancel),
+        IORING_OP_READ_FIXED => SubmissionOpcodeSupport::Supported(RequestOperation::Read),
+        IORING_OP_WRITE_FIXED => SubmissionOpcodeSupport::Supported(RequestOperation::Write),
         IORING_OP_READ => SubmissionOpcodeSupport::Supported(RequestOperation::Read),
         IORING_OP_WRITE => SubmissionOpcodeSupport::Supported(RequestOperation::Write),
         opcode if opcode < PINNED_IORING_OP_LAST => SubmissionOpcodeSupport::KnownUnsupported,
@@ -92,6 +96,7 @@ pub struct ReadWriteRequest {
     file: FileTarget,
     offset: u64,
     buffer: IoBuffer,
+    buffer_slot: Option<BufferSlot>,
 }
 
 impl ReadWriteRequest {
@@ -108,6 +113,11 @@ impl ReadWriteRequest {
     /// Checked userspace buffer geometry.
     pub const fn buffer(self) -> IoBuffer {
         self.buffer
+    }
+
+    /// Fixed-buffer slot selected by `READ_FIXED`/`WRITE_FIXED`, if any.
+    pub const fn fixed_buffer(self) -> Option<BufferSlot> {
+        self.buffer_slot
     }
 }
 
@@ -198,9 +208,9 @@ impl CopiedSubmission {
 impl ParsedSubmission {
     /// Parses an already copied SQE without constructing a raw C union or enum.
     ///
-    /// Integer fields use the little-endian Linux ABI of the supported RISC-V
-    /// 64 and LoongArch64 consumers. The parser accepts only the operation and
-    /// flag subset that this crate can model.
+    /// Integer fields use the little-endian Linux ABI of supported x86_64
+    /// consumers. The parser accepts only the operation and flag subset that
+    /// this crate can model.
     pub fn parse(bytes: [u8; SQE_BYTES as usize]) -> Result<Self, IoUringError> {
         CopiedSubmission::new(bytes).parse()
     }
@@ -227,9 +237,15 @@ impl ParsedSubmission {
                 }
                 SubmissionOperation::Nop
             }
-            IORING_OP_READ | IORING_OP_WRITE => {
+            IORING_OP_READ_FIXED | IORING_OP_WRITE_FIXED | IORING_OP_READ | IORING_OP_WRITE => {
                 require_submission_flags(sqe_flags, IOSQE_FIXED_FILE)?;
-                if ioprio != 0 || personality != 0 || buffer_index != 0 || operation_flags != 0 {
+                let fixed_buffer = matches!(opcode, IORING_OP_READ_FIXED | IORING_OP_WRITE_FIXED);
+                if ioprio != 0
+                    || personality != 0
+                    || (!fixed_buffer && buffer_index != 0)
+                    || operation_flags != 0
+                    || splice_fd_in != 0
+                {
                     return Err(IoUringError::UnsupportedOperationFlags);
                 }
                 if offset == u64::MAX {
@@ -239,8 +255,9 @@ impl ParsedSubmission {
                     file: FileTarget::from_sqe(fd, sqe_flags & IOSQE_FIXED_FILE != 0)?,
                     offset,
                     buffer: IoBuffer::new(address, length)?,
+                    buffer_slot: fixed_buffer.then(|| BufferSlot::new(u32::from(buffer_index))),
                 };
-                if opcode == IORING_OP_READ {
+                if opcode == IORING_OP_READ_FIXED || opcode == IORING_OP_READ {
                     SubmissionOperation::Read(request)
                 } else {
                     SubmissionOperation::Write(request)
@@ -472,6 +489,28 @@ mod tests {
         assert_eq!(read.file(), FileTarget::Registered(FileSlot::new(2)));
         assert_eq!(read.offset(), 7);
         assert_eq!(read.buffer().end(), 0x1010);
+    }
+
+    #[test]
+    fn fixed_buffer_io_decodes_slot_and_exact_range() {
+        let mut bytes = sqe(IORING_OP_WRITE_FIXED, 10);
+        bytes[1] = IOSQE_FIXED_FILE;
+        bytes[4..8].copy_from_slice(&3_i32.to_le_bytes());
+        bytes[8..16].copy_from_slice(&11_u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&0x4010_u64.to_le_bytes());
+        bytes[24..28].copy_from_slice(&24_u32.to_le_bytes());
+        bytes[40..42].copy_from_slice(&7_u16.to_le_bytes());
+        let parsed = ParsedSubmission::parse(bytes).unwrap();
+        let SubmissionOperation::Write(write) = parsed.operation() else {
+            panic!("expected fixed-buffer write request");
+        };
+        assert_eq!(write.file(), FileTarget::Registered(FileSlot::new(3)));
+        assert_eq!(write.fixed_buffer(), Some(BufferSlot::new(7)));
+        assert_eq!(write.buffer(), IoBuffer::new(0x4010, 24).unwrap());
+        assert_eq!(
+            classify_submission_opcode(IORING_OP_READ_FIXED),
+            SubmissionOpcodeSupport::Supported(RequestOperation::Read)
+        );
     }
 
     #[test]

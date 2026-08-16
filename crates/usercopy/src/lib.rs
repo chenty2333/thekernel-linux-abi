@@ -43,9 +43,6 @@ impl fmt::Display for UserCopyError {
     }
 }
 
-/// Compatibility error alias retained for source migrations from `starry-vm`.
-pub type VmError = UserCopyError;
-
 /// A user-memory operation result.
 pub type VmResult<T = ()> = Result<T, UserCopyError>;
 
@@ -205,12 +202,16 @@ pub unsafe fn vm_write_slice_unchecked<M: UserMemory + ?Sized, T>(
 mod thin;
 pub use thin::{VmMutPtr, VmPtr};
 
+mod sigevent;
+pub use sigevent::RawSigevent;
+
 #[cfg(feature = "alloc")]
 #[path = "alloc.rs"]
 mod owned;
 #[cfg(feature = "alloc")]
 pub use owned::{
-    MAX_NUL_SEARCH_BYTES, vm_load, vm_load_any, vm_load_any_until_nul, vm_load_until_nul,
+    MAX_NUL_SEARCH_BYTES, vm_load, vm_load_any, vm_load_any_until_nul,
+    vm_load_any_until_nul_bounded, vm_load_until_nul, vm_load_until_nul_bounded,
 };
 
 #[cfg(test)]

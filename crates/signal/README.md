@@ -10,10 +10,17 @@ Thread IDs are unique within one process registry; registration is
 rollback-safe and bounded by an immutable process-local endpoint limit. The
 default is 65,536; `try_with_thread_limit()` selects a lower or other finite
 limit, while `usize::MAX` is rejected as effective infinity. Explicit
-cancellation stops later publication while draining and refunding
-thread-private queued records. Cancellation also quiesces a delivery that
-already started, so handler context and mask updates cannot complete after
-endpoint teardown returns.
+cancellation stops later publication while draining and refunding queued
+records. Process and thread endpoints may instead enter a retained state for
+Linux zombie/group-leader teardown: retained endpoints leave ordinary routing
+but preserve exact pending ownership until reap. Cancellation and retirement
+both quiesce a delivery that already started, so handler context and mask
+updates cannot complete after teardown returns.
+
+Signal dispositions live in an opaque, reference-counted
+`SharedSignalActions` owner. Cloning that owner implements `CLONE_SIGHAND` and
+preserves an identity suitable for `KCMP_SIGHAND`; `try_snapshot()` implements
+an independent fork snapshot without exposing the table lock to consumers.
 
 Synchronous waits use `observe_signal_wait()` under that same sole delivery
 owner. Each observation first accepts a queued signal selected by the caller's
@@ -29,7 +36,8 @@ admission token; dropping that token rolls the admission back, while
 `commit()` activates it. `commit()` is fallible and returns
 `ThreadRegistrationError::Cancelled` if concurrent teardown cancelled the
 admission first. An embedding kernel must call `cancel_registration()` during
-thread teardown before releasing the endpoint.
+ordinary thread teardown, or `retire_registration()` when exact pending
+ownership must survive in a retained leader.
 
 Credential- or liveness-checked signal sends also have an explicit two-phase
 path. `try_prepare_signal_send()` fallibly retains a bounded process routing
@@ -42,6 +50,15 @@ returned deferred result retains every unused queue record, account, registry
 entry, process manager, and endpoint until the kernel has left its outer
 critical section. Process-route preparation is intentionally allowed to
 allocate and take the sleepable registry mutex; publication is not.
+
+Every actually published thread-private record receives a non-reusable
+generation. Pre-delivery Retry/Fault returns the same owned record to the front
+of its original queue without changing real-time FIFO order, `siginfo`, or
+accounting. A one-shot delivery bypass matches both signal number and exact
+generation, so coalesced or stale records cannot consume it. Generation
+exhaustion is sticky and fails closed. Linux stop/continue generation effects
+flush conflicting pending records across process, live-thread, and retained
+leader queues.
 
 Every userspace action/frame copy receives an explicit
 `UserMemoryContext`; the crate never obtains the current task or address space.
@@ -71,13 +88,11 @@ wrap. Signal frames expose the actual interrupted alternate-stack snapshot,
 including computed `SS_ONSTACK` state.
 
 Version 0.1.0 is nightly-only because fallible `Arc::try_new` queue and
-endpoint allocation requires `allocator_api`. It is tested with
-`nightly-2025-05-20` and does not claim a stable `rust-version`.
+endpoint allocation requires `allocator_api`. It follows the workspace's
+rolling nightly toolchain and does not claim a stable `rust-version`.
 
-The 0.1.0 release-supported target matrix is hosted x86_64 plus bare-metal
-RISC-V 64 and LoongArch64. The inherited AArch64 frame module remains
-source-only on this release line because the pinned `axcpu` and nightly pair
-does not build that target.
+The 0.1.0 release-supported target is x86_64. Signal frames and the restorer
+layout are fixed to the Linux x86_64 ABI.
 
 Bare-metal consumers must enable `multitask`, so delivery quiescence and
 action/registry publication use the sleepable `axsync::Mutex`. A bare-metal

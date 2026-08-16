@@ -43,16 +43,39 @@ impl<M: UserMemory + ?Sized> UserMemoryContext<'_, M> {
     /// This entry point supports raw userspace pointer arrays without enabling
     /// bytemuck's unsound raw-pointer `Pod` implementation.
     pub unsafe fn load_any_until_nul<T>(&mut self, ptr: *const T) -> VmResult<Vec<T>> {
+        // SAFETY: this method has the same representation and sentinel
+        // requirements as the bounded entry point.
+        unsafe { self.load_any_until_nul_bounded(ptr, usize::MAX) }
+    }
+
+    /// Loads representations until an all-zero value appears within
+    /// `scan_elements` elements.
+    ///
+    /// The scan budget includes the terminating zero element. The crate-wide
+    /// 128 KiB byte ceiling remains authoritative when the requested budget
+    /// is larger.
+    ///
+    /// # Safety
+    ///
+    /// Every nonzero representation returned by the provider must be valid for
+    /// `T`, and the all-zero representation must be a valid sentinel for `T`.
+    /// This entry point supports raw userspace pointer arrays without enabling
+    /// bytemuck's unsound raw-pointer `Pod` implementation.
+    pub unsafe fn load_any_until_nul_bounded<T>(
+        &mut self,
+        ptr: *const T,
+        scan_elements: usize,
+    ) -> VmResult<Vec<T>> {
         let size = core::mem::size_of::<T>();
         if size == 0 {
             return Err(UserCopyError::BadAddress);
         }
-        let start = ptr as usize;
-        let max_elements = MAX_NUL_SEARCH_BYTES / size;
+        let max_elements = scan_elements.min(MAX_NUL_SEARCH_BYTES / size);
         if max_elements == 0 {
             return Err(UserCopyError::TooLong);
         }
 
+        let start = ptr as usize;
         let mut result = Vec::new();
         while result.len() < max_elements {
             let address = element_address(start, result.len(), size)?;
@@ -82,9 +105,24 @@ impl<M: UserMemory + ?Sized> UserMemoryContext<'_, M> {
     /// Loads `Pod` values until a zero value appears or the bound is hit.
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // Pointer is an opaque user address, never dereferenced.
     pub fn load_until_nul<T: Pod>(&mut self, ptr: *const T) -> VmResult<Vec<T>> {
+        self.load_until_nul_bounded(ptr, usize::MAX)
+    }
+
+    /// Loads `Pod` values until an all-zero value appears within
+    /// `scan_elements` elements.
+    ///
+    /// The scan budget includes the terminating zero element. The crate-wide
+    /// 128 KiB byte ceiling remains authoritative when the requested budget
+    /// is larger.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // Pointer is an opaque user address, never dereferenced.
+    pub fn load_until_nul_bounded<T: Pod>(
+        &mut self,
+        ptr: *const T,
+        scan_elements: usize,
+    ) -> VmResult<Vec<T>> {
         // SAFETY: `Pod` guarantees that every representation is valid and that
         // the all-zero representation is valid.
-        unsafe { self.load_any_until_nul(ptr) }
+        unsafe { self.load_any_until_nul_bounded(ptr, scan_elements) }
     }
 }
 
@@ -125,12 +163,41 @@ pub unsafe fn vm_load_any_until_nul<M: UserMemory + ?Sized, T>(
     unsafe { memory.load_any_until_nul(ptr) }
 }
 
+/// Loads raw representations until an all-zero sentinel is found within
+/// `scan_elements` elements.
+///
+/// The scan budget includes the terminating zero element and is also limited
+/// by the crate-wide 128 KiB byte ceiling.
+///
+/// # Safety
+///
+/// Every nonzero representation must be valid for `T`, and all-zero must be a
+/// valid sentinel. This is the migration path for raw userspace pointer arrays.
+pub unsafe fn vm_load_any_until_nul_bounded<M: UserMemory + ?Sized, T>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const T,
+    scan_elements: usize,
+) -> VmResult<Vec<T>> {
+    // SAFETY: forwarded from this function's caller.
+    unsafe { memory.load_any_until_nul_bounded(ptr, scan_elements) }
+}
+
 /// Loads a bounded NUL-terminated vector through an explicit context.
 pub fn vm_load_until_nul<M: UserMemory + ?Sized, T: Pod>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const T,
 ) -> VmResult<Vec<T>> {
     memory.load_until_nul(ptr)
+}
+
+/// Loads a bounded NUL-terminated vector through an explicit context and an
+/// element-count scan budget.
+pub fn vm_load_until_nul_bounded<M: UserMemory + ?Sized, T: Pod>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const T,
+    scan_elements: usize,
+) -> VmResult<Vec<T>> {
+    memory.load_until_nul_bounded(ptr, scan_elements)
 }
 
 fn is_zero_uninit<T>(value: &core::mem::MaybeUninit<T>) -> bool {

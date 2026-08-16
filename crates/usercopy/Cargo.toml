@@ -19,9 +19,13 @@ alloc = []
 
 [dependencies]
 bytemuck.workspace = true
+linux-raw-sys.workspace = true
 
 [dev-dependencies]
 bytemuck = { workspace = true, features = ["derive"] }
+# Exercise the additive owned APIs in integration tests without making them
+# part of the default no-alloc library build.
+thekernel-linux-usercopy = { path = ".", features = ["alloc"] }
 
 [package.metadata.docs.rs]
 all-features = true

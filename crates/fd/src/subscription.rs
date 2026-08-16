@@ -4,6 +4,24 @@ use core::{
     task::Waker,
 };
 
+fn try_atomic_update(
+    counter: &AtomicUsize,
+    set_order: Ordering,
+    load_order: Ordering,
+    mut update: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    let mut current = counter.load(load_order);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match counter.compare_exchange_weak(current, next, set_order, load_order) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Shared bounded accounting for persistent watches or ephemeral source slots.
 pub struct WatchAccount {
     limit: usize,
@@ -35,15 +53,14 @@ impl WatchAccount {
     /// Atomically reserves `amount`, refunding it when the returned charge is
     /// dropped.
     pub fn try_charge(&self, amount: usize) -> Result<WatchCharge<'_>, WatchChargeError> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(amount).filter(|next| *next <= self.limit)
-            })
-            .map(|_| WatchCharge {
-                account: self,
-                amount,
-            })
-            .map_err(|_| WatchChargeError::Limit)
+        try_atomic_update(&self.used, Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(amount).filter(|next| *next <= self.limit)
+        })
+        .map(|_| WatchCharge {
+            account: self,
+            amount,
+        })
+        .map_err(|_| WatchChargeError::Limit)
     }
 }
 

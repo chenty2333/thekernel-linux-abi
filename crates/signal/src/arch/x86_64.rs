@@ -2,21 +2,94 @@ use axcpu::uspace::UserContext;
 
 use crate::{SignalSet, SignalStack, arch::SignalContextError};
 
+/// The exact x86_64 legacy floating-point image exposed by `fxsave`.
+///
+/// The current target does not advertise `OSXSAVE`, so the signal ABI carries
+/// the legacy 512-byte image rather than an XSAVE area.  This type is an
+/// owned byte image on purpose: the signal crate does not inspect or validate
+/// CPU state and leaves restore/commit to its embedding architecture layer.
+#[repr(C, align(16))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegacyFpState64 {
+    bytes: [u8; Self::SIZE],
+}
+
+impl LegacyFpState64 {
+    /// Size of one legacy FXSAVE image.
+    pub const SIZE: usize = 512;
+
+    /// Creates an owned image from its exact object bytes.
+    pub const fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        Self { bytes }
+    }
+
+    /// Alias documenting that the input is copied into owned storage.
+    pub const fn from_owned_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        Self::from_bytes(bytes)
+    }
+
+    /// Returns a shared view of the complete owned image.
+    pub const fn as_bytes(&self) -> &[u8; Self::SIZE] {
+        &self.bytes
+    }
+
+    /// Copies the complete image into an owned byte array.
+    pub const fn to_bytes(&self) -> [u8; Self::SIZE] {
+        self.bytes
+    }
+
+    /// Consumes the image and returns its exact owned bytes.
+    pub const fn into_bytes(self) -> [u8; Self::SIZE] {
+        self.bytes
+    }
+
+    /// Alias documenting that the returned value owns all bytes.
+    pub const fn into_owned_bytes(self) -> [u8; Self::SIZE] {
+        self.into_bytes()
+    }
+}
+
+impl Default for LegacyFpState64 {
+    fn default() -> Self {
+        Self::from_bytes([0; Self::SIZE])
+    }
+}
+
+impl core::fmt::Debug for LegacyFpState64 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("LegacyFpState64")
+            .field(&self.bytes.len())
+            .finish()
+    }
+}
+
+impl From<[u8; LegacyFpState64::SIZE]> for LegacyFpState64 {
+    fn from(bytes: [u8; LegacyFpState64::SIZE]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl From<LegacyFpState64> for [u8; LegacyFpState64::SIZE] {
+    fn from(image: LegacyFpState64) -> Self {
+        image.into_bytes()
+    }
+}
+
 core::arch::global_asm!(
     "
 .section .text
 .code64
 .balign 4096
-.global signal_trampoline
-signal_trampoline:
+.global thekernel_linux_signal_trampoline
+thekernel_linux_signal_trampoline:
     mov rax, 0xf
     syscall
 
-.fill 4096 - (. - signal_trampoline), 1, 0
+.fill 4096 - (. - thekernel_linux_signal_trampoline), 1, 0
 "
 );
 
-#[repr(C, align(16))]
+#[repr(C)]
 #[derive(Clone)]
 pub struct MContext {
     r8: usize,
@@ -40,7 +113,7 @@ pub struct MContext {
     cs: u16,
     gs: u16,
     fs: u16,
-    _pad: u16,
+    ss: u16,
     err: usize,
     trapno: usize,
     oldmask: usize,
@@ -73,7 +146,7 @@ impl MContext {
             cs: uctx.cs as _,
             gs: 0,
             fs: 0,
-            _pad: 0,
+            ss: uctx.ss as _,
             err: uctx.error_code as _,
             trapno: uctx.vector as _,
             oldmask: 0,
@@ -83,13 +156,23 @@ impl MContext {
         }
     }
 
+    /// Builds the context fields that are published in a signal delivery.
+    /// `oldmask` is retained for the legacy sigcontext ABI while `fpstate`
+    /// points at the separately published FXSAVE payload.
+    pub(crate) fn for_delivery(uctx: &UserContext, sigmask: SignalSet, fpstate: usize) -> Self {
+        let mut context = Self::new(uctx);
+        context.oldmask = sigmask.bits() as _;
+        context.fpstate = fpstate;
+        context
+    }
+
     pub(crate) fn prepare_restore(
         &self,
         current: &UserContext,
     ) -> Result<UserContext, SignalContextError> {
         // TheKernel currently supports only the native 64-bit userspace ABI.
         // Never copy a kernel or compatibility selector out of a user frame.
-        if self.cs & 0b11 != 0b11 || self.cs as u64 != current.cs {
+        if self.cs & 0b11 != 0b11 || self.cs as u64 != current.cs || self.ss as u64 != current.ss {
             return Err(SignalContextError::InvalidProcessorState);
         }
 
@@ -156,6 +239,26 @@ impl MContext {
     pub fn set_code_segment(&mut self, cs: u16) {
         self.cs = cs;
     }
+
+    /// Returns the saved user stack-segment selector.
+    pub const fn stack_segment(&self) -> u16 {
+        self.ss
+    }
+
+    /// Returns the legacy sigcontext blocked-mask field.
+    pub const fn old_mask(&self) -> usize {
+        self.oldmask
+    }
+
+    /// Returns the userspace address of the legacy FXSAVE image.
+    pub const fn fpstate(&self) -> usize {
+        self.fpstate
+    }
+
+    /// Replaces the userspace pointer to the legacy FXSAVE image.
+    pub fn set_fpstate(&mut self, address: usize) {
+        self.fpstate = address;
+    }
 }
 
 #[repr(C)]
@@ -164,26 +267,52 @@ pub struct UContext {
     pub flags: usize,
     pub link: usize,
     pub stack: SignalStack,
-    __mcontext_padding: u64,
     pub mcontext: MContext,
     pub sigmask: SignalSet,
-    __tail_padding: u64,
 }
 
 impl UContext {
     pub fn new(uctx: &UserContext, sigmask: SignalSet, stack: SignalStack) -> Self {
         Self {
-            flags: 0,
+            flags: UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS,
             link: 0,
             stack,
-            __mcontext_padding: 0,
-            mcontext: MContext::new(uctx),
+            mcontext: MContext::for_delivery(uctx, sigmask, 0),
             sigmask,
-            __tail_padding: 0,
+        }
+    }
+
+    /// Builds a context with its separately published legacy FXSAVE address.
+    pub(crate) fn with_fpstate(
+        uctx: &UserContext,
+        sigmask: SignalSet,
+        stack: SignalStack,
+        fpstate: usize,
+    ) -> Self {
+        Self {
+            flags: UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS,
+            link: 0,
+            stack,
+            mcontext: MContext::for_delivery(uctx, sigmask, fpstate),
+            sigmask,
         }
     }
 }
 
+/// `ucontext_t.uc_flags` bit indicating that sigcontext contains `ss`.
+pub const UC_SIGCONTEXT_SS: usize = 2;
+/// `ucontext_t.uc_flags` bit requesting strict user `ss` restoration.
+pub const UC_STRICT_RESTORE_SS: usize = 4;
+/// The x86_64 Linux ABI does not advertise this flag for the legacy image.
+pub const UC_FP_XSTATE: usize = 1;
+
+const _: [(); 8] = [(); core::mem::align_of::<MContext>()];
 const _: [(); 256] = [(); size_of::<MContext>()];
-const _: [(); 48] = [(); core::mem::offset_of!(UContext, mcontext)];
-const _: [(); 320] = [(); size_of::<UContext>()];
+const _: [(); 150] = [(); core::mem::offset_of!(MContext, ss)];
+const _: [(); 168] = [(); core::mem::offset_of!(MContext, oldmask)];
+const _: [(); 184] = [(); core::mem::offset_of!(MContext, fpstate)];
+const _: [(); 16] = [(); core::mem::align_of::<LegacyFpState64>()];
+const _: [(); 512] = [(); size_of::<LegacyFpState64>()];
+const _: [(); 40] = [(); core::mem::offset_of!(UContext, mcontext)];
+const _: [(); 296] = [(); core::mem::offset_of!(UContext, sigmask)];
+const _: [(); 304] = [(); size_of::<UContext>()];
