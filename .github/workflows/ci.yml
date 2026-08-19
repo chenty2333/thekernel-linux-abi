@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: chenty2333/thekernel-ax
-          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          ref: a9a89b0545e8af88213b39fb0ba050dbfeafc0b3
           fetch-depth: 2
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
@@ -46,7 +46,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: chenty2333/thekernel-ax
-          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          ref: a9a89b0545e8af88213b39fb0ba050dbfeafc0b3
           fetch-depth: 2
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
@@ -69,7 +69,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: chenty2333/thekernel-ax
-          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          ref: a9a89b0545e8af88213b39fb0ba050dbfeafc0b3
           fetch-depth: 2
           path: .ci-deps/thekernel-ax
       - name: Link the external path dependency
