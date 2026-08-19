@@ -159,6 +159,11 @@ pub enum DeliveryOutcome {
         /// Readiness observed by the adapter's post-copy level check.
         still_ready: ReadyMask,
     },
+    /// The adapter re-polled the queued item immediately before copyout and
+    /// found no currently deliverable event.  The stale snapshot is discarded,
+    /// but a wake which raced the recheck remains pending and one-shot state is
+    /// not consumed because userspace observed no event.
+    Suppressed,
     /// Copyout faulted; the same event must remain deliverable.
     Fault,
 }
@@ -728,6 +733,9 @@ impl<U, S> EpollCore<U, S> {
                 DeliveryOutcome::Fault => {
                     entry.ready |= delivery.events | entry.during_delivery;
                 }
+                DeliveryOutcome::Suppressed => {
+                    entry.ready |= entry.during_delivery;
+                }
                 DeliveryOutcome::Copied { still_ready } => {
                     entry.ready |= entry.during_delivery;
                     if !entry.interest.mode.edge {
@@ -924,6 +932,48 @@ mod tests {
         )
         .unwrap();
         assert!(core.begin_delivery().unwrap().is_some());
+    }
+
+    #[test]
+    fn suppressed_delivery_preserves_racing_wake_without_consuming_one_shot() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let key = EpollKey {
+            ofd: ofd(1),
+            fd: FdNumber::new(3),
+        };
+        let mut core = EpollCore::try_new(id(1), 1).unwrap();
+        let token = core
+            .add(interest(
+                key,
+                InterestMode {
+                    one_shot: true,
+                    ..InterestMode::default()
+                },
+                &drops,
+            ))
+            .unwrap();
+
+        core.notify(token, ReadyMask::IN).unwrap();
+        let stale = core.begin_delivery().unwrap().unwrap();
+        core.finish_delivery(stale.delivery, DeliveryOutcome::Suppressed)
+            .unwrap();
+        assert!(core.begin_delivery().unwrap().is_none());
+        assert_eq!(
+            core.notify(token, ReadyMask::IN),
+            Ok(NotifyOutcome::Enqueued)
+        );
+
+        let racing = core.begin_delivery().unwrap().unwrap();
+        assert_eq!(
+            core.notify(token, ReadyMask::IN),
+            Ok(NotifyOutcome::Coalesced)
+        );
+        core.finish_delivery(racing.delivery, DeliveryOutcome::Suppressed)
+            .unwrap();
+        assert_eq!(
+            core.begin_delivery().unwrap().unwrap().events,
+            ReadyMask::IN
+        );
     }
 
     #[test]
