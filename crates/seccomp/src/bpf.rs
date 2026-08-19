@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use axcbpf::{Input, LoadWidth, Program, VerifyError, opcode};
+use axcbpf::{CodeImage, Input, InputProfile, LoadWidth, Program, VerifyError, opcode};
 
 use crate::{BPF_MAXINSNS, SECCOMP_DATA_SIZE};
 
@@ -22,6 +22,26 @@ pub struct SeccompData {
 }
 
 impl SeccompData {
+    /// Returns the exact 64-byte native-endian byte view consumed by a
+    /// native seccomp translator.
+    ///
+    /// The returned object is intentionally owned: it keeps the input ABI
+    /// explicit without exposing a reference created through an unsafe cast
+    /// or relying on a packed representation. On x86_64 this is the native
+    /// `struct seccomp_data` layout and is safe to pass to an executor for
+    /// the duration of one evaluation.
+    pub fn native_bytes(&self) -> [u8; SECCOMP_DATA_SIZE] {
+        let mut bytes = [0u8; SECCOMP_DATA_SIZE];
+        bytes[0..4].copy_from_slice(&self.number.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&self.architecture.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.instruction_pointer.to_ne_bytes());
+        for (index, argument) in self.arguments.iter().copied().enumerate() {
+            let start = 16 + index * 8;
+            bytes[start..start + 8].copy_from_slice(&argument.to_ne_bytes());
+        }
+        bytes
+    }
+
     fn load_word(&self, offset: usize) -> Option<u32> {
         if offset & 3 != 0 || offset >= SECCOMP_DATA_SIZE {
             return None;
@@ -38,6 +58,17 @@ impl SeccompData {
             _ => None,
         }
     }
+}
+
+/// Narrow object-safe execution contract for one immutable seccomp program.
+///
+/// Implementations must not allocate, mutate policy state, or inspect the
+/// current task. The input is the 64-byte native seccomp-data view. The
+/// interpreter remains the semantic oracle and is used whenever no executor
+/// was successfully published.
+pub trait SeccompExecutor: Send + Sync {
+    /// Evaluates one native seccomp-data byte view and returns a raw action.
+    fn execute(&self, data: &[u8]) -> u32;
 }
 
 impl Input for SeccompData {
@@ -187,6 +218,14 @@ impl VerifiedProgram {
     /// baseline deliberately excludes architecture-specific JIT hardening.
     pub fn path_charge(&self) -> usize {
         self.path_charge
+    }
+
+    /// Translates this verified program for the x86_64 native seccomp-data
+    /// ABI. The returned image is still non-executable; its owner must apply
+    /// the platform's W^X publication policy.
+    pub fn translate_native(&self) -> Result<CodeImage, axcbpf::TranslationError> {
+        self.program
+            .translate_with_profile(InputProfile::NativeAlignedWords)
     }
 
     /// Returns the immutable verified instruction sequence.
@@ -379,6 +418,31 @@ mod tests {
         assert_eq!(offset_of!(SeccompData, instruction_pointer), 8);
         assert_eq!(offset_of!(SeccompData, arguments), 16);
         assert_eq!(AUDIT_ARCH_X86_64, 0xc000_003e);
+    }
+
+    #[test]
+    fn native_bytes_preserve_the_wire_layout_without_aliasing() {
+        let bytes = data().native_bytes();
+        assert_eq!(&bytes[0..4], &63i32.to_ne_bytes());
+        assert_eq!(&bytes[4..8], &AUDIT_ARCH_X86_64.to_ne_bytes());
+        assert_eq!(&bytes[8..16], &0x1122_3344_5566_7788u64.to_ne_bytes());
+        assert_eq!(&bytes[16..24], &0x0102_0304_0506_0708u64.to_ne_bytes());
+        assert_eq!(bytes.len(), SECCOMP_DATA_SIZE);
+    }
+
+    #[test]
+    fn verified_program_exposes_only_the_native_seccomp_translation_profile() {
+        let program = VerifiedProgram::try_copy_from_slice(&[
+            stmt(opcode::LD_W_ABS, 4),
+            stmt(opcode::RET_A, 0),
+        ])
+        .unwrap();
+        let image = program.translate_native().unwrap();
+        assert_eq!(image.profile(), InputProfile::NativeAlignedWords);
+        image.validate().unwrap();
+        let bytes = data().native_bytes();
+        let native = axcbpf::NativeWordInput::new(&bytes);
+        assert_eq!(image.evaluate(&native), program.evaluate(&data()));
     }
 
     #[test]

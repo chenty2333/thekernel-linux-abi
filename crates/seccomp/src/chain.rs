@@ -3,7 +3,7 @@ use core::mem::size_of;
 
 use crate::{
     Action, ClassicBpfInstruction, FILTER_PATH_PENALTY, FilterBudget, MAX_INSNS_PER_PATH,
-    SeccompData, VerifiedProgram, budget::FilterCharge,
+    SeccompData, SeccompExecutor, VerifiedProgram, budget::FilterCharge,
 };
 
 /// Per-filter installation metadata retained with an immutable program.
@@ -26,15 +26,43 @@ pub struct FilterDecision {
     /// Winning filter metadata. It is `None` when every filter returned
     /// `ALLOW`, matching Linux's lack of a selected allow filter.
     pub matched_filter: Option<FilterMetadata>,
+    /// Number of native executors run for this decision.
+    ///
+    /// This is execution evidence, not Linux-visible action state. It lets a
+    /// kernel adapter account the immutable executor choice without a second
+    /// chain traversal or a global policy read on the syscall hot path.
+    pub native_executions: usize,
+    /// Number of interpreter programs run for this decision.
+    pub interpreter_executions: usize,
 }
 
 struct FilterNode {
     program: VerifiedProgram,
+    executor: Option<Arc<dyn SeccompExecutor>>,
     metadata: FilterMetadata,
     previous: Option<Arc<FilterNode>>,
     path_cost: usize,
     filter_count: usize,
     _charge: FilterCharge,
+}
+
+/// Aligned native input storage for the x86_64 translator.
+///
+/// `InputProfile::NativeAlignedWords` checks logical word offsets, while its
+/// native loads also require the snapshot base to be four-byte aligned. A
+/// plain `[u8; SECCOMP_DATA_SIZE]` only has byte alignment, so keep that
+/// precondition explicit at the one boundary where the JIT receives bytes.
+#[repr(align(4))]
+struct NativeInput([u8; crate::SECCOMP_DATA_SIZE]);
+
+impl NativeInput {
+    fn from_data(data: &SeccompData) -> Self {
+        Self(data.native_bytes())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl Drop for FilterNode {
@@ -122,6 +150,19 @@ impl FilterChain {
         metadata: FilterMetadata,
         budget: &FilterBudget,
     ) -> Result<Self, FilterInstallError> {
+        self.try_append_with_executor(program, metadata, budget, None)
+    }
+
+    /// Allocates an immutable leaf with an optional already-published native
+    /// executor. The executor is only an optimization: `None` always retains
+    /// the same verified interpreter semantics.
+    pub fn try_append_with_executor(
+        &self,
+        program: VerifiedProgram,
+        metadata: FilterMetadata,
+        budget: &FilterBudget,
+        executor: Option<Arc<dyn SeccompExecutor>>,
+    ) -> Result<Self, FilterInstallError> {
         let path_cost = if self.is_empty() {
             program.path_charge()
         } else {
@@ -155,6 +196,7 @@ impl FilterChain {
             .map_err(|_| FilterInstallError::BudgetExceeded)?;
         let node = Arc::try_new(FilterNode {
             program,
+            executor,
             metadata,
             previous: self.leaf.clone(),
             path_cost,
@@ -181,9 +223,20 @@ impl FilterChain {
     pub fn evaluate(&self, data: &SeccompData) -> FilterDecision {
         let mut selected = Action::from_raw(crate::SECCOMP_RET_ALLOW);
         let mut matched_filter = None;
+        let mut native_executions: usize = 0;
+        let mut interpreter_executions: usize = 0;
+        let mut native_data = None;
         let mut cursor = self.leaf.as_ref();
         while let Some(node) = cursor {
-            let current = Action::from_raw(node.program.evaluate(data));
+            let raw = if let Some(executor) = node.executor.as_ref() {
+                native_executions = native_executions.saturating_add(1);
+                let native = native_data.get_or_insert_with(|| NativeInput::from_data(data));
+                executor.execute(native.as_bytes())
+            } else {
+                interpreter_executions = interpreter_executions.saturating_add(1);
+                node.program.evaluate(data)
+            };
+            let current = Action::from_raw(raw);
             // Strictly-less preserves the newest filter's DATA for ties.
             if current.precedence() < selected.precedence() {
                 selected = current;
@@ -194,6 +247,8 @@ impl FilterChain {
         FilterDecision {
             action: selected,
             matched_filter,
+            native_executions,
+            interpreter_executions,
         }
     }
 }
@@ -244,6 +299,54 @@ mod tests {
 
     fn budget() -> FilterBudget {
         FilterBudget::try_new(usize::MAX).unwrap()
+    }
+
+    struct TestExecutor;
+
+    impl SeccompExecutor for TestExecutor {
+        fn execute(&self, data: &[u8]) -> u32 {
+            assert_eq!(data.len(), crate::SECCOMP_DATA_SIZE);
+            assert_eq!((data.as_ptr() as usize) & 3, 0);
+            u32::from_ne_bytes(data[0..4].try_into().unwrap())
+        }
+    }
+
+    #[test]
+    fn native_executor_is_optional_and_shares_with_cloned_chain() {
+        let budget = budget();
+        let root = FilterChain::empty();
+        let program = returning(SECCOMP_RET_ALLOW);
+        let executor: Arc<dyn SeccompExecutor> = Arc::new(TestExecutor);
+        let chain = root
+            .try_append_with_executor(program, FilterMetadata::default(), &budget, Some(executor))
+            .unwrap();
+        let cloned = chain.clone();
+        let input = SeccompData {
+            number: 17,
+            architecture: crate::AUDIT_ARCH_X86_64,
+            instruction_pointer: 0,
+            arguments: [0; 6],
+        };
+        assert_eq!(chain.evaluate(&input).action.raw(), 17);
+        let decision = chain.evaluate(&input);
+        assert_eq!(decision.native_executions, 1);
+        assert_eq!(decision.interpreter_executions, 0);
+        assert_eq!(cloned.evaluate(&input).action.raw(), 17);
+    }
+
+    #[test]
+    fn interpreter_executor_count_is_captured_per_evaluation() {
+        let budget = budget();
+        let chain = FilterChain::empty()
+            .try_append(
+                returning(SECCOMP_RET_ALLOW),
+                FilterMetadata::default(),
+                &budget,
+            )
+            .unwrap();
+        let decision = chain.evaluate(&data());
+        assert_eq!(decision.native_executions, 0);
+        assert_eq!(decision.interpreter_executions, 1);
     }
 
     fn returning_with_len(length: usize, value: u32) -> VerifiedProgram {
