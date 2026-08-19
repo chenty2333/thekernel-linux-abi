@@ -1302,7 +1302,7 @@ impl ThreadSignalManager {
     ///
     /// The hook is called once at most, only after a deliverable signal's
     /// effective disposition has been resolved to a userspace handler and
-    /// before [`prepare_signal_frame`] snapshots the interrupted context. Signals
+    /// before [`crate::api::frame::prepare_signal_frame`] snapshots the interrupted context. Signals
     /// that are blocked, ignored, or handled by a default action never invoke
     /// it.
     ///

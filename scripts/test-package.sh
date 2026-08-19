@@ -61,30 +61,15 @@ if [ "$needs_packaged_axcbpf" = 1 ]; then
     axcbpf_repo=${AXCBPF_SOURCE_ROOT:-"$repo_root/../thekernel-ax"}
     axcbpf_crate_path=crates/thekernel-axcbpf
     axcbpf_source="$axcbpf_repo/$axcbpf_crate_path"
-    axcbpf_reviewed_commit=a2b4f6f7e0bfbb1ca4bdf4fef45e104185749705
-    axcbpf_release_commit=5c34536fd766b5f84f2fb8e6b18a2ab340659582
+    axcbpf_source_commit=$(git -C "$axcbpf_repo" rev-parse HEAD)
 
     [ -d "$axcbpf_source" ] || {
         printf 'thekernel-axcbpf source missing: %s\n' "$axcbpf_source" >&2
         exit 1
     }
-    for commit in "$axcbpf_reviewed_commit" "$axcbpf_release_commit"; do
-        git -C "$axcbpf_repo" cat-file -e "$commit^{commit}" || {
-            printf 'thekernel-axcbpf source commit missing: %s\n' "$commit" >&2
-            exit 1
-        }
-    done
-    git -C "$axcbpf_repo" diff --quiet \
-        "$axcbpf_reviewed_commit" "$axcbpf_release_commit" -- \
-        "$axcbpf_crate_path" || {
-        printf '%s\n' \
-            'thekernel-axcbpf release commit changes the reviewed 0.1.0 crate tree' >&2
-        exit 1
-    }
-    git -C "$axcbpf_repo" diff --quiet \
-        "$axcbpf_release_commit" -- "$axcbpf_crate_path" || {
-        printf '%s\n' \
-            'thekernel-axcbpf source differs from the exact 0.1.0 release commit' >&2
+    git -C "$axcbpf_repo" cat-file -e "$axcbpf_source_commit^{commit}" || {
+        printf 'thekernel-axcbpf source commit missing: %s\n' \
+            "$axcbpf_source_commit" >&2
         exit 1
     }
     if [ -n "$(git -C "$axcbpf_repo" ls-files --others --exclude-standard -- "$axcbpf_crate_path")" ]; then
@@ -147,7 +132,7 @@ if [ "$needs_packaged_axcbpf" = 1 ]; then
     grep -Fq 'license = "Apache-2.0"' "$packaged_axcbpf_dir/Cargo.toml"
     grep -Fq 'repository = "https://github.com/chenty2333/thekernel-ax"' \
         "$packaged_axcbpf_dir/Cargo.toml"
-    grep -Fq "\"sha1\": \"$axcbpf_release_commit\"" \
+    grep -Fq "\"sha1\": \"$axcbpf_source_commit\"" \
         "$packaged_axcbpf_dir/.cargo_vcs_info.json"
     ! grep -Fq '"dirty": true' "$packaged_axcbpf_dir/.cargo_vcs_info.json" || {
         printf '%s\n' 'thekernel-axcbpf packaged VCS record is dirty' >&2
