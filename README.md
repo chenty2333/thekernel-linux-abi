@@ -45,7 +45,7 @@ policy leaves; task ownership and cross-subsystem integration stay with the
 caller rather than becoming hidden workspace-global state.
 
 The workspace name is not a facade package. Package names describe ownership
-boundaries, not complete Linux syscall parity. A real-consumer x86_64 gate
+boundaries, not complete Linux syscall parity. A real-consumer x86_64 check
 remains required before a release tag.
 
 ## Development
@@ -63,31 +63,34 @@ release commits recorded for the axcbpf package, rejects source drift, and
 packages the dependency from its real Git worktree. The path is development
 wiring only and must not survive in a normalized seccomp archive.
 
-The pull-request front door is:
+Routine checks use ordinary Cargo and project commands directly:
 
 ```bash
-./scripts/ci.sh all
+cargo +nightly fmt --all -- --check
+cargo +nightly clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +nightly test --workspace --all-features --locked
+scripts/check-provenance.sh
 ```
 
-It runs one nightly workspace quality pass plus one Rust-1.85 compatibility
-pass for the stable crates. Individual tiers remain available as
-`./scripts/ci.sh quality` and `./scripts/ci.sh msrv`.
+GitHub Actions exposes the rolling-nightly workspace result separately from the
+Rust 1.85 compatibility result. The compatibility job runs tests and
+`no_default_features` checks for crates that claim Rust 1.85 support. It does
+not treat an old Clippy version's evolving style policy as an MSRV condition.
 
-Release-only rustdoc, archive, and publish-dry-run checks are separate:
-
-```bash
-./scripts/ci.sh release
-```
+Release-only rustdoc, archive, and publish-dry-run operations are visible as
+separate steps in the manual `Release Check` workflow. They call the existing
+package tools directly instead of recursively rerunning source CI.
 
 The seccomp package proof uses the exact released `thekernel-axcbpf` source,
 provided through `AXCBPF_SOURCE_ROOT`; routine source quality continues to use
 the current sibling mechanism checkout. See `RELEASING.md` for the required
-revision and command.
+revision and commands.
 
-`thekernel-linux-rseq` is covered by workspace tests, no-default-feature checks,
-Rust 1.85, Clippy, and rustdoc. It is not yet included in package/publish helper
-lists because its release metadata and provenance asset set are incomplete;
-that source crate must not be described as release-qualified yet.
+`thekernel-linux-rseq` is covered by nightly workspace tests and Clippy,
+no-default-feature checks, Rust 1.85 tests/checks, and rustdoc. It is not yet
+included in package/publish helper lists because its release metadata and
+provenance asset set are incomplete; that source crate must not be described as
+release-qualified yet.
 
 ## Boundaries
 
@@ -132,7 +135,7 @@ that source crate must not be described as release-qualified yet.
 - Unsupported functionality is reported honestly; a package name is not a
   claim of complete Linux parity.
 
-The pre-publication package gate builds seccomp together with an exact packaged
+The pre-publication package check builds seccomp together with an exact packaged
 `thekernel-axcbpf` source artifact and tests only those unpacked archives. This
 does not pretend that the dependency already exists on crates.io. A final
 `cargo publish --dry-run` for seccomp remains deferred until

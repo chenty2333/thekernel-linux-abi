@@ -13,9 +13,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
 jobs:
-  quality:
-    name: Workspace quality and MSRV
+  nightly:
+    name: Nightly workspace quality
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     defaults:
@@ -45,16 +49,97 @@ jobs:
           toolchain: nightly
           components: clippy,rustfmt
 
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: thekernel-linux-abi -> target
+
+      - name: Format
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Lint workspace
+        run: >-
+          cargo +nightly clippy --workspace --all-targets --all-features
+          --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo +nightly test --workspace --all-features --locked
+
+      - name: Check no_std and alloc-only configurations
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            thekernel-linux-usercopy
+            thekernel-linux-vfs
+            thekernel-linux-fd
+            thekernel-linux-mm
+            thekernel-linux-io-uring
+            thekernel-linux-packet
+            thekernel-linux-rseq
+            thekernel-linux-process
+            thekernel-linux-signal
+            thekernel-linux-cred
+            thekernel-linux-seccomp
+          )
+          for package in "${packages[@]}"; do
+            cargo +nightly check -p "$package" --no-default-features --lib --locked
+          done
+          cargo +nightly check -p thekernel-linux-fd --features alloc --lib --locked
+
+      - name: Validate source provenance
+        run: scripts/check-provenance.sh
+
+  rust-1-85:
+    name: Stable crates on Rust 1.85
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: thekernel-linux-abi
+    steps:
+      - name: Checkout Linux ABI workspace
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: thekernel-linux-abi
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout pinned mechanism workspace
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: chenty2333/thekernel-ax
+          ref: a9a89b0545e8af88213b39fb0ba050dbfeafc0b3
+          path: thekernel-ax
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.85.0
-          components: clippy
 
       - name: Cache Cargo outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: thekernel-linux-abi -> target
 
-      - name: Run pull-request gate
-        run: ./scripts/ci.sh all
+      - name: Test stable crates and no_std configurations
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            thekernel-linux-usercopy
+            thekernel-linux-vfs
+            thekernel-linux-fd
+            thekernel-linux-mm
+            thekernel-linux-io-uring
+            thekernel-linux-packet
+            thekernel-linux-rseq
+          )
+          for package in "${packages[@]}"; do
+            cargo +1.85.0 test -p "$package" --all-targets --all-features --locked
+            cargo +1.85.0 check -p "$package" --no-default-features --lib --locked
+          done
+          cargo +1.85.0 check -p thekernel-linux-fd --features alloc --lib --locked

@@ -10,9 +10,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
 jobs:
   release:
-    name: Package and publish dry-run
+    name: Documentation, packages, and publish dry-runs
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -51,18 +55,83 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly
-          components: clippy,rustfmt
 
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.85.0
-          components: clippy
 
       - name: Cache Cargo outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: thekernel-linux-abi -> target
 
-      - name: Run release gate
-        run: ./scripts/ci.sh release
+      - name: Build release documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable_packages=(
+            thekernel-linux-usercopy
+            thekernel-linux-vfs
+            thekernel-linux-fd
+            thekernel-linux-mm
+            thekernel-linux-io-uring
+            thekernel-linux-packet
+            thekernel-linux-rseq
+          )
+          nightly_packages=(
+            thekernel-linux-process
+            thekernel-linux-signal
+            thekernel-linux-cred
+            thekernel-linux-seccomp
+          )
+          for package in "${stable_packages[@]}"; do
+            RUSTDOCFLAGS='-D warnings' \
+              cargo +1.85.0 doc -p "$package" --all-features --no-deps --locked
+          done
+          for package in "${nightly_packages[@]}"; do
+            RUSTDOCFLAGS='-D warnings' \
+              cargo +nightly doc -p "$package" --all-features --no-deps --locked
+          done
+
+      - name: Validate stable package artifacts
+        env:
+          CARGO_TOOLCHAIN: 1.85.0
+        run: |
+          scripts/test-package.sh \
+            thekernel-linux-usercopy \
+            thekernel-linux-vfs \
+            thekernel-linux-fd \
+            thekernel-linux-mm \
+            thekernel-linux-io-uring \
+            thekernel-linux-packet
+
+      - name: Validate nightly package artifacts
+        env:
+          CARGO_TOOLCHAIN: nightly
+        run: |
+          scripts/test-package.sh \
+            thekernel-linux-process \
+            thekernel-linux-signal \
+            thekernel-linux-cred \
+            thekernel-linux-seccomp
+
+      - name: Run stable publish dry-runs
+        env:
+          CARGO_TOOLCHAIN: 1.85.0
+        run: |
+          scripts/test-publish-dry-run.sh \
+            thekernel-linux-usercopy \
+            thekernel-linux-vfs \
+            thekernel-linux-fd \
+            thekernel-linux-mm \
+            thekernel-linux-io-uring \
+            thekernel-linux-packet
+
+      - name: Run nightly publish dry-runs
+        env:
+          CARGO_TOOLCHAIN: nightly
+        run: |
+          scripts/test-publish-dry-run.sh \
+            thekernel-linux-process \
+            thekernel-linux-cred
