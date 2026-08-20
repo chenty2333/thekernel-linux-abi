@@ -1,23 +1,22 @@
-name: CI
+name: Release Check
 
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: thekernel-linux-abi-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: thekernel-linux-abi-release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  quality:
-    name: Workspace quality and MSRV
+  release:
+    name: Package and publish dry-run
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
+    env:
+      AXCBPF_SOURCE_ROOT: ${{ github.workspace }}/thekernel-axcbpf-release
     defaults:
       run:
         shell: bash
@@ -39,6 +38,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Checkout exact released classic-BPF source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: chenty2333/thekernel-ax
+          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          path: thekernel-axcbpf-release
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
@@ -56,5 +64,5 @@ jobs:
         with:
           workspaces: thekernel-linux-abi -> target
 
-      - name: Run pull-request gate
-        run: ./scripts/ci.sh all
+      - name: Run release gate
+        run: ./scripts/ci.sh release

@@ -1,102 +1,173 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd -- "$script_dir/.." && pwd)
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+AXCBPF_SOURCE_ROOT=${AXCBPF_SOURCE_ROOT:-$ROOT/../thekernel-ax}
+cd "$ROOT"
 
-run_cargo() {
-    if [ -n "${CARGO_TOOLCHAIN:-}" ]; then
-        cargo "+$CARGO_TOOLCHAIN" "$@"
-    else
-        cargo "$@"
-    fi
+usage() {
+    cat <<'USAGE'
+Usage: scripts/ci.sh [quality|msrv|all|release]
+
+  quality  Nightly workspace format, lint, test, no_std, and provenance gate.
+  msrv     Rust 1.85 checks for crates that claim stable/MSRV support.
+  all      Run quality and msrv (the pull-request gate).
+  release  Run all, rustdoc, package checks, and publish dry-runs.
+
+The default command is all.
+USAGE
 }
 
-case "${CARGO_TOOLCHAIN:-nightly}" in
-    stable|1.85|1.85.0)
-        stable_only=1
+step() {
+    local name=$1
+    shift
+    printf '\n==> %s\n' "$name"
+    "$@"
+}
+
+stable_packages=(
+    thekernel-linux-usercopy
+    thekernel-linux-vfs
+    thekernel-linux-fd
+    thekernel-linux-mm
+    thekernel-linux-io-uring
+    thekernel-linux-packet
+    thekernel-linux-rseq
+)
+
+nightly_packages=(
+    thekernel-linux-process
+    thekernel-linux-signal
+    thekernel-linux-cred
+    thekernel-linux-seccomp
+)
+
+no_std_packages=(
+    thekernel-linux-usercopy
+    thekernel-linux-vfs
+    thekernel-linux-fd
+    thekernel-linux-mm
+    thekernel-linux-io-uring
+    thekernel-linux-packet
+    thekernel-linux-rseq
+    thekernel-linux-process
+    thekernel-linux-signal
+    thekernel-linux-cred
+    thekernel-linux-seccomp
+)
+
+quality() {
+    step 'rustfmt' cargo +nightly fmt --all -- --check
+    step 'workspace clippy' \
+        cargo +nightly clippy --workspace --all-targets --all-features \
+        --locked -- -D warnings
+    step 'workspace tests' \
+        cargo +nightly test --workspace --all-features --locked
+
+    local package
+    for package in "${no_std_packages[@]}"; do
+        step "$package no-default-features" \
+            cargo +nightly check -p "$package" --no-default-features --lib --locked
+    done
+    step 'fd alloc-only configuration' \
+        cargo +nightly check -p thekernel-linux-fd --features alloc --lib --locked
+    step 'source provenance' scripts/check-provenance.sh
+}
+
+msrv() {
+    local package
+    for package in "${stable_packages[@]}"; do
+        step "$package MSRV tests" \
+            cargo +1.85.0 test -p "$package" --all-targets --all-features --locked
+        step "$package MSRV clippy" \
+            cargo +1.85.0 clippy -p "$package" --all-targets --all-features \
+            --locked -- -D warnings
+        step "$package MSRV no-default-features" \
+            cargo +1.85.0 check -p "$package" --no-default-features --lib --locked
+    done
+    step 'fd MSRV alloc-only configuration' \
+        cargo +1.85.0 check -p thekernel-linux-fd --features alloc --lib --locked
+}
+
+release() {
+    quality
+    msrv
+
+    local package
+    for package in "${stable_packages[@]}"; do
+        step "$package MSRV rustdoc" \
+            env RUSTDOCFLAGS='-D warnings' \
+            cargo +1.85.0 doc -p "$package" --all-features --no-deps --locked
+    done
+    for package in "${nightly_packages[@]}"; do
+        step "$package nightly rustdoc" \
+            env RUSTDOCFLAGS='-D warnings' \
+            cargo +nightly doc -p "$package" --all-features --no-deps --locked
+    done
+
+    # Keep release-only packaging mechanics out of pull requests. These lists
+    # match the packages currently supported by the repository's package tools.
+    step 'stable package artifacts' \
+        env CARGO_TOOLCHAIN=1.85.0 \
+        scripts/test-package.sh \
+        thekernel-linux-usercopy \
+        thekernel-linux-vfs \
+        thekernel-linux-fd \
+        thekernel-linux-mm \
+        thekernel-linux-io-uring \
+        thekernel-linux-packet
+    step 'nightly package artifacts' \
+        env CARGO_TOOLCHAIN=nightly \
+        AXCBPF_SOURCE_ROOT="$AXCBPF_SOURCE_ROOT" \
+        scripts/test-package.sh \
+        thekernel-linux-process \
+        thekernel-linux-signal \
+        thekernel-linux-cred \
+        thekernel-linux-seccomp
+
+    step 'stable publish dry-runs' \
+        env CARGO_TOOLCHAIN=1.85.0 \
+        scripts/test-publish-dry-run.sh \
+        thekernel-linux-usercopy \
+        thekernel-linux-vfs \
+        thekernel-linux-fd \
+        thekernel-linux-mm \
+        thekernel-linux-io-uring \
+        thekernel-linux-packet
+    step 'nightly publish dry-runs' \
+        env CARGO_TOOLCHAIN=nightly \
+        scripts/test-publish-dry-run.sh \
+        thekernel-linux-process \
+        thekernel-linux-cred
+}
+
+command=${1:-all}
+if [ "$#" -gt 0 ]; then
+    shift
+fi
+case "$command" in
+    quality)
+        [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+        quality
+        ;;
+    msrv)
+        [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+        msrv
+        ;;
+    all)
+        [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+        quality
+        msrv
+        ;;
+    release)
+        [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+        release
+        ;;
+    -h|--help|help)
+        usage
         ;;
     *)
-        stable_only=0
+        usage >&2
+        exit 2
         ;;
 esac
-
-cd "$repo_root"
-run_cargo fmt --all -- --check
-
-if [ "$stable_only" = 1 ]; then
-    for package in thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd thekernel-linux-mm thekernel-linux-io-uring thekernel-linux-packet; do
-        run_cargo clippy -p "$package" --all-targets --all-features --locked -- -D warnings
-        run_cargo test -p "$package" --all-features --locked
-        RUSTDOCFLAGS='-D warnings' \
-            run_cargo doc -p "$package" --all-features --no-deps --locked
-    done
-else
-    run_cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-    run_cargo test --workspace --all-features --locked
-    RUSTDOCFLAGS='-D warnings' \
-        run_cargo doc --workspace --all-features --no-deps --locked
-    run_cargo check -p thekernel-linux-process --no-default-features --lib --locked
-    run_cargo check -p thekernel-linux-signal --no-default-features --lib --locked
-    run_cargo check -p thekernel-linux-cred --no-default-features --lib --locked
-    run_cargo check -p thekernel-linux-seccomp --no-default-features --lib --locked
-fi
-
-run_cargo check -p thekernel-linux-usercopy --no-default-features --lib --locked
-run_cargo check -p thekernel-linux-vfs --no-default-features --lib --locked
-run_cargo check -p thekernel-linux-fd --no-default-features --lib --locked
-run_cargo check -p thekernel-linux-fd --features alloc --lib --locked
-run_cargo check -p thekernel-linux-mm --no-default-features --lib --locked
-run_cargo check -p thekernel-linux-io-uring --no-default-features --lib --locked
-run_cargo check -p thekernel-linux-packet --no-default-features --lib --locked
-
-"$script_dir/check-provenance.sh"
-if [ "$stable_only" = 1 ]; then
-    package_list=(thekernel-linux-usercopy thekernel-linux-vfs thekernel-linux-fd thekernel-linux-mm thekernel-linux-io-uring thekernel-linux-packet)
-else
-    package_list=(
-        thekernel-linux-usercopy
-        thekernel-linux-process
-        thekernel-linux-signal
-        thekernel-linux-vfs
-        thekernel-linux-fd
-        thekernel-linux-cred
-        thekernel-linux-mm
-        thekernel-linux-io-uring
-        thekernel-linux-packet
-        thekernel-linux-seccomp
-    )
-fi
-CARGO_TOOLCHAIN=${CARGO_TOOLCHAIN:-} \
-PACKAGE_ALLOW_DIRTY=${PACKAGE_ALLOW_DIRTY:-0} \
-    "$script_dir/test-package.sh" "${package_list[@]}"
-
-if [ "$stable_only" = 1 ]; then
-    publish_list=(
-        thekernel-linux-usercopy
-        thekernel-linux-vfs
-        thekernel-linux-fd
-        thekernel-linux-mm
-        thekernel-linux-io-uring
-        thekernel-linux-packet
-    )
-else
-    # Seccomp is intentionally absent until the independently packaged
-    # thekernel-axcbpf 0.1.0 dependency is visible in the registry. Its exact
-    # local pre-publication archive is exercised by test-package.sh above.
-    publish_list=(
-        thekernel-linux-usercopy
-        thekernel-linux-process
-        thekernel-linux-vfs
-        thekernel-linux-fd
-        thekernel-linux-cred
-        thekernel-linux-mm
-        thekernel-linux-io-uring
-        thekernel-linux-packet
-    )
-fi
-CARGO_TOOLCHAIN=${CARGO_TOOLCHAIN:-} \
-PUBLISH_ALLOW_DIRTY=${PUBLISH_ALLOW_DIRTY:-0} \
-    "$script_dir/test-publish-dry-run.sh" "${publish_list[@]}"
-
-printf 'workspace-ci: PASS\n'
