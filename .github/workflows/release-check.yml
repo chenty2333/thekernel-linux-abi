@@ -1,0 +1,137 @@
+name: Release Check
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: thekernel-linux-abi-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Documentation, packages, and publish dry-runs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      AXCBPF_SOURCE_ROOT: ${{ github.workspace }}/thekernel-axcbpf-release
+    defaults:
+      run:
+        shell: bash
+        working-directory: thekernel-linux-abi
+    steps:
+      - name: Checkout Linux ABI workspace
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: thekernel-linux-abi
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout pinned mechanism workspace
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: chenty2333/thekernel-ax
+          ref: a9a89b0545e8af88213b39fb0ba050dbfeafc0b3
+          path: thekernel-ax
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout exact released classic-BPF source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: chenty2333/thekernel-ax
+          ref: 5c34536fd766b5f84f2fb8e6b18a2ab340659582
+          path: thekernel-axcbpf-release
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: thekernel-linux-abi -> target
+
+      - name: Build release documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable_packages=(
+            thekernel-linux-usercopy
+            thekernel-linux-vfs
+            thekernel-linux-fd
+            thekernel-linux-mm
+            thekernel-linux-io-uring
+            thekernel-linux-packet
+            thekernel-linux-rseq
+          )
+          nightly_packages=(
+            thekernel-linux-process
+            thekernel-linux-signal
+            thekernel-linux-cred
+            thekernel-linux-seccomp
+          )
+          for package in "${stable_packages[@]}"; do
+            RUSTDOCFLAGS='-D warnings' \
+              cargo +1.85.0 doc -p "$package" --all-features --no-deps --locked
+          done
+          for package in "${nightly_packages[@]}"; do
+            RUSTDOCFLAGS='-D warnings' \
+              cargo +nightly doc -p "$package" --all-features --no-deps --locked
+          done
+
+      - name: Validate stable package artifacts
+        env:
+          CARGO_TOOLCHAIN: 1.85.0
+        run: |
+          scripts/test-package.sh \
+            thekernel-linux-usercopy \
+            thekernel-linux-vfs \
+            thekernel-linux-fd \
+            thekernel-linux-mm \
+            thekernel-linux-io-uring \
+            thekernel-linux-packet
+
+      - name: Validate nightly package artifacts
+        env:
+          CARGO_TOOLCHAIN: nightly
+        run: |
+          scripts/test-package.sh \
+            thekernel-linux-process \
+            thekernel-linux-signal \
+            thekernel-linux-cred \
+            thekernel-linux-seccomp
+
+      - name: Run stable publish dry-runs
+        env:
+          CARGO_TOOLCHAIN: 1.85.0
+        run: |
+          scripts/test-publish-dry-run.sh \
+            thekernel-linux-usercopy \
+            thekernel-linux-vfs \
+            thekernel-linux-fd \
+            thekernel-linux-mm \
+            thekernel-linux-io-uring \
+            thekernel-linux-packet
+
+      - name: Run nightly publish dry-runs
+        env:
+          CARGO_TOOLCHAIN: nightly
+        run: |
+          scripts/test-publish-dry-run.sh \
+            thekernel-linux-process \
+            thekernel-linux-cred
