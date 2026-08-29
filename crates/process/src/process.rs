@@ -3,6 +3,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    any::Any,
     fmt,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
@@ -201,6 +202,11 @@ pub struct Process<Z> {
     registry: Weak<ProcessRegistry<Z>>,
     published: AtomicBool,
     pid: Pid,
+    /// Immutable kernel-owned identity retained for this process's entire
+    /// lifetime, including after its live runtime state has gone away.
+    identity: Arc<dyn Any + Send + Sync>,
+    /// The namespace-local reparenting domain this process belongs to.
+    reaper_scope: Arc<ReaperScope<Z>>,
     init: bool,
     is_zombie: AtomicBool,
     reaped: AtomicBool,
@@ -686,7 +692,25 @@ impl<Z> ProcessRegistry<Z> {
 /// Explicit owner of one process registry and its unique init identity.
 pub struct ProcessDomain<Z> {
     registry: Arc<ProcessRegistry<Z>>,
+    root_reaper_scope: Arc<ReaperScope<Z>>,
+}
+
+/// One independent reparenting domain, normally corresponding to one PID namespace.
+///
+/// A scope has exactly one init process.  Reparenting never selects a child
+/// subreaper from another scope and falls back to this init when no eligible
+/// ancestor exists in the scope.
+pub struct ReaperScope<Z> {
+    registry: Weak<ProcessRegistry<Z>>,
     init: SpinNoIrq<Option<Arc<Process<Z>>>>,
+    outer_scope: SpinNoIrq<Option<Weak<ReaperScope<Z>>>>,
+}
+
+impl<Z> ReaperScope<Z> {
+    /// Returns this scope's namespace-init process after it has been published.
+    pub fn init_process(&self) -> Option<Arc<Process<Z>>> {
+        self.init.lock().clone()
+    }
 }
 
 fn reparent_if_owned<Z>(
@@ -710,12 +734,29 @@ struct ReaperSelection<Z> {
 }
 
 fn select_reaper_for_exit_locked<Z>(
-    process: &Arc<Process<Z>>,
-    init: &Arc<Process<Z>>,
+    exiting: &Arc<Process<Z>>,
+    child: &Arc<Process<Z>>,
+    scope: &Arc<ReaperScope<Z>>,
 ) -> ReaperSelection<Z> {
-    let Some(first_ancestor) = process.parent() else {
+    let init = scope
+        .init_process()
+        .expect("every published process has a bound reaper-scope init");
+    // A scope's init is parented in its outer scope. It cannot reparent to
+    // itself when that outer parent exits; use the outer scope fallback.
+    let fallback = if Arc::ptr_eq(&init, child) {
+        scope
+            .outer_scope
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|outer| outer.init_process())
+            .expect("a non-root scope init has an outer-scope init")
+    } else {
+        init
+    };
+    let Some(first_ancestor) = exiting.parent() else {
         return ReaperSelection {
-            reaper: init.clone(),
+            reaper: fallback.clone(),
             retired_first_ancestor: None,
         };
     };
@@ -734,7 +775,7 @@ fn select_reaper_for_exit_locked<Z>(
         // topology guard prevents exit mutation and published registry removal,
         // keeping the registry's owning Arc alive.
         let candidate = unsafe { &*candidate_ptr };
-        if candidate.is_child_subreaper() {
+        if Arc::ptr_eq(&candidate.reaper_scope, scope) && candidate.is_child_subreaper() {
             let tg = candidate.tg.lock();
             if tg.live_threads != 0
                 && !tg.exit_prepared
@@ -762,6 +803,9 @@ fn select_reaper_for_exit_locked<Z>(
             }
         }
 
+        if !Arc::ptr_eq(&candidate.reaper_scope, scope) {
+            break;
+        }
         let parent = candidate.parent.lock();
         let next_ptr = (parent.strong_count() != 0).then(|| parent.as_ptr());
         drop(parent);
@@ -771,7 +815,7 @@ fn select_reaper_for_exit_locked<Z>(
         candidate_ptr = next_ptr;
     }
     ReaperSelection {
-        reaper: init.clone(),
+        reaper: fallback,
         retired_first_ancestor: Some(first_ancestor),
     }
 }
@@ -787,8 +831,13 @@ impl<Z> ProcessDomain<Z> {
         let registry =
             Arc::try_new(ProcessRegistry::new(limit)).map_err(|_| ProcessError::NoMemory)?;
         Ok(Self {
-            registry,
-            init: SpinNoIrq::new(None),
+            registry: registry.clone(),
+            root_reaper_scope: Arc::try_new(ReaperScope {
+                registry: Arc::downgrade(&registry),
+                init: SpinNoIrq::new(None),
+                outer_scope: SpinNoIrq::new(None),
+            })
+            .map_err(|_| ProcessError::NoMemory)?,
         })
     }
 
@@ -799,7 +848,23 @@ impl<Z> ProcessDomain<Z> {
 
     /// Returns the domain's init process after initialization.
     pub fn init_process(&self) -> Option<Arc<Process<Z>>> {
-        self.init.lock().clone()
+        self.root_reaper_scope.init_process()
+    }
+
+    /// Returns the scope used by processes created through the legacy domain
+    /// APIs. It is the domain's root PID namespace reparenting scope.
+    pub fn root_reaper_scope(&self) -> Arc<ReaperScope<Z>> {
+        self.root_reaper_scope.clone()
+    }
+
+    /// Creates an empty reparenting scope owned by this domain.
+    pub fn try_new_reaper_scope(&self) -> Result<Arc<ReaperScope<Z>>, ProcessError> {
+        Arc::try_new(ReaperScope {
+            registry: Arc::downgrade(&self.registry),
+            init: SpinNoIrq::new(None),
+            outer_scope: SpinNoIrq::new(None),
+        })
+        .map_err(|_| ProcessError::NoMemory)
     }
 
     /// Fallibly creates, publishes, and records the domain's unique init process.
@@ -808,15 +873,62 @@ impl<Z> ProcessDomain<Z> {
         pid: Pid,
         exit_signal: Option<u8>,
     ) -> Result<Arc<Process<Z>>, ProcessError> {
+        self.try_new_init_with_identity(pid, exit_signal, ())
+    }
+
+    /// Creates the domain init with immutable caller-owned identity metadata.
+    pub fn try_new_init_with_identity<I>(
+        &self,
+        pid: Pid,
+        exit_signal: Option<u8>,
+        identity: I,
+    ) -> Result<Arc<Process<Z>>, ProcessError>
+    where
+        I: Any + Send + Sync,
+    {
+        self.try_new_init_in_reaper_scope_with_identity(
+            &self.root_reaper_scope,
+            pid,
+            exit_signal,
+            identity,
+        )
+    }
+
+    /// Creates and publishes a root process for `scope`.
+    ///
+    /// Unlike [`prepare_fork_as_reaper_scope_init_with_identity`], this has no
+    /// parent and is therefore suitable only for the domain's root scope.
+    pub fn try_new_init_in_reaper_scope_with_identity<I>(
+        &self,
+        scope: &Arc<ReaperScope<Z>>,
+        pid: Pid,
+        exit_signal: Option<u8>,
+        identity: I,
+    ) -> Result<Arc<Process<Z>>, ProcessError>
+    where
+        I: Any + Send + Sync,
+    {
+        self.ensure_scope_owned(scope)?;
         let session = Session::try_new(pid, &self.registry)?;
         let group = ProcessGroup::try_new(pid, &session)?;
         let job_control =
             self.registry
                 .admit_session_group(session.clone(), group.clone(), true)?;
-        let process = Process::try_allocate(&self.registry, pid, true, None, group, exit_signal)?;
+        let identity: Arc<dyn Any + Send + Sync> =
+            Arc::try_new(identity).map_err(|_| ProcessError::NoMemory)?;
+        let process = Process::try_allocate(
+            &self.registry,
+            pid,
+            true,
+            None,
+            group,
+            exit_signal,
+            identity,
+            scope.clone(),
+        )?;
         let admission = self.registry.admit(process.clone())?;
 
-        let mut init = self.init.lock();
+        let mut init = scope.init.lock();
         if init.is_some() {
             drop(init);
             drop(admission);
@@ -840,10 +952,51 @@ impl<Z> ProcessDomain<Z> {
         pid: Pid,
         exit_signal: Option<u8>,
     ) -> Result<ProcessAdmission<Z>, ProcessError> {
+        self.prepare_fork_with_identity(parent, pid, exit_signal, ())
+    }
+
+    /// Reserves a child with immutable caller-owned identity metadata.
+    pub fn prepare_fork_with_identity<I>(
+        &self,
+        parent: &Arc<Process<Z>>,
+        pid: Pid,
+        exit_signal: Option<u8>,
+        identity: I,
+    ) -> Result<ProcessAdmission<Z>, ProcessError>
+    where
+        I: Any + Send + Sync,
+    {
+        self.prepare_fork_in_reaper_scope_with_identity(
+            parent,
+            &parent.reaper_scope,
+            pid,
+            exit_signal,
+            identity,
+        )
+    }
+
+    /// Reserves a child in an already initialized reparenting scope.
+    pub fn prepare_fork_in_reaper_scope_with_identity<I>(
+        &self,
+        parent: &Arc<Process<Z>>,
+        scope: &Arc<ReaperScope<Z>>,
+        pid: Pid,
+        exit_signal: Option<u8>,
+        identity: I,
+    ) -> Result<ProcessAdmission<Z>, ProcessError>
+    where
+        I: Any + Send + Sync,
+    {
         self.registry.ensure_published(parent)?;
+        self.ensure_scope_owned(scope)?;
+        if scope.init_process().is_none() {
+            return Err(ProcessError::NotInitialized);
+        }
         if parent.is_zombie() {
             return Err(ProcessError::NotLive);
         }
+        let identity: Arc<dyn Any + Send + Sync> =
+            Arc::try_new(identity).map_err(|_| ProcessError::NoMemory)?;
         let process = Process::try_allocate(
             &self.registry,
             pid,
@@ -851,8 +1004,58 @@ impl<Z> ProcessDomain<Z> {
             Some(parent),
             parent.group(),
             exit_signal,
+            identity,
+            scope.clone(),
         )?;
         self.registry.admit(process)
+    }
+
+    /// Reserves the init process of a newly created child reparenting scope.
+    /// Its ordinary parent remains `parent`, while its descendants reparent to
+    /// itself or an eligible subreaper in `scope`.
+    pub fn prepare_fork_as_reaper_scope_init_with_identity<I>(
+        &self,
+        parent: &Arc<Process<Z>>,
+        scope: &Arc<ReaperScope<Z>>,
+        pid: Pid,
+        exit_signal: Option<u8>,
+        identity: I,
+    ) -> Result<ScopedInitProcessAdmission<Z>, ProcessError>
+    where
+        I: Any + Send + Sync,
+    {
+        self.registry.ensure_published(parent)?;
+        self.ensure_scope_owned(scope)?;
+        if parent.is_zombie() || scope.init_process().is_some() {
+            return Err(ProcessError::NotLive);
+        }
+        let identity: Arc<dyn Any + Send + Sync> =
+            Arc::try_new(identity).map_err(|_| ProcessError::NoMemory)?;
+        let process = Process::try_allocate(
+            &self.registry,
+            pid,
+            true,
+            Some(parent),
+            parent.group(),
+            exit_signal,
+            identity,
+            scope.clone(),
+        )?;
+        let admission = self.registry.admit(process)?;
+        Ok(ScopedInitProcessAdmission {
+            admission,
+            scope: scope.clone(),
+            outer_scope: parent.reaper_scope.clone(),
+        })
+    }
+
+    fn ensure_scope_owned(&self, scope: &Arc<ReaperScope<Z>>) -> Result<(), ProcessError> {
+        scope
+            .registry
+            .upgrade()
+            .filter(|registry| Arc::ptr_eq(registry, &self.registry))
+            .map(|_| ())
+            .ok_or(ProcessError::WrongDomain)
     }
 
     /// Reserves a thread membership in an already published live process.
@@ -883,7 +1086,7 @@ impl<Z> ProcessDomain<Z> {
         exit_code: i32,
     ) -> Result<ThreadExitTransition<Z>, ProcessError> {
         self.registry.ensure_published(process)?;
-        let init = self.init_process().ok_or(ProcessError::NotInitialized)?;
+        self.init_process().ok_or(ProcessError::NotInitialized)?;
         let topology = self.registry.topology.lock();
         let mut tg = process.tg.lock();
         let node = tg.threads.find(&tid).get().and_then(|thread| {
@@ -943,7 +1146,6 @@ impl<Z> ProcessDomain<Z> {
         Ok(ThreadExitTransition::FinalThread(ProcessExitAdmission {
             registry: self.registry.clone(),
             process: process.clone(),
-            init,
             departing_thread: Some(departing_thread),
             committed: false,
         }))
@@ -963,7 +1165,7 @@ impl<Z> ProcessDomain<Z> {
         if process.is_init() || process.is_zombie() {
             return Err(ProcessError::NotLive);
         }
-        let init = self.init_process().ok_or(ProcessError::NotInitialized)?;
+        self.init_process().ok_or(ProcessError::NotInitialized)?;
         let topology = self.registry.topology.lock();
         let mut tg = process.tg.lock();
         if tg.memberships != 0 {
@@ -981,7 +1183,6 @@ impl<Z> ProcessDomain<Z> {
         Ok(ProcessExitAdmission {
             registry: self.registry.clone(),
             process: process.clone(),
-            init,
             departing_thread: None,
             committed: false,
         })
@@ -1285,7 +1486,6 @@ impl<Z> CommittedProcessExit<Z> {
 pub struct ProcessExitAdmission<Z> {
     registry: Arc<ProcessRegistry<Z>>,
     process: Arc<Process<Z>>,
-    init: Arc<Process<Z>>,
     departing_thread: Option<Arc<ThreadNode>>,
     committed: bool,
 }
@@ -1355,21 +1555,19 @@ impl<Z> ProcessExitAdmission<Z> {
         // ancestor for the remaining children.
         let mut children = self.registry.processes_through_current_max();
         let mut finished = false;
+        let mut deferred_child = None;
         while !finished {
             let mut reparented = [const { None }; REPARENT_BATCH_LIMIT];
             let mut retired_scanned = [const { None }; REPARENT_BATCH_LIMIT];
             let mut retired_parents = [const { None }; REPARENT_BATCH_LIMIT];
             let mut retired_terminal = None;
             let topology = self.registry.topology.lock();
-            let selection = select_reaper_for_exit_locked(&self.process, &self.init);
-            let reaper = selection.reaper;
-            let retired_first_ancestor = selection.retired_first_ancestor;
-            let reaper_weak = Arc::downgrade(&reaper);
             let mut reparented_len = 0;
             let mut retired_scanned_len = 0;
             let mut batch_len = 0;
+            let mut batch_reaper = None;
             while batch_len < REPARENT_BATCH_LIMIT {
-                let child = match children.next_raw() {
+                let child = match deferred_child.take().map(ProcessCursorStep::Process).unwrap_or_else(|| children.next_raw()) {
                     ProcessCursorStep::Process(child) => child,
                     ProcessCursorStep::Finished(retired) => {
                         retired_terminal = retired;
@@ -1383,17 +1581,48 @@ impl<Z> ProcessExitAdmission<Z> {
                     retired_scanned_len += 1;
                     continue;
                 }
+                if child.parent.lock().as_ptr() != Arc::as_ptr(&self.process) {
+                    retired_scanned[retired_scanned_len] = Some(child);
+                    retired_scanned_len += 1;
+                    continue;
+                }
+                let selection = select_reaper_for_exit_locked(
+                    &self.process,
+                    &child,
+                    &child.reaper_scope,
+                );
+                let reaper = selection.reaper;
+                let retired_first_ancestor = selection.retired_first_ancestor;
+                if batch_reaper
+                    .as_ref()
+                    .is_some_and(|current: &Arc<Process<Z>>| !Arc::ptr_eq(current, &reaper))
+                {
+                    deferred_child = Some(child);
+                    drop(retired_first_ancestor);
+                    drop(reaper);
+                    break;
+                }
+                let reaper_weak = Arc::downgrade(&reaper);
                 if let Some(old_parent) = reparent_if_owned(&child, &self.process, &reaper_weak) {
                     let was_zombie = child.is_zombie();
                     retired_parents[reparented_len] = Some(old_parent);
                     reparented[reparented_len] = Some(ReparentedProcess { child, was_zombie });
                     reparented_len += 1;
+                    if batch_reaper.is_none() {
+                        batch_reaper = Some(reaper.clone());
+                    }
+                    drop(reaper_weak);
+                    drop(retired_first_ancestor);
+                    drop(reaper);
                     if was_zombie {
                         // Preserve the existing prompt inherited-zombie wakeup
                         // boundary instead of delaying it behind a full batch.
                         break;
                     }
                 } else {
+                    drop(reaper_weak);
+                    drop(retired_first_ancestor);
+                    drop(reaper);
                     retired_scanned[retired_scanned_len] = Some(child);
                     retired_scanned_len += 1;
                 }
@@ -1405,15 +1634,13 @@ impl<Z> ProcessExitAdmission<Z> {
             // Weak/Arc reference-count decrements, arbitrary adapter work, and
             // inherited-zombie notification all happen after the IRQ-disabled
             // core topology section. The fixed arrays themselves never allocate.
-            drop(reaper_weak);
             drop(retired_parents);
             drop(retired_scanned);
             drop(retired_terminal);
-            drop(retired_first_ancestor);
 
             if reparented_len != 0 {
                 let batch = ProcessReparentBatch {
-                    reaper,
+                    reaper: batch_reaper.expect("reparented batch has a selected reaper"),
                     reparented,
                     len: reparented_len,
                 };
@@ -1422,8 +1649,6 @@ impl<Z> ProcessExitAdmission<Z> {
                     inherited_zombie(moved.child().clone());
                 }
                 drop(batch);
-            } else {
-                drop(reaper);
             }
         }
 
@@ -1589,12 +1814,16 @@ impl<Z> Process<Z> {
         parent: Option<&Arc<Process<Z>>>,
         group: Arc<ProcessGroup<Z>>,
         exit_signal: Option<u8>,
+        identity: Arc<dyn Any + Send + Sync>,
+        reaper_scope: Arc<ReaperScope<Z>>,
     ) -> Result<Arc<Self>, ProcessError> {
         Arc::try_new(Self {
             registry_link: RBTreeAtomicLink::new(),
             registry: Arc::downgrade(registry),
             published: AtomicBool::new(false),
             pid,
+            identity,
+            reaper_scope,
             init,
             is_zombie: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
@@ -1611,6 +1840,16 @@ impl<Z> Process<Z> {
     /// The process ID.
     pub fn pid(&self) -> Pid {
         self.pid
+    }
+
+    /// Returns immutable process identity metadata of the requested type.
+    pub fn identity<T: Any>(&self) -> Option<&T> {
+        self.identity.downcast_ref()
+    }
+
+    /// Returns the process's immutable reparenting scope.
+    pub fn reaper_scope(&self) -> &Arc<ReaperScope<Z>> {
+        &self.reaper_scope
     }
 
     /// Returns whether this is the unique init process of its domain.
@@ -1957,6 +2196,75 @@ impl<Z> Drop for JobControlAdmission<Z> {
         if !self.committed {
             self.registry.remove_empty_group(&self.group);
         }
+    }
+}
+
+/// Reserved init process for a newly created reparenting scope.
+///
+/// The scope is bound immediately before release-publication, so a published
+/// scoped process can never be observed without its fallback reaper.
+pub struct ScopedInitProcessAdmission<Z> {
+    admission: ProcessAdmission<Z>,
+    scope: Arc<ReaperScope<Z>>,
+    outer_scope: Arc<ReaperScope<Z>>,
+}
+
+impl<Z> ScopedInitProcessAdmission<Z> {
+    /// Returns the unpublished namespace-init process object.
+    pub fn process(&self) -> &Arc<Process<Z>> {
+        self.admission.process()
+    }
+
+    /// Reserves and couples this init's initial thread to publication.
+    pub fn prepare_initial_thread(
+        self,
+        tid: Pid,
+    ) -> Result<ScopedInitialProcessAdmission<Z>, ProcessError> {
+        Ok(ScopedInitialProcessAdmission {
+            admission: self.admission.prepare_initial_thread(tid)?,
+            scope: self.scope,
+            outer_scope: self.outer_scope,
+        })
+    }
+
+    /// Publishes this scope init without an initial thread.
+    pub fn commit(mut self) {
+        self.bind();
+        self.admission.commit();
+    }
+
+    fn bind(&mut self) {
+        let mut init = self.scope.init.lock();
+        assert!(init.is_none(), "a reaper scope has exactly one init");
+        *init = Some(self.admission.process().clone());
+        drop(init);
+        *self.scope.outer_scope.lock() = Some(Arc::downgrade(&self.outer_scope));
+    }
+}
+
+/// Scoped counterpart to [`InitialProcessAdmission`].
+pub struct ScopedInitialProcessAdmission<Z> {
+    admission: InitialProcessAdmission<Z>,
+    scope: Arc<ReaperScope<Z>>,
+    outer_scope: Arc<ReaperScope<Z>>,
+}
+
+impl<Z> ScopedInitialProcessAdmission<Z> {
+    /// Returns the unpublished namespace-init process object.
+    pub fn process(&self) -> &Arc<Process<Z>> {
+        self.admission.process()
+    }
+
+    /// Atomically publishes this scope init and its initial thread.
+    pub fn commit(self) -> Result<Arc<Process<Z>>, ProcessError> {
+        let mut init = self.scope.init.lock();
+        if init.is_some() {
+            return Err(ProcessError::AlreadyExists);
+        }
+        *init = Some(self.admission.process().clone());
+        drop(init);
+        *self.scope.outer_scope.lock() = Some(Arc::downgrade(&self.outer_scope));
+        Ok(self.admission.commit())
     }
 }
 
@@ -2371,5 +2679,58 @@ mod tests {
         domain.prepare_fork(&init, 40, None).unwrap().commit();
         let seen: Vec<_> = cursor.map(|process| process.pid()).collect();
         assert_eq!(seen, [2, 10, 30]);
+    }
+
+    #[test]
+    fn reparenting_is_scoped_and_never_mixes_handoff_reapers() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let root = domain.try_new_init(1, None).unwrap();
+        domain.prepare_thread(&root, 1).unwrap().commit().unwrap();
+        root.set_child_subreaper(true);
+        let parent = domain
+            .prepare_fork(&root, 2, None)
+            .unwrap()
+            .prepare_initial_thread(2)
+            .unwrap()
+            .commit();
+        let scope = domain.try_new_reaper_scope().unwrap();
+        let scoped_init = domain
+            .prepare_fork_as_reaper_scope_init_with_identity(&parent, &scope, 3, None, ())
+            .unwrap()
+            .prepare_initial_thread(3)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let scoped_child = domain
+            .prepare_fork_in_reaper_scope_with_identity(&parent, &scope, 4, None, ())
+            .unwrap()
+            .prepare_initial_thread(4)
+            .unwrap()
+            .commit();
+        let root_child = domain
+            .prepare_fork(&parent, 5, None)
+            .unwrap()
+            .prepare_initial_thread(5)
+            .unwrap()
+            .commit();
+
+        let exit = match domain.exit_thread(&parent, 2, 0).unwrap() {
+            ThreadExitTransition::FinalThread(exit) => exit,
+            _ => panic!("parent must exit"),
+        };
+        exit.commit_with_reparent_handoff(Arc::new(()), |_| {}, |batch| {
+            for moved in batch.reparented() {
+                let expected = if Arc::ptr_eq(moved.child(), &scoped_child) {
+                    &scoped_init
+                } else {
+                    &root
+                };
+                assert!(Arc::ptr_eq(batch.reaper(), expected));
+            }
+        });
+
+        assert!(Arc::ptr_eq(&scoped_child.parent().unwrap(), &scoped_init));
+        assert!(Arc::ptr_eq(&scoped_init.parent().unwrap(), &root));
+        assert!(Arc::ptr_eq(&root_child.parent().unwrap(), &root));
     }
 }

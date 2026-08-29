@@ -21,7 +21,8 @@ pub type Pid = u32;
 pub use process::{
     CommittedProcessExit, CreatedSession, ExitOutcome, InitialProcessAdmission,
     PROCESS_MEMBERSHIP_LIMIT, Process, ProcessAdmission, ProcessDomain, ProcessError,
-    ProcessExitAdmission, ProcessRegistry, ProcessReparentBatch, Processes, ReparentedProcess,
+    ProcessExitAdmission, ProcessRegistry, ProcessReparentBatch, Processes, ReaperScope,
+    ReparentedProcess, ScopedInitialProcessAdmission, ScopedInitProcessAdmission,
     ThreadAdmission, ThreadExitOutcome, ThreadExitTransition, ThreadIds, ThreadPublicationOutcome,
 };
 pub use process_group::ProcessGroup;
