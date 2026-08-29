@@ -116,7 +116,7 @@ impl CredentialIds {
     }
 }
 
-/// Immutable, sorted, deduplicated supplementary groups.
+/// Immutable, sorted supplementary groups.
 #[derive(Debug)]
 pub struct GroupInfo {
     groups: Vec<Kgid>,
@@ -129,7 +129,6 @@ impl GroupInfo {
             return Err(CredError::InvalidInput);
         }
         groups.sort_unstable();
-        groups.dedup();
         Arc::try_new(Self { groups }).map_err(|_| CredError::NoMemory)
     }
 
@@ -941,9 +940,9 @@ mod tests {
     }
 
     #[test]
-    fn group_info_is_sorted_deduplicated_and_bounded() {
+    fn group_info_is_sorted_preserves_duplicates_and_is_bounded() {
         let groups = GroupInfo::try_new(vec![kgid(3), kgid(1), kgid(3), kgid(2)]).unwrap();
-        assert_eq!(groups.as_slice(), &[kgid(1), kgid(2), kgid(3)]);
+        assert_eq!(groups.as_slice(), &[kgid(1), kgid(2), kgid(3), kgid(3)]);
         assert!(groups.contains(kgid(2)));
 
         let too_many = vec![kgid(1); NGROUPS_MAX as usize + 1];
