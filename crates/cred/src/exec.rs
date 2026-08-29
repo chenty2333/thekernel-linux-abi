@@ -277,6 +277,7 @@ pub struct ExecCredentialEffects {
     aux_identity: ExecAuxIdentity,
     dumpability: ExecDumpability,
     clear_pdeath_signal: bool,
+    clear_personality_on_setid: bool,
 }
 
 impl ExecCredentialEffects {
@@ -294,6 +295,12 @@ impl ExecCredentialEffects {
     /// cleared at commit.
     pub const fn clear_pdeath_signal(self) -> bool {
         self.clear_pdeath_signal
+    }
+
+    /// Reports Linux `bprm->per_clear`: only an honored set-ID transition or
+    /// an actual permitted-capability gain clears these personality flags.
+    pub const fn clear_personality_on_setid(self) -> bool {
+        self.clear_personality_on_setid
     }
 
     /// Reports whether secure-exec treatment is required.
@@ -459,11 +466,9 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
 
     // bprm_fill_uid() applies set-ID before commoncap's unsafe-exec downgrade.
     // Both nosuid and no_new_privs prevent the inode bits from taking effect.
+    let setid_admitted = input.mount_privilege.honors_file_privilege() && !old.no_new_privs();
     let mut ids = old_ids;
-    if input.mount_privilege.honors_file_privilege()
-        && !old.no_new_privs()
-        && let Some(owner) = mapped_owner
-    {
+    if setid_admitted && let Some(owner) = mapped_owner {
         if set_uid {
             ids.euid = owner.uid;
         }
@@ -531,8 +536,11 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
 
     let permitted_gained_before_unsafe = any_bits_outside(permitted_without_ambient, old_permitted);
     let privilege_sensitive = id_changed || permitted_gained_before_unsafe;
+    let setid_downgraded = privilege_sensitive
+        && (old.no_new_privs() || input.trace_state.suppresses_privilege())
+        && (old.no_new_privs() || !old.has_effective_capability_in_own_user_ns(CAP_SETUID));
     if privilege_sensitive && (old.no_new_privs() || input.trace_state.suppresses_privilege()) {
-        if old.no_new_privs() || !old.has_effective_capability_in_own_user_ns(CAP_SETUID) {
+        if setid_downgraded {
             ids.euid = ids.ruid;
             ids.egid = ids.rgid;
         }
@@ -577,6 +585,11 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
     let changed_effective_or_fs_ids =
         changed_effective_ids || old_ids.fsuid != ids.fsuid || old_ids.fsgid != ids.fsgid;
     let permitted_gained = any_bits_outside(capabilities.permitted(), old_permitted);
+    // bprm_fill_uid()/cap_bprm_creds_from_file decide per_clear before the
+    // later unsafe-exec downgrade.  Do not retract it when ptrace subsequently
+    // restores IDs or intersects the final permitted set.
+    let honored_setuid = setid_admitted && set_uid;
+    let honored_setgid = setid_admitted && set_gid;
     let capabilities_beyond_ambient =
         any_bits_outside(capabilities.permitted(), capabilities.ambient());
     let non_root_file_privilege =
@@ -597,6 +610,9 @@ pub fn derive_exec_credential<N: ExecUserNamespaceView>(
         aux_identity: ExecAuxIdentity::from_ids(ids, &uid_map, &gid_map, secure_exec),
         dumpability,
         clear_pdeath_signal: secure_exec || changed_effective_or_fs_ids || permitted_gained,
+        clear_personality_on_setid: honored_setuid
+            || honored_setgid
+            || permitted_gained_before_unsafe,
     };
     let revalidation = ExecPtraceRevalidation {
         privilege_sensitive,
@@ -1994,6 +2010,7 @@ mod tests {
                 aux_identity: ExecAuxIdentity::trusted_boot(),
                 dumpability: ExecDumpability::UserDumpable,
                 clear_pdeath_signal: false,
+                clear_personality_on_setid: false,
             },
             revalidation: ExecPtraceRevalidation {
                 privilege_sensitive: false,
