@@ -2311,7 +2311,10 @@ pub enum SchedulerSecurityOperation {
     },
     /// Change the target CPU-affinity mask.
     SetAffinity,
-    /// Change the target nice value against one frozen `RLIMIT_NICE` value.
+    /// Change the target nice value against one frozen caller `RLIMIT_NICE`
+    /// value.  The ownership gate is evaluated against the target user
+    /// namespace, while the priority-raise exemption is evaluated in the
+    /// caller's current user namespace, matching `set_user_nice()`.
     SetNice {
         /// Current nice value.
         current_nice: i8,
@@ -2777,15 +2780,18 @@ fn rlimit_allows_nice(rlimit_nice: u64, requested_nice: i8) -> bool {
 pub fn commoncap_scheduler<N: UserNamespaceView>(
     context: &SchedulerSecurityContext<'_, N>,
 ) -> Result<(), AuthorizationError> {
-    let capable = ns_capable(context.actor, context.target.user_ns(), CAP_SYS_NICE);
-    if !context.owner_match && !capable {
+    // Permission to operate on another task is relative to the target's user
+    // namespace.  This is deliberately distinct from `can_nice()`: that
+    // check asks whether the caller is capable in its *own* current namespace.
+    let target_capable = ns_capable(context.actor, context.target.user_ns(), CAP_SYS_NICE);
+    if !context.owner_match && !target_capable {
         return Err(AuthorizationError::NotPermitted);
     }
 
     match context.operation {
         SchedulerSecurityOperation::SetPolicy { realtime }
         | SchedulerSecurityOperation::SetParam { realtime }
-            if realtime && !capable =>
+            if realtime && !target_capable =>
         {
             Err(AuthorizationError::NotPermitted)
         }
@@ -2794,7 +2800,7 @@ pub fn commoncap_scheduler<N: UserNamespaceView>(
             requested_nice,
             rlimit_nice,
         } if requested_nice < current_nice
-            && !capable
+            && !ns_capable(context.actor, context.actor.user_ns(), CAP_SYS_NICE)
             && !rlimit_allows_nice(rlimit_nice, requested_nice) =>
         {
             Err(AuthorizationError::AccessDenied)
@@ -3871,6 +3877,38 @@ mod tests {
             SchedulerSecurityOperation::SetNice {
                 current_nice: 0,
                 requested_nice: 5,
+                rlimit_nice: 0,
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn scheduler_nice_uses_callers_current_namespace_capability() {
+        let root_namespace = MockNamespace::root();
+        let root = root_credential(root_namespace.clone());
+        let child_namespace = MockNamespace::child(
+            &root_namespace,
+            Kuid::INITIAL_ROOT,
+            Some(Kuid::INITIAL_ROOT),
+        );
+        let child_root = Credential::try_with_user_namespace(&root, child_namespace).unwrap();
+        let actor = credential_with_identity_and_caps(
+            &child_root,
+            1000,
+            &[CAP_SYS_NICE],
+            &[CAP_SYS_NICE],
+        );
+        let target = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+
+        // The target namespace capability gate is irrelevant for an owned
+        // task; can_nice instead observes the actor's current namespace.
+        commoncap_scheduler(&SchedulerSecurityContext::new(
+            &actor,
+            &target,
+            SchedulerSecurityOperation::SetNice {
+                current_nice: 0,
+                requested_nice: -20,
                 rlimit_nice: 0,
             },
         ))
