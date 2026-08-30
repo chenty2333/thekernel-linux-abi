@@ -13,7 +13,7 @@ use core::{
 };
 
 use linux_raw_sys::general::{
-    CAP_KILL, CAP_LAST_CAP, CAP_SYS_NICE, CAP_SYS_PTRACE, SIGCONT,
+    CAP_KILL, CAP_LAST_CAP, CAP_SYS_NICE, CAP_SYS_PTRACE, RLIM_INFINITY, SIGCONT,
     XATTR_NAME_MAX as LINUX_XATTR_NAME_MAX,
 };
 
@@ -2339,6 +2339,12 @@ pub enum SchedulerSecurityOperation {
     SetParam {
         /// Whether the target policy is a real-time class.
         realtime: bool,
+        /// RT priority observed in the same scheduler snapshot as the policy.
+        old_rt_priority: u8,
+        /// Requested RT priority.
+        new_rt_priority: u8,
+        /// Frozen target task soft `RLIMIT_RTPRIO` value.
+        rlimit_rtprio: u64,
     },
     /// Change the target CPU-affinity mask.
     SetAffinity,
@@ -2843,6 +2849,7 @@ pub fn commoncap_scheduler<N: UserNamespaceView>(
     // namespace.  This is deliberately distinct from `can_nice()`: that
     // check asks whether the caller is capable in its *own* current namespace.
     let target_capable = ns_capable(context.actor, context.target.user_ns(), CAP_SYS_NICE);
+    let caller_capable = ns_capable(context.actor, context.actor.user_ns(), CAP_SYS_NICE);
     if !context.owner_match && !target_capable {
         return Err(AuthorizationError::NotPermitted);
     }
@@ -2889,10 +2896,19 @@ pub fn commoncap_scheduler<N: UserNamespaceView>(
         {
             Err(AuthorizationError::NotPermitted)
         }
-        // `sched_setparam()` keeps its established all-real-time capability
-        // rule: it has no old/new priority snapshot through which to apply
-        // `RLIMIT_RTPRIO`.
-        SchedulerSecurityOperation::SetParam { realtime } if realtime && !target_capable => {
+        // `sched_setparam()` may raise an existing real-time priority only
+        // when the caller's current namespace capability or the target's
+        // frozen `RLIMIT_RTPRIO` admits the requested value.
+        SchedulerSecurityOperation::SetParam {
+            realtime: true,
+            old_rt_priority,
+            new_rt_priority,
+            rlimit_rtprio,
+        } if new_rt_priority > old_rt_priority
+            && !caller_capable
+            && rlimit_rtprio != RLIM_INFINITY as i64 as u64
+            && new_rt_priority as u64 > rlimit_rtprio =>
+        {
             Err(AuthorizationError::NotPermitted)
         }
         SchedulerSecurityOperation::SetNice {
@@ -4028,11 +4044,16 @@ mod tests {
         ))
         .unwrap();
 
-        // Preserve `SetParam`'s existing operation shape and capability rule.
+        // An unchanged non-RT parameter is always admitted.
         commoncap_scheduler(&SchedulerSecurityContext::new(
             &actor,
             &target,
-            SchedulerSecurityOperation::SetParam { realtime: false },
+            SchedulerSecurityOperation::SetParam {
+                realtime: false,
+                old_rt_priority: 0,
+                new_rt_priority: 0,
+                rlimit_rtprio: 0,
+            },
         ))
         .unwrap();
 
@@ -4061,7 +4082,72 @@ mod tests {
         commoncap_scheduler(&SchedulerSecurityContext::new(
             &actor,
             &target,
-            SchedulerSecurityOperation::SetParam { realtime: true },
+            SchedulerSecurityOperation::SetParam {
+                realtime: true,
+                old_rt_priority: 1,
+                new_rt_priority: 2,
+                rlimit_rtprio: 0,
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn scheduler_setparam_uses_target_limit_and_callers_namespace_capability() {
+        let root_namespace = MockNamespace::root();
+        let root = root_credential(root_namespace.clone());
+        let actor = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let target = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+
+        // An unprivileged owner may raise only to its target task's frozen
+        // soft limit. The context is intentionally scalar: the kernel must
+        // source it from the target task while holding the scheduler tuple.
+        commoncap_scheduler(&SchedulerSecurityContext::new(
+            &actor,
+            &target,
+            SchedulerSecurityOperation::SetParam {
+                realtime: true,
+                old_rt_priority: 1,
+                new_rt_priority: 2,
+                rlimit_rtprio: 2,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            commoncap_scheduler(&SchedulerSecurityContext::new(
+                &actor,
+                &target,
+                SchedulerSecurityOperation::SetParam {
+                    realtime: true,
+                    old_rt_priority: 1,
+                    new_rt_priority: 2,
+                    rlimit_rtprio: 1,
+                },
+            )),
+            Err(AuthorizationError::NotPermitted)
+        );
+
+        let child_namespace = MockNamespace::child(
+            &root_namespace,
+            Kuid::INITIAL_ROOT,
+            Some(Kuid::INITIAL_ROOT),
+        );
+        let child_root = Credential::try_with_user_namespace(&root, child_namespace).unwrap();
+        let child_actor =
+            credential_with_identity_and_caps(&child_root, 1000, &[CAP_SYS_NICE], &[CAP_SYS_NICE]);
+
+        // For an owned target, the rlimit exemption is capability in the
+        // caller's current namespace, rather than capability in the target's
+        // ancestor namespace.
+        commoncap_scheduler(&SchedulerSecurityContext::new(
+            &child_actor,
+            &target,
+            SchedulerSecurityOperation::SetParam {
+                realtime: true,
+                old_rt_priority: 1,
+                new_rt_priority: 2,
+                rlimit_rtprio: 0,
+            },
         ))
         .unwrap();
     }
@@ -4127,7 +4213,12 @@ mod tests {
         commoncap_scheduler(&SchedulerSecurityContext::new(
             &root,
             &child_target,
-            SchedulerSecurityOperation::SetParam { realtime: true },
+            SchedulerSecurityOperation::SetParam {
+                realtime: true,
+                old_rt_priority: 1,
+                new_rt_priority: 2,
+                rlimit_rtprio: 0,
+            },
         ))
         .unwrap();
 
