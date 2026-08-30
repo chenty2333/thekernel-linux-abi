@@ -72,7 +72,7 @@ pub use security::{
     InodeSetattrPrivilegeCleanup, InodeSetattrProposal, InodeSymlinkContext, InodeUnlinkContext,
     InodeXattrContext, InodeXattrOperation, PreparedCredentialCapabilityContext,
     PreparedCredentialCapabilityOperation, PtraceAccessContext, PtraceAccessKind,
-    PtraceCredentialKind, PtraceTracemeContext, SchedulerSecurityContext,
+    PtraceCredentialKind, PtraceTracemeContext, SchedulerSecurityContext, TaskGetSchedulerContext,
     SchedulerSecurityOperation, SignalCoreAuthorization, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
     SignalSecuritySource, XATTR_NAME_MAX, XattrSetFlags, XattrValueClass,

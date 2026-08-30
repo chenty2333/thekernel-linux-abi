@@ -2325,6 +2325,33 @@ pub enum SchedulerSecurityOperation {
     },
 }
 
+/// Immutable actor/target pair presented to Linux `security_task_getscheduler`.
+///
+/// Unlike scheduler mutation authorization this hook has no commoncap gate:
+/// the caller has already resolved the exact task, and each LSM decides
+/// whether its scheduling policy may be observed.
+pub struct TaskGetSchedulerContext<'a, N: UserNamespaceView> {
+    actor: &'a Credential<N>,
+    target: &'a Credential<N>,
+}
+
+impl<'a, N: UserNamespaceView> TaskGetSchedulerContext<'a, N> {
+    /// Freezes the actor and target credentials for one observation.
+    pub const fn new(actor: &'a Credential<N>, target: &'a Credential<N>) -> Self {
+        Self { actor, target }
+    }
+
+    /// Returns the credential which issued the query.
+    pub const fn actor(&self) -> &'a Credential<N> {
+        self.actor
+    }
+
+    /// Returns the credential owned by the resolved task.
+    pub const fn target(&self) -> &'a Credential<N> {
+        self.target
+    }
+}
+
 /// Complete immutable input to one scheduler authorization decision.
 ///
 /// Ownership is computed internally from the frozen credentials; callers
