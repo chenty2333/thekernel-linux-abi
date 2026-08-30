@@ -2883,6 +2883,22 @@ pub fn commoncap_scheduler<N: UserNamespaceView>(
         {
             Err(AuthorizationError::NotPermitted)
         }
+        // sched_setattr() changes policy and nice as one scheduler
+        // transaction.  Apply can_nice() as part of that single commoncap
+        // decision rather than asking the LSM twice through SetNice followed
+        // by SetPolicy.  The limit belongs to the target task snapshot, the
+        // capability exception to the caller's current namespace.
+        SchedulerSecurityOperation::SetPolicy {
+            current_nice,
+            requested_nice,
+            rlimit_nice,
+            ..
+        } if requested_nice < current_nice
+            && !caller_capable
+            && !rlimit_allows_nice(rlimit_nice, requested_nice) =>
+        {
+            Err(AuthorizationError::NotPermitted)
+        }
         // Leaving `SCHED_IDLE` reduces nice from Linux's idle baseline and is
         // therefore an unprivileged priority raise only when `RLIMIT_NICE`
         // admits the requested nice value.
@@ -2892,8 +2908,7 @@ pub fn commoncap_scheduler<N: UserNamespaceView>(
             requested_nice,
             rlimit_nice,
             ..
-        } if !target_capable && !rlimit_allows_nice(rlimit_nice, requested_nice) =>
-        {
+        } if !target_capable && !rlimit_allows_nice(rlimit_nice, requested_nice) => {
             Err(AuthorizationError::NotPermitted)
         }
         // `sched_setparam()` may raise an existing real-time priority only
@@ -4304,12 +4319,8 @@ mod tests {
             Some(Kuid::INITIAL_ROOT),
         );
         let child_root = Credential::try_with_user_namespace(&root, child_namespace).unwrap();
-        let actor = credential_with_identity_and_caps(
-            &child_root,
-            1000,
-            &[CAP_SYS_NICE],
-            &[CAP_SYS_NICE],
-        );
+        let actor =
+            credential_with_identity_and_caps(&child_root, 1000, &[CAP_SYS_NICE], &[CAP_SYS_NICE]);
         let target = credential_with_identity_and_caps(&root, 1000, &[], &[]);
 
         // The target namespace capability gate is irrelevant for an owned
