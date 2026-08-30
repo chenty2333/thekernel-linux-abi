@@ -676,12 +676,10 @@ impl SignalStack {
 
     /// Normalizes the `uc_stack` record supplied by `rt_sigreturn`.
     ///
-    /// Version 0.1 supports the Linux disabled, enabled, and visible
-    /// `SS_ONSTACK` modes. `SS_AUTODISARM` is intentionally not advertised:
-    /// consumers must reject it at `sigaltstack(2)` until delivery-time reset
-    /// and restore semantics are implemented end to end.
     pub(crate) fn prepare_restore(&self) -> Result<Self, SignalStackRestoreError> {
-        if self.flags != 0 && self.flags != SS_DISABLE && self.flags != SS_ONSTACK {
+        const SS_AUTODISARM: u32 = 1 << 31;
+        if self.flags != 0 && self.flags != SS_DISABLE && self.flags != SS_ONSTACK
+            && self.flags != SS_AUTODISARM {
             return Err(SignalStackRestoreError::InvalidFlags);
         }
         if self.flags == SS_DISABLE {

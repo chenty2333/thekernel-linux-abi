@@ -935,6 +935,13 @@ impl ThreadSignalManager {
                     }
                 };
                 published.install(uctx);
+                // Linux sas_ss_reset(): while an AUTODISARM handler runs,
+                // nested delivery and sigaltstack observe SS_DISABLE. The
+                // original record is retained in ucontext and restored by
+                // rt_sigreturn (or swapcontext's explicit frame restore).
+                if stack.flags & (1 << 31) != 0 {
+                    *self.stack.lock() = SignalStack::default();
+                }
 
                 let mut add_blocked = action.mask;
                 if !action.flags.contains(SignalActionFlags::NODEFER) {

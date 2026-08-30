@@ -487,7 +487,11 @@ pub fn prepare_signal_frame_with_fp_snapshot(
 ) -> Result<PreparedSignalFrame, SignalFrameLayoutError> {
     let layout = SignalFrameLayout::new(interrupted.sp(), &configured_stack, stack)?;
     let mut visible_stack = configured_stack;
-    visible_stack.flags = configured_stack.flags_at(interrupted.sp());
+    // rt_sigreturn must retain the AUTODISARM configuration even though the
+    // live thread state is disabled for the handler's dynamic extent.
+    if configured_stack.flags & (1 << 31) == 0 {
+        visible_stack.flags = configured_stack.flags_at(interrupted.sp());
+    }
     let fpstate = snapshot();
     Ok(PreparedSignalFrame {
         layout,
