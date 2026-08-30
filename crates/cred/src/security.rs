@@ -2299,10 +2299,41 @@ impl<'a, N: UserNamespaceView, O: ?Sized> PtraceTracemeContext<'a, N, O> {
 /// One Linux-visible scheduler mutation presented to security policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerSecurityOperation {
-    /// Change scheduling policy; real-time classes require `CAP_SYS_NICE`.
+    /// Change the target scheduling policy.
+    ///
+    /// The policy snapshot freezes the old and requested real-time state and
+    /// priorities together with the target task's soft `RLIMIT_RTPRIO` value.
+    /// This lets commoncap distinguish an unprivileged priority raise, which
+    /// Linux may admit through that limit, from a policy change that only
+    /// lowers priority or leaves the real-time classes.
     SetPolicy {
-        /// Whether the requested policy is a real-time class.
-        realtime: bool,
+        /// Whether the requested scheduling class differs from the current one.
+        policy_changed: bool,
+        /// Whether the target's current policy is real-time.
+        current_realtime: bool,
+        /// The target's current real-time priority.
+        current_rt_priority: u8,
+        /// Whether the requested policy is real-time.
+        requested_realtime: bool,
+        /// The requested real-time priority.
+        requested_rt_priority: u8,
+        /// Frozen soft `RLIMIT_RTPRIO` for the target task.
+        rlimit_rtprio: u64,
+        /// Whether the target's current policy is `SCHED_IDLE`.
+        current_idle: bool,
+        /// Whether the requested policy is `SCHED_IDLE`.
+        requested_idle: bool,
+        /// The target's current nice value. `SCHED_IDLE` is represented by
+        /// Linux's effective baseline nice value of 20.
+        current_nice: i8,
+        /// The requested nice value.
+        requested_nice: i8,
+        /// Frozen soft `RLIMIT_NICE` value for the target task.
+        rlimit_nice: u64,
+        /// Whether the target policy currently enables reset-on-fork.
+        current_reset_on_fork: bool,
+        /// Whether the requested policy enables reset-on-fork.
+        reset_on_fork: bool,
     },
     /// Change parameters of the target's current scheduling policy.
     SetParam {
@@ -2796,7 +2827,8 @@ fn rlimit_allows_nice(rlimit_nice: u64, requested_nice: i8) -> bool {
     nice_to_rlimit(requested_nice).is_some_and(|required| required <= rlimit_nice)
 }
 
-/// Applies Linux commoncap's scheduler authority and `RLIMIT_NICE` rules.
+/// Applies Linux commoncap's scheduler authority, `RLIMIT_RTPRIO`, and
+/// `RLIMIT_NICE` rules.
 ///
 /// # Errors
 ///
@@ -2816,10 +2848,51 @@ pub fn commoncap_scheduler<N: UserNamespaceView>(
     }
 
     match context.operation {
-        SchedulerSecurityOperation::SetPolicy { realtime }
-        | SchedulerSecurityOperation::SetParam { realtime }
-            if realtime && !target_capable =>
+        // Linux lets an unprivileged owner enable reset-on-fork, but only a
+        // target-namespace `CAP_SYS_NICE` holder may clear it again.
+        SchedulerSecurityOperation::SetPolicy {
+            current_reset_on_fork: true,
+            reset_on_fork: false,
+            ..
+        } if !target_capable => Err(AuthorizationError::NotPermitted),
+        // A real-time policy-class change needs either `CAP_SYS_NICE` in the
+        // target namespace or a nonzero `RLIMIT_RTPRIO`, even when its RT
+        // priority remains unchanged (for example, FIFO to RR).
+        SchedulerSecurityOperation::SetPolicy {
+            policy_changed: true,
+            requested_realtime: true,
+            rlimit_rtprio: 0,
+            ..
+        } if !target_capable => Err(AuthorizationError::NotPermitted),
+        SchedulerSecurityOperation::SetPolicy {
+            current_rt_priority,
+            requested_realtime: true,
+            requested_rt_priority,
+            rlimit_rtprio,
+            ..
+        } if !target_capable
+            && requested_rt_priority > current_rt_priority
+            && u64::from(requested_rt_priority) > rlimit_rtprio =>
         {
+            Err(AuthorizationError::NotPermitted)
+        }
+        // Leaving `SCHED_IDLE` reduces nice from Linux's idle baseline and is
+        // therefore an unprivileged priority raise only when `RLIMIT_NICE`
+        // admits the requested nice value.
+        SchedulerSecurityOperation::SetPolicy {
+            current_idle: true,
+            requested_idle: false,
+            requested_nice,
+            rlimit_nice,
+            ..
+        } if !target_capable && !rlimit_allows_nice(rlimit_nice, requested_nice) =>
+        {
+            Err(AuthorizationError::NotPermitted)
+        }
+        // `sched_setparam()` keeps its established all-real-time capability
+        // rule: it has no old/new priority snapshot through which to apply
+        // `RLIMIT_RTPRIO`.
+        SchedulerSecurityOperation::SetParam { realtime } if realtime && !target_capable => {
             Err(AuthorizationError::NotPermitted)
         }
         SchedulerSecurityOperation::SetNice {
@@ -3792,19 +3865,170 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_realtime_requires_effective_capability_even_for_owner() {
+    fn scheduler_policy_uses_target_rtprio_for_unprivileged_priority_raises() {
         let namespace = MockNamespace::root();
         let root = root_credential(namespace);
         let actor = credential_with_identity_and_caps(&root, 1000, &[], &[]);
         let target = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+
+        // Entering a real-time class raises priority from the non-RT zero
+        // baseline, so an owner may do it only up to `RLIMIT_RTPRIO`.
         assert_eq!(
             commoncap_scheduler(&SchedulerSecurityContext::new(
                 &actor,
                 &target,
-                SchedulerSecurityOperation::SetPolicy { realtime: true },
+                SchedulerSecurityOperation::SetPolicy {
+                    policy_changed: true,
+                    current_realtime: false,
+                    current_rt_priority: 0,
+                    requested_realtime: true,
+                    requested_rt_priority: 50,
+                    rlimit_rtprio: 49,
+                    current_idle: false,
+                    requested_idle: false,
+                    current_nice: 0,
+                    requested_nice: 0,
+                    rlimit_nice: 0,
+                    current_reset_on_fork: false,
+                    reset_on_fork: false,
+                },
             )),
             Err(AuthorizationError::NotPermitted)
         );
+        commoncap_scheduler(&SchedulerSecurityContext::new(
+            &actor,
+            &target,
+            SchedulerSecurityOperation::SetPolicy {
+                policy_changed: true,
+                current_realtime: false,
+                current_rt_priority: 0,
+                requested_realtime: true,
+                requested_rt_priority: 50,
+                rlimit_rtprio: 50,
+                current_idle: false,
+                requested_idle: false,
+                current_nice: 0,
+                requested_nice: 0,
+                rlimit_nice: 0,
+                current_reset_on_fork: false,
+                reset_on_fork: false,
+            },
+        ))
+        .unwrap();
+
+        // Switching FIFO and RR at the same priority is still an RT policy
+        // change, and a zero `RLIMIT_RTPRIO` does not admit it.
+        assert_eq!(
+            commoncap_scheduler(&SchedulerSecurityContext::new(
+                &actor,
+                &target,
+                SchedulerSecurityOperation::SetPolicy {
+                    policy_changed: true,
+                    current_realtime: true,
+                    current_rt_priority: 50,
+                    requested_realtime: true,
+                    requested_rt_priority: 50,
+                    rlimit_rtprio: 0,
+                    current_idle: false,
+                    requested_idle: false,
+                    current_nice: 0,
+                    requested_nice: 0,
+                    rlimit_nice: 0,
+                    current_reset_on_fork: false,
+                    reset_on_fork: false,
+                },
+            )),
+            Err(AuthorizationError::NotPermitted)
+        );
+
+        // Raising an existing RT priority follows the same limit, while
+        // lowering it or leaving RT does not need a real-time raise grant.
+        assert_eq!(
+            commoncap_scheduler(&SchedulerSecurityContext::new(
+                &actor,
+                &target,
+                SchedulerSecurityOperation::SetPolicy {
+                    policy_changed: false,
+                    current_realtime: true,
+                    current_rt_priority: 50,
+                    requested_realtime: true,
+                    requested_rt_priority: 51,
+                    rlimit_rtprio: 50,
+                    current_idle: false,
+                    requested_idle: false,
+                    current_nice: 0,
+                    requested_nice: 0,
+                    rlimit_nice: 0,
+                    current_reset_on_fork: false,
+                    reset_on_fork: false,
+                },
+            )),
+            Err(AuthorizationError::NotPermitted)
+        );
+        commoncap_scheduler(&SchedulerSecurityContext::new(
+            &actor,
+            &target,
+            SchedulerSecurityOperation::SetPolicy {
+                policy_changed: false,
+                current_realtime: true,
+                current_rt_priority: 50,
+                requested_realtime: true,
+                requested_rt_priority: 49,
+                rlimit_rtprio: 0,
+                current_idle: false,
+                requested_idle: false,
+                current_nice: 0,
+                requested_nice: 0,
+                rlimit_nice: 0,
+                current_reset_on_fork: false,
+                reset_on_fork: true,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            commoncap_scheduler(&SchedulerSecurityContext::new(
+                &actor,
+                &target,
+                SchedulerSecurityOperation::SetPolicy {
+                    policy_changed: false,
+                    current_realtime: true,
+                    current_rt_priority: 49,
+                    requested_realtime: true,
+                    requested_rt_priority: 49,
+                    rlimit_rtprio: 0,
+                    current_idle: false,
+                    requested_idle: false,
+                    current_nice: 0,
+                    requested_nice: 0,
+                    rlimit_nice: 0,
+                    current_reset_on_fork: true,
+                    reset_on_fork: false,
+                },
+            )),
+            Err(AuthorizationError::NotPermitted)
+        );
+        commoncap_scheduler(&SchedulerSecurityContext::new(
+            &actor,
+            &target,
+            SchedulerSecurityOperation::SetPolicy {
+                policy_changed: true,
+                current_realtime: true,
+                current_rt_priority: 50,
+                requested_realtime: false,
+                requested_rt_priority: 0,
+                rlimit_rtprio: 0,
+                current_idle: false,
+                requested_idle: false,
+                current_nice: 0,
+                requested_nice: 0,
+                rlimit_nice: 0,
+                current_reset_on_fork: false,
+                reset_on_fork: false,
+            },
+        ))
+        .unwrap();
+
+        // Preserve `SetParam`'s existing operation shape and capability rule.
         commoncap_scheduler(&SchedulerSecurityContext::new(
             &actor,
             &target,
@@ -3817,9 +4041,78 @@ mod tests {
         commoncap_scheduler(&SchedulerSecurityContext::new(
             &actor,
             &target,
+            SchedulerSecurityOperation::SetPolicy {
+                policy_changed: true,
+                current_realtime: false,
+                current_rt_priority: 0,
+                requested_realtime: true,
+                requested_rt_priority: 99,
+                rlimit_rtprio: 0,
+                current_idle: false,
+                requested_idle: false,
+                current_nice: 0,
+                requested_nice: 0,
+                rlimit_nice: 0,
+                current_reset_on_fork: true,
+                reset_on_fork: false,
+            },
+        ))
+        .unwrap();
+        commoncap_scheduler(&SchedulerSecurityContext::new(
+            &actor,
+            &target,
             SchedulerSecurityOperation::SetParam { realtime: true },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn scheduler_policy_leaving_idle_uses_rlimit_nice() {
+        let namespace = MockNamespace::root();
+        let root = root_credential(namespace);
+        let actor = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let target = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+
+        let denied = SchedulerSecurityOperation::SetPolicy {
+            policy_changed: true,
+            current_realtime: false,
+            current_rt_priority: 0,
+            requested_realtime: false,
+            requested_rt_priority: 0,
+            rlimit_rtprio: 0,
+            current_idle: true,
+            requested_idle: false,
+            current_nice: 20,
+            requested_nice: 0,
+            rlimit_nice: 19,
+            current_reset_on_fork: false,
+            reset_on_fork: false,
+        };
+        assert_eq!(
+            commoncap_scheduler(&SchedulerSecurityContext::new(&actor, &target, denied)),
+            Err(AuthorizationError::NotPermitted)
+        );
+
+        let admitted = SchedulerSecurityOperation::SetPolicy {
+            policy_changed: true,
+            current_realtime: false,
+            current_rt_priority: 0,
+            requested_realtime: false,
+            requested_rt_priority: 0,
+            rlimit_rtprio: 0,
+            current_idle: true,
+            requested_idle: false,
+            current_nice: 20,
+            requested_nice: 0,
+            rlimit_nice: 20,
+            current_reset_on_fork: false,
+            reset_on_fork: false,
+        };
+        commoncap_scheduler(&SchedulerSecurityContext::new(&actor, &target, admitted)).unwrap();
+
+        let capable =
+            credential_with_identity_and_caps(&root, 1000, &[CAP_SYS_NICE], &[CAP_SYS_NICE]);
+        commoncap_scheduler(&SchedulerSecurityContext::new(&capable, &target, denied)).unwrap();
     }
 
     #[test]
