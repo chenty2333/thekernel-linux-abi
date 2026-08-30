@@ -62,6 +62,14 @@ pub unsafe trait UserMemory {
 
     /// Writes exactly `src.len()` bytes to `start`.
     fn write(&mut self, start: usize, src: &[u8]) -> VmResult;
+
+    /// Validates a complete writable user range without changing user memory.
+    /// Providers that can distinguish mappings must override this; the
+    /// conservative default retains compatibility for synthetic test memory.
+    fn validate_write(&mut self, start: usize, len: usize) -> VmResult {
+        checked_end(start, len)?;
+        Ok(())
+    }
 }
 
 // SAFETY: delegating through an exclusive reference preserves the underlying
@@ -73,6 +81,10 @@ unsafe impl<M: UserMemory + ?Sized> UserMemory for &mut M {
 
     fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
         (**self).write(start, src)
+    }
+
+    fn validate_write(&mut self, start: usize, len: usize) -> VmResult {
+        (**self).validate_write(start, len)
     }
 }
 
@@ -94,6 +106,11 @@ impl<'a, M: UserMemory + ?Sized> UserMemoryContext<'a, M> {
     /// Returns the provider for a lower-level adapter operation.
     pub fn memory_mut(&mut self) -> &mut M {
         self.memory
+    }
+
+    /// Validates the entire output extent before an operation starts copying.
+    pub fn validate_write_range(&mut self, start: usize, len: usize) -> VmResult {
+        self.memory.validate_write(start, len)
     }
 
     /// Reads a byte range after checked address arithmetic.
