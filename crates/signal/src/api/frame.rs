@@ -14,8 +14,11 @@ use thekernel_linux_usercopy::{
 };
 
 use crate::{
+    arch::{
+        LegacyFpState64, PkruRestore, SignalContextError, UContext, XsavePkruState64,
+        XsavePkruValidationError,
+    },
     SignalInfo, SignalSet, SignalStack, SignalStackRestoreError, Signo,
-    arch::{LegacyFpState64, SignalContextError, UContext},
 };
 
 /// x86_64's red zone, which an asynchronous signal frame must not overwrite.
@@ -54,8 +57,23 @@ pub enum FpStateRestoreError {
     Copyin(UserCopyError),
 }
 
+/// Why the XSAVE prefix used to restore PKRU could not be accepted during
+/// `rt_sigreturn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XsavePkruRestoreError {
+    /// The non-null XSAVE pointer was not 64-byte aligned.
+    Misaligned,
+    /// The XSAVE prefix through component 9 could not be copied from userspace.
+    Copyin(UserCopyError),
+    /// The copied XSAVE header or PKRU component was not valid for this task.
+    Validation(XsavePkruValidationError),
+}
+
 /// Short alias for callers that refer to the restored FP payload directly.
 pub type FpRestoreError = FpStateRestoreError;
+
+/// Alias for callers that use the `rt_sigreturn` terminology directly.
+pub type RtSigreturnXsaveError = XsavePkruRestoreError;
 
 /// The CPU-independent floating-point action returned by signal restore.
 ///
@@ -564,6 +582,7 @@ pub struct PreparedSignalRestore {
     blocked: SignalSet,
     stack: Option<SignalStack>,
     stack_error: Option<SignalStackRestoreError>,
+    fpstate: usize,
     fp_restore: FpRestore,
 }
 
@@ -591,6 +610,11 @@ impl PreparedSignalRestore {
     /// Returns the CPU-independent floating-point action to commit.
     pub const fn fp_restore(&self) -> &FpRestore {
         &self.fp_restore
+    }
+
+    /// Returns the user fpstate address from the validated fixed frame.
+    pub const fn fpstate_address(&self) -> usize {
+        self.fpstate
     }
 
     /// Consumes the prepared restore and returns its floating-point token.
@@ -697,6 +721,7 @@ pub fn prepare_signal_restore_with_fp(
         blocked,
         stack,
         stack_error,
+        fpstate: frame.ucontext.mcontext.fpstate(),
         fp_restore,
     })
 }
@@ -776,6 +801,42 @@ fn read_fp_restore<M: UserMemory + ?Sized>(
     // SAFETY: usercopy reports success only after initializing every byte of
     // the exact 512-byte destination object.
     Ok(FpRestore::Image(unsafe { image.assume_init() }))
+}
+
+/// Copies and validates the XSAVE portion needed to restore PKRU on
+/// `rt_sigreturn`.
+///
+/// This is intentionally separate from [`copyin_and_prepare_restore`]: that
+/// established API consumes a legacy 512-byte FXSAVE image.  An x86 root that
+/// enables `OSXSAVE` must select this function and validate the remaining
+/// XSAVE components before issuing `XRSTOR`; it must never reinterpret an
+/// XSAVE frame as FXSAVE. `allowed_xfeatures` is the current task's enabled
+/// user mask (normally including x87, SSE, and PKRU), not a raw host CPUID
+/// capability mask.
+///
+/// A null `fpstate` follows Linux's reset semantics and returns a zero PKRU
+/// action without copying userspace. A non-null pointer must be 64-byte
+/// aligned, as required for the XSAVE instruction family.
+pub fn copyin_xsave_pkru_for_rt_sigreturn<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    fpstate: usize,
+    allowed_xfeatures: u64,
+) -> Result<PkruRestore, XsavePkruRestoreError> {
+    if fpstate == 0 {
+        return Ok(PkruRestore::Reset);
+    }
+    if fpstate & (core::mem::align_of::<XsavePkruState64>() - 1) != 0 {
+        return Err(XsavePkruRestoreError::Misaligned);
+    }
+    let image = (fpstate as *const XsavePkruState64)
+        .vm_read_uninit(memory)
+        .map_err(XsavePkruRestoreError::Copyin)?;
+    // SAFETY: usercopy reports success only after initializing every byte of
+    // the exact XSAVE prefix through component 9.
+    let image = unsafe { image.assume_init() };
+    image
+        .validate_pkru_for_rt_sigreturn(allowed_xfeatures)
+        .map_err(XsavePkruRestoreError::Validation)
 }
 
 /// Why copying or validating a signal return frame failed.

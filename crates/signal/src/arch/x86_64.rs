@@ -1,6 +1,6 @@
 use axcpu::uspace::UserContext;
 
-use crate::{SignalSet, SignalStack, arch::SignalContextError};
+use crate::{arch::SignalContextError, SignalSet, SignalStack};
 
 /// The exact x86_64 legacy floating-point image exposed by `fxsave`.
 ///
@@ -73,6 +73,155 @@ impl From<LegacyFpState64> for [u8; LegacyFpState64::SIZE] {
     fn from(image: LegacyFpState64) -> Self {
         image.into_bytes()
     }
+}
+
+/// The standard-format XSAVE prefix needed to carry xstate component 9.
+///
+/// Linux places PKRU at its architectural standard-format offset, 2688 bytes
+/// from the start of the XSAVE area.  The signal layer deliberately owns this
+/// prefix rather than deriving an offset from CPUID: the task xstate policy is
+/// selected by the embedding x86 layer, and a user frame must be validated
+/// against that selected policy before it reaches `XRSTOR`.
+#[repr(C, align(64))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct XsavePkruState64 {
+    bytes: [u8; Self::SIZE],
+}
+
+impl XsavePkruState64 {
+    /// XSAVE component number assigned to PKRU by x86.
+    pub const PKRU_COMPONENT: u32 = 9;
+    /// Bit in `xstate_bv` denoting that the PKRU component is present.
+    pub const PKRU_XFEATURE: u64 = 1 << Self::PKRU_COMPONENT;
+    /// Offset of the 64-byte XSAVE header after the legacy FXSAVE region.
+    pub const HEADER_OFFSET: usize = LegacyFpState64::SIZE;
+    /// Size of the standard XSAVE header.
+    pub const HEADER_SIZE: usize = 64;
+    /// Standard-format offset of the eight-byte PKRU component.
+    pub const PKRU_OFFSET: usize = 2688;
+    /// Size of the PKRU component, including its architecturally reserved high word.
+    pub const PKRU_SIZE: usize = 8;
+    /// Exact byte prefix needed to validate and extract component 9.
+    pub const SIZE: usize = Self::PKRU_OFFSET + Self::PKRU_SIZE;
+
+    /// Creates an owned image from the XSAVE bytes needed for PKRU restore.
+    pub const fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        Self { bytes }
+    }
+
+    /// Returns the exact owned XSAVE prefix.
+    pub const fn as_bytes(&self) -> &[u8; Self::SIZE] {
+        &self.bytes
+    }
+
+    /// Returns the user-controlled xstate bitmap.
+    pub fn xstate_bv(&self) -> u64 {
+        self.read_u64(Self::HEADER_OFFSET)
+    }
+
+    /// Returns the XSAVE format bitmap.
+    pub fn xcomp_bv(&self) -> u64 {
+        self.read_u64(Self::HEADER_OFFSET + 8)
+    }
+
+    /// Returns the PKRU value when the component is present.
+    pub fn pkru(&self) -> Option<u32> {
+        (self.xstate_bv() & Self::PKRU_XFEATURE != 0).then(|| self.read_u32(Self::PKRU_OFFSET))
+    }
+
+    /// Validates the subset of an XSAVE signal image that is relevant before
+    /// an x86 embedding restores its state.
+    ///
+    /// `allowed_xfeatures` must be the task's enabled user XSAVE mask, not
+    /// the host's broad CPUID mask.  An absent component 9 denotes x86's
+    /// initial PKRU value (zero).  This avoids preserving stale PKRU when a
+    /// signal frame intentionally omits the component.
+    pub fn validate_pkru_for_rt_sigreturn(
+        &self,
+        allowed_xfeatures: u64,
+    ) -> Result<PkruRestore, XsavePkruValidationError> {
+        let xstate_bv = self.xstate_bv();
+        if xstate_bv & !allowed_xfeatures != 0 {
+            return Err(XsavePkruValidationError::UnsupportedXfeature);
+        }
+        if self.xcomp_bv() != 0 {
+            return Err(XsavePkruValidationError::NonStandardFormat);
+        }
+        if self.bytes[Self::HEADER_OFFSET + 16..Self::HEADER_OFFSET + Self::HEADER_SIZE]
+            .iter()
+            .any(|&byte| byte != 0)
+        {
+            return Err(XsavePkruValidationError::ReservedHeader);
+        }
+        if xstate_bv & Self::PKRU_XFEATURE == 0 {
+            return Ok(PkruRestore::Reset);
+        }
+        if allowed_xfeatures & Self::PKRU_XFEATURE == 0 {
+            return Err(XsavePkruValidationError::PkruNotEnabled);
+        }
+        if self.read_u32(Self::PKRU_OFFSET + 4) != 0 {
+            return Err(XsavePkruValidationError::ReservedPkruBits);
+        }
+        Ok(PkruRestore::Restore(self.read_u32(Self::PKRU_OFFSET)))
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(self.bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64(&self, offset: usize) -> u64 {
+        u64::from_le_bytes(self.bytes[offset..offset + 8].try_into().unwrap())
+    }
+}
+
+impl Default for XsavePkruState64 {
+    fn default() -> Self {
+        Self::from_bytes([0; Self::SIZE])
+    }
+}
+
+impl core::fmt::Debug for XsavePkruState64 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("XsavePkruState64")
+            .field("xstate_bv", &self.xstate_bv())
+            .field("xcomp_bv", &self.xcomp_bv())
+            .field("pkru", &self.pkru())
+            .finish()
+    }
+}
+
+/// The PKRU action extracted from a validated `rt_sigreturn` XSAVE image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkruRestore {
+    /// Component 9 was absent, so restore x86's initial PKRU value of zero.
+    Reset,
+    /// Restore this validated PKRU value with `WRPKRU` or an equivalent xstate restore.
+    Restore(u32),
+}
+
+impl PkruRestore {
+    /// Returns the PKRU value that must be installed.
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::Reset => 0,
+            Self::Restore(value) => value,
+        }
+    }
+}
+
+/// Why the PKRU-relevant portion of an XSAVE signal image is not restorable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XsavePkruValidationError {
+    /// The frame requests an xstate component outside the task's enabled mask.
+    UnsupportedXfeature,
+    /// The frame uses compacted or supervisor XSAVE layout, not Linux's standard user layout.
+    NonStandardFormat,
+    /// Reserved XSAVE header bytes were nonzero.
+    ReservedHeader,
+    /// The frame contained PKRU although component 9 is disabled for this task.
+    PkruNotEnabled,
+    /// The upper 32 bits of xstate component 9 were nonzero.
+    ReservedPkruBits,
 }
 
 core::arch::global_asm!(
