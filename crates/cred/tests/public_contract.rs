@@ -12,12 +12,12 @@ use thekernel_linux_cred::{
     InodeMknodKind, InodeMknodOperation, InodePermissionAccess, InodePermissionContext,
     InodePostSetattrContext, InodeRenameContext, InodeRmdirContext, InodeSetattrContext,
     InodeSetattrIntent, InodeSetattrMode, InodeSetattrPrivilegeCleanup, InodeSetattrProposal,
-    InodeSymlinkContext, InodeUnlinkContext, InodeXattrContext, InodeXattrOperation, KeyPermission,
-    KeyPermissionMask, Kgid, Kuid, MemoryProtection, MmapAddressContext, MmapFileContext,
-    MmapFileFlags, MmapFileOperation, MmapFileSecurityRef, MmapFileTarget,
-    PreparedCredentialCapabilityOperation, PtraceAccessContext, PtraceAccessKind,
-    PtraceCredentialKind, PtraceTracemeContext, SECBIT_EXEC_DENY_INTERACTIVE,
-    SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, SECBIT_EXEC_RESTRICT_FILE,
+    InodeSymlinkContext, InodeTimestampIntent, InodeTimestampValue, InodeUnlinkContext,
+    InodeXattrContext, InodeXattrOperation, KeyPermission, KeyPermissionMask, Kgid, Kuid,
+    MemoryProtection, MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation,
+    MmapFileSecurityRef, MmapFileTarget, PreparedCredentialCapabilityOperation,
+    PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind, PtraceTracemeContext,
+    SECBIT_EXEC_DENY_INTERACTIVE, SECBIT_EXEC_DENY_INTERACTIVE_LOCKED, SECBIT_EXEC_RESTRICT_FILE,
     SECBIT_EXEC_RESTRICT_FILE_LOCKED, SECURE_ALL_UNPRIVILEGED, SECURITY_CAPABILITY_XATTR_NAME,
     SchedulerSecurityContext, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
     SignalDeliveryScope, SignalNumber, SignalSecurityContext, SignalSecurityOperation,
@@ -695,6 +695,19 @@ fn inode_setattr_public_contract_preserves_omission_and_hook_point_effects() {
         chmod.privilege_cleanup(),
         InodeSetattrPrivilegeCleanup::Preserve
     );
+
+    let timestamps =
+        InodeTimestampIntent::new(InodeTimestampValue::Explicit, InodeTimestampValue::Now);
+    let timestamp_proposal = InodeSetattrProposal::timestamps(timestamps);
+    assert_eq!(timestamps.atime(), InodeTimestampValue::Explicit);
+    assert_eq!(timestamps.mtime(), InodeTimestampValue::Now);
+    assert_eq!(
+        timestamp_proposal.intent(),
+        InodeSetattrIntent::Timestamp(timestamps)
+    );
+    assert_eq!(timestamp_proposal.mode(), None);
+    assert_eq!(timestamp_proposal.user(), None);
+    assert_eq!(timestamp_proposal.group(), None);
 
     let omitted = InodeChownIntent::new(None, None);
     let omitted_proposal = InodeSetattrProposal::chown(

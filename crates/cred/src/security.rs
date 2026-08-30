@@ -273,6 +273,47 @@ pub struct InodeChownIntent {
     group: Option<Kgid>,
 }
 
+/// One timestamp field requested through inode setattr.
+///
+/// The security hook observes whether the caller omitted a field, requested
+/// the kernel's current time, or supplied an explicit value.  The value itself
+/// remains owned by the VFS adapter so this no-std policy crate does not impose
+/// a kernel time representation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum InodeTimestampValue {
+    /// Leave this timestamp unchanged.
+    Omit,
+    /// Set this timestamp to the kernel's current time.
+    Now,
+    /// Set this timestamp to a caller-supplied value.
+    Explicit,
+}
+
+/// Normalized atime/mtime request before inode-setattr policy and mutation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InodeTimestampIntent {
+    atime: InodeTimestampValue,
+    mtime: InodeTimestampValue,
+}
+
+impl InodeTimestampIntent {
+    /// Constructs an omission-preserving timestamp intent.
+    pub const fn new(atime: InodeTimestampValue, mtime: InodeTimestampValue) -> Self {
+        Self { atime, mtime }
+    }
+
+    /// Returns the requested access-time operation.
+    pub const fn atime(self) -> InodeTimestampValue {
+        self.atime
+    }
+
+    /// Returns the requested modification-time operation.
+    pub const fn mtime(self) -> InodeTimestampValue {
+        self.mtime
+    }
+}
+
 impl InodeChownIntent {
     /// Constructs an omission-aware chown intent.
     pub const fn new(user: Option<Kuid>, group: Option<Kgid>) -> Self {
@@ -293,8 +334,7 @@ impl InodeChownIntent {
 /// Leaf-typed inode attribute request selected by the embedding adapter.
 ///
 /// The variants identify Linux-visible operation families without raw iattr
-/// masks or caller-provided booleans. Future time-setting support can add a
-/// separate typed variant without changing the chmod/chown payloads.
+/// masks or caller-provided booleans.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum InodeSetattrIntent {
@@ -302,6 +342,8 @@ pub enum InodeSetattrIntent {
     Chmod(InodeChmodIntent),
     /// Change zero, one, or both ownership fields with omission preserved.
     Chown(InodeChownIntent),
+    /// Change access and/or modification timestamps.
+    Timestamp(InodeTimestampIntent),
 }
 
 /// Normalized iattr-equivalent proposal observed by an inode-setattr hook.
@@ -364,6 +406,17 @@ impl InodeSetattrProposal {
             user: intent.user(),
             group: intent.group(),
             privilege_cleanup,
+        }
+    }
+
+    /// Constructs the only valid timestamp hook-point proposal shape.
+    pub const fn timestamps(intent: InodeTimestampIntent) -> Self {
+        Self {
+            intent: InodeSetattrIntent::Timestamp(intent),
+            mode: None,
+            user: None,
+            group: None,
+            privilege_cleanup: InodeSetattrPrivilegeCleanup::Preserve,
         }
     }
 
